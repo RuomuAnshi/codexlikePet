@@ -32,6 +32,8 @@ const LOOK_MARGIN_LOGICAL: f64 = 72.0;
 const LOOK_DEADZONE_LOGICAL: f64 = 60.0;
 const PET_WIDTH: f64 = 192.0;
 const PET_HEIGHT: f64 = 208.0;
+const CONTEXT_MENU_ESTIMATED_WIDTH: f64 = 180.0;
+const CONTEXT_MENU_GAP: f64 = 8.0;
 const SPRITESHEET_WIDTH: u32 = 1536;
 const SPRITESHEET_HEIGHT: u32 = 2288;
 // The starter pet is a product default, not part of resource discovery. New
@@ -2488,8 +2490,47 @@ fn show_pet_context_menu(app: tauri::AppHandle, window_label: String) -> Result<
     let menu = Menu::with_items(&app, &[&feed, &play, &pet, &sleep, &chat, &settings, &hide])
         .map_err(|error| error.to_string())?;
     window
-        .popup_menu(&menu)
+        .popup_menu_at(&menu, pet_context_menu_position(&window))
         .map_err(|error| format!("无法显示宠物菜单: {error}"))
+}
+
+/// Put the native context menu beside the pet instead of under the pointer.
+///
+/// The menu width is intentionally an estimate: the native menu calculates
+/// its final width after it is shown. We only need enough room to decide
+/// whether the menu should open on the right or the left side of the pet.
+fn pet_context_menu_position(window: &tauri::WebviewWindow) -> LogicalPosition<f64> {
+    let scale_factor = window.scale_factor().unwrap_or(1.0).max(1.0);
+    let window_width = window
+        .outer_size()
+        .map(|size| f64::from(size.width) / scale_factor)
+        .unwrap_or(PET_WIDTH);
+    let window_position = window.outer_position().ok();
+    let monitor = window.current_monitor().ok().flatten();
+
+    let can_open_right = match (window_position, monitor) {
+        (Some(position), Some(monitor)) => {
+            let pet_right = f64::from(position.x) + window_width * scale_factor;
+            let monitor_right = f64::from(monitor.position().x)
+                + f64::from(monitor.size().width);
+            let required_space =
+                (CONTEXT_MENU_ESTIMATED_WIDTH + CONTEXT_MENU_GAP) * scale_factor;
+            monitor_right - pet_right >= required_space
+        }
+        // If monitor geometry is temporarily unavailable while the window is
+        // being created, the right side is the least surprising default.
+        _ => true,
+    };
+
+    let x = if can_open_right {
+        window_width + CONTEXT_MENU_GAP
+    } else {
+        -(CONTEXT_MENU_ESTIMATED_WIDTH + CONTEXT_MENU_GAP)
+    };
+
+    // Keep the top of the menu near the top of the pet. The native menu may
+    // further clamp itself when the pet is close to the bottom of a display.
+    LogicalPosition::new(x, CONTEXT_MENU_GAP)
 }
 
 fn handle_pet_context_action(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
