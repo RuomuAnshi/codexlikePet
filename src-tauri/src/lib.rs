@@ -146,8 +146,8 @@ mod windows_overlay {
         COINIT_APARTMENTTHREADED,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOSIZE,
+        SetWindowPos, HWND_NOTOPMOST, HWND_TOPMOST, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE,
     };
 
     // Windows exposes the desktop manager for inspection and moving windows,
@@ -1312,7 +1312,7 @@ fn reassert_fullscreen_overlay(
     #[cfg(target_os = "macos")]
     {
         window
-            .set_visible_on_all_workspaces(true)
+            .set_visible_on_all_workspaces(show_in_fullscreen)
             .map_err(|error| format!("failed to refresh macOS workspace visibility: {error}"))?;
     }
 
