@@ -52,6 +52,8 @@ async function boot(): Promise<void> {
   const petEl = document.querySelector<HTMLElement>("#pet")!;
   const speech = document.querySelector<HTMLElement>("#speech")!;
   const speechText = document.querySelector<HTMLElement>("#speech-text")!;
+  const effects = document.querySelector<HTMLElement>("#effects")!;
+  const emotion = document.querySelector<HTMLElement>("#emotion")!;
   const setStageSize = (scale: number): void => {
     stage.width = Math.round(CELL_WIDTH * scale);
     stage.height = Math.round(CELL_HEIGHT * scale);
@@ -73,6 +75,19 @@ async function boot(): Promise<void> {
     walk: 0,
     drag: 0,
     idle: 0,
+    morning: 0,
+    evening: 0,
+    sleep: 0,
+    wake: 0,
+    petting: 0,
+    feed: 0,
+    play: 0,
+    pickup: 0,
+    putDown: 0,
+    lowBattery: 0,
+    breakReminder: 0,
+    reunion: 0,
+    milestone: 0,
   };
   let speechTimer: number | undefined;
   let idleSpeechTimer: number | undefined;
@@ -81,6 +96,8 @@ async function boot(): Promise<void> {
   let chatRequestId: string | null = null;
   let chatReply = "";
   let behaviorLookTimer: number | undefined;
+  let pettingTimer: number | undefined;
+  let autoQuiet = false;
 
   const speechPreview = (text: string): string => {
     const chars = [...text.trim()];
@@ -117,7 +134,7 @@ async function boot(): Promise<void> {
   };
 
   const sayLine = (trigger: DialogueTrigger): void => {
-    if (settings.quietMode) return;
+    if (settings.quietMode || autoQuiet) return;
     const lines = dialogue[trigger];
     if (!lines.length) return;
     const index = dialogueIndices[trigger] % lines.length;
@@ -125,13 +142,33 @@ async function boot(): Promise<void> {
     showSpeech(lines[index], 3600);
   };
 
+  const showEffect = (kind: "heart" | "star" | "food" | "dust"): void => {
+    if (globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    const symbols = { heart: "♥", star: "✦", food: "✿", dust: "·" };
+    const particle = document.createElement("span");
+    particle.className = `particle particle-${kind}`;
+    particle.textContent = symbols[kind];
+    particle.style.left = `${35 + Math.random() * 30}%`;
+    particle.style.top = `${34 + Math.random() * 22}%`;
+    effects.append(particle);
+    globalThis.setTimeout(() => particle.remove(), 1_200);
+  };
+
+  const showEmotion = (value: string, duration = 2_000): void => {
+    const icon = value === "sleeping" ? "💤" : value === "sad" ? "😿" : value === "low" ? "!" : "❤";
+    emotion.textContent = icon;
+    emotion.hidden = false;
+    emotion.classList.add("emotion-visible");
+    globalThis.setTimeout(() => emotion.classList.remove("emotion-visible"), duration);
+  };
+
   const scheduleIdleSpeech = (): void => {
     if (idleSpeechTimer !== undefined) globalThis.clearTimeout(idleSpeechTimer);
     idleSpeechTimer = undefined;
-    if (settings.quietMode || !dialogue.idle.length) return;
+    if (settings.quietMode || autoQuiet || !dialogue.idle.length) return;
     idleSpeechTimer = globalThis.setTimeout(() => {
       idleSpeechTimer = undefined;
-      if (!settings.quietMode && !dragging && !walking && !stateMachine.hasAction()) {
+      if (!settings.quietMode && !autoQuiet && !dragging && !walking && !stateMachine.hasAction()) {
         sayLine("idle");
       }
       scheduleIdleSpeech();
@@ -183,7 +220,7 @@ async function boot(): Promise<void> {
     engine.setScale(next.scale);
     walker.setSettings(next.speed, next.wanderEnabled, next.quietMode);
     engine.play(!next.paused);
-    if (next.paused || !next.wanderEnabled || next.quietMode) walker.stop();
+    if (next.paused || !next.wanderEnabled || next.quietMode || autoQuiet) walker.stop();
     else if (!dragging) walker.start();
     if (!dragging) engine.setLook(lastDirection);
     syncAnimation();
@@ -220,7 +257,7 @@ async function boot(): Promise<void> {
   speech.addEventListener("click", () => void openPetChat());
 
   const playAction = (action: PetAction): void => {
-    if (paused || dragging || !stateMachine.startAction(action)) return;
+    if (paused || dragging || dragState.petting || !stateMachine.startAction(action)) return;
     engine.setLook(null);
     engine.playOnce(action, () => {
       stateMachine.finishAction();
@@ -279,18 +316,28 @@ async function boot(): Promise<void> {
 
   attachDrag(
     petEl,
-    (enabled, direction: DragDirection | null) => {
+    (enabled, direction: DragDirection | null, carried) => {
       dragging = enabled;
       if (enabled) walker.stop();
       if (enabled && stateMachine.hasAction()) {
         stateMachine.finishAction();
         engine.cancelAction();
       }
-      stateMachine.setDragging(enabled, direction);
+      stateMachine.setDragging(enabled, direction, carried);
       if (enabled && direction && !dragDialogueShown) {
         dragDialogueShown = true;
         recordPetInteraction("drag");
         sayLine("drag");
+      }
+      if (enabled && carried && !petEl.classList.contains("is-carried")) {
+        petEl.classList.add("is-carried");
+        showEffect("star");
+        sayLine("pickup");
+      }
+      if (!enabled && petEl.classList.contains("is-carried")) {
+        petEl.classList.remove("is-carried");
+        showEffect("dust");
+        sayLine("putDown");
       }
       if (enabled) engine.setLook(null);
       else engine.setLook(lastDirection);
@@ -327,9 +374,35 @@ async function boot(): Promise<void> {
 
   attachGestures(petEl, (gesture: Gesture) => {
     if (gesture === "right") {
-      recordPetInteraction("rightClick");
-      sayLine("rightClick");
-      playAction("failed");
+      void invoke("show_pet_context_menu", { windowLabel: window.label }).catch((error) => {
+        console.warn("failed to open pet menu:", error);
+      });
+      return;
+    }
+    if (gesture === "petting-start") {
+      walker.stop();
+      if (stateMachine.hasAction()) {
+        stateMachine.finishAction();
+        engine.cancelAction();
+      }
+      engine.setLook(null);
+      engine.setState("waiting");
+      sayLine("petting");
+      showEffect("heart");
+      void invoke("record_petting", { petId: runtime.petId });
+      pettingTimer = globalThis.setInterval(() => {
+        showEffect("heart");
+        void invoke("record_petting", { petId: runtime.petId });
+      }, 700);
+      return;
+    }
+    if (gesture === "petting-end") {
+      if (pettingTimer !== undefined) globalThis.clearInterval(pettingTimer);
+      pettingTimer = undefined;
+      settlePetActivity();
+      if (!dragging) engine.setLook(lastDirection);
+      syncAnimation();
+      if (!paused && settings.wanderEnabled && !settings.quietMode && !autoQuiet) walker.start();
       return;
     }
     if (clickTimer !== undefined) globalThis.clearTimeout(clickTimer);
@@ -352,6 +425,77 @@ async function boot(): Promise<void> {
   await listen<PetMeetupEvent>("pet://meetup", ({ payload }) => {
     if (payload.petId !== runtime.petId) return;
     walker.walkTo(payload.targetX, payload.targetY);
+  });
+  await listen<{ petId: string; state: { activity: string; mood: string; energy: number } }>(
+    "pet://life-state",
+    ({ payload }) => {
+      if (payload.petId !== runtime.petId) return;
+      if (payload.state.activity === "sleeping") {
+        walker.stop();
+        engine.setState("waiting");
+      } else if (!dragging && !dragState.petting) {
+        syncAnimation();
+      }
+      showEmotion(
+        payload.state.activity === "sleeping"
+          ? "sleeping"
+          : payload.state.energy < 20
+            ? "low"
+            : payload.state.mood,
+        2_400,
+      );
+    },
+  );
+  await listen<{ petId: string; trigger: DialogueTrigger }>("pet://life-dialogue", ({ payload }) => {
+    if (payload.petId === runtime.petId) sayLine(payload.trigger);
+  });
+  await listen<{ petId: string; instanceId: string; action: string }>(
+    "pet://context-action",
+    ({ payload }) => {
+      if (payload.petId !== runtime.petId || payload.instanceId !== runtime.instanceId) return;
+      const action = payload.action as DialogueTrigger;
+      if (action === "feed" || action === "play" || action === "petting") {
+        sayLine(action);
+        showEffect(action === "feed" ? "food" : action === "play" ? "star" : "heart");
+      } else if (action === "sleep" || action === "wake") {
+        sayLine(action);
+        showEmotion(action === "sleep" ? "sleeping" : "happy");
+        if (action === "sleep") {
+          walker.stop();
+          engine.setState("waiting");
+        } else if (!dragging) {
+          syncAnimation();
+        }
+      }
+      if (action === "play") playAction("jumping");
+      if (action === "feed") playAction("waiting");
+    },
+  );
+  await listen<{ snapshot: { session: string }; autoQuiet: boolean; breakReminder: boolean; lowBattery: boolean }>(
+    "environment://state",
+    ({ payload }) => {
+      autoQuiet = payload.autoQuiet;
+      if (payload.breakReminder) sayLine("breakReminder");
+      if (payload.lowBattery) sayLine("lowBattery");
+      if (payload.autoQuiet || payload.snapshot.session !== "active") {
+        walker.stop();
+        engine.setState("waiting");
+      } else {
+        if (!paused && !dragging && settings.wanderEnabled && !settings.quietMode) walker.start();
+        if (!dragging && !dragState.petting) syncAnimation();
+      }
+      scheduleIdleSpeech();
+    },
+  );
+  await listen<{ petId: string; milestones: string[] }>("pet://milestone", ({ payload }) => {
+    if (payload.petId === runtime.petId) {
+      sayLine("milestone");
+      showEmotion("happy");
+    }
+  });
+  await listen<{ petId: string; kind: string; mood: string }>("pet://interaction-feedback", ({ payload }) => {
+    if (payload.petId !== runtime.petId) return;
+    if (payload.kind === "petting") showEmotion(payload.mood);
   });
   await listen<{ requestId: string; petId: string; delta: string }>("chat://delta", ({ payload }) => {
     if (payload.petId !== runtime.petId) return;

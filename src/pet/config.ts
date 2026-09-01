@@ -10,6 +10,9 @@ export interface PetSettings {
   quietMode: boolean;
   showInFullscreen: boolean;
   paused: boolean;
+  circadianEnabled: boolean;
+  sleepStartMinutes: number;
+  wakeMinutes: number;
 }
 
 export interface PetSettingsEvent {
@@ -25,6 +28,19 @@ export interface PetDialogue {
   walk: string[];
   drag: string[];
   idle: string[];
+  morning: string[];
+  evening: string[];
+  sleep: string[];
+  wake: string[];
+  petting: string[];
+  feed: string[];
+  play: string[];
+  pickup: string[];
+  putDown: string[];
+  lowBattery: string[];
+  breakReminder: string[];
+  reunion: string[];
+  milestone: string[];
 }
 
 export interface PetInstanceInfo {
@@ -108,6 +124,44 @@ export interface PetLifeState {
   chatCount: number;
   petInteractionCount: number;
   nextActionAt: number;
+  moodValue: number;
+  relationshipLevel: number;
+  peakBond: number;
+  lastAdvancedAt: number;
+  energyProgressMs: number;
+  attentionProgressMs: number;
+  lastBondDecayAt: number;
+  sleepingSince: number;
+  sleepOverrideUntil: number;
+  lastGreetingDate: string;
+  lastFedAt: number;
+  lastPlayedAt: number;
+  lastPettedAt: number;
+  unlockedMilestones: string[];
+}
+
+export interface PetPairRelationship {
+  pairId: string;
+  affinity: number;
+  peakAffinity: number;
+  level: number;
+  knownSince: number;
+  interactionCount: number;
+  lastInteractionAt: number;
+  lastAdvancedAt: number;
+  unlockedMilestones: string[];
+}
+
+export interface EnvironmentSettings {
+  foregroundTrackingEnabled: boolean;
+  breakReminderEnabled: boolean;
+  breakReminderMinutes: number;
+  meetingQuietEnabled: boolean;
+  lowBatteryEnabled: boolean;
+  lowBatteryThreshold: number;
+  notificationEventsEnabled: boolean;
+  codingApps: string[];
+  meetingApps: string[];
 }
 
 export interface PetBehavior {

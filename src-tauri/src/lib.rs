@@ -25,6 +25,7 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use zip::ZipArchive;
 
 mod ai;
+mod environment;
 use ai::{AiRuntime, AiSettings};
 
 const LOOK_MARGIN_LOGICAL: f64 = 72.0;
@@ -444,6 +445,9 @@ struct PetSettings {
     quiet_mode: bool,
     show_in_fullscreen: bool,
     paused: bool,
+    circadian_enabled: bool,
+    sleep_start_minutes: u16,
+    wake_minutes: u16,
 }
 
 impl Default for PetSettings {
@@ -458,6 +462,9 @@ impl Default for PetSettings {
             quiet_mode: false,
             show_in_fullscreen: false,
             paused: false,
+            circadian_enabled: true,
+            sleep_start_minutes: 1_410,
+            wake_minutes: 450,
         }
     }
 }
@@ -472,6 +479,19 @@ struct PetDialogue {
     walk: Vec<String>,
     drag: Vec<String>,
     idle: Vec<String>,
+    morning: Vec<String>,
+    evening: Vec<String>,
+    sleep: Vec<String>,
+    wake: Vec<String>,
+    petting: Vec<String>,
+    feed: Vec<String>,
+    play: Vec<String>,
+    pickup: Vec<String>,
+    put_down: Vec<String>,
+    low_battery: Vec<String>,
+    break_reminder: Vec<String>,
+    reunion: Vec<String>,
+    milestone: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -614,6 +634,19 @@ impl Default for PetDialogue {
                 "这里待着也很舒服。".to_string(),
                 "要不要陪我说说话？".to_string(),
             ],
+            morning: vec!["早上好呀，今天也要一起度过。".to_string()],
+            evening: vec!["晚上啦，今天辛苦了。".to_string()],
+            sleep: vec!["我先睡一会儿，晚安。".to_string()],
+            wake: vec!["唔……醒来了。早上好！".to_string()],
+            petting: vec!["呼噜呼噜……再摸一会儿嘛。".to_string()],
+            feed: vec!["谢谢投喂！好好吃。".to_string()],
+            play: vec!["来玩一会儿吧！".to_string()],
+            pickup: vec!["诶、诶？我被拎起来啦！".to_string()],
+            put_down: vec!["呼……落地了。".to_string()],
+            low_battery: vec!["电量好低了，要不要休息一下？".to_string()],
+            break_reminder: vec!["已经忙很久啦，起来活动一下吧。".to_string()],
+            reunion: vec!["你回来啦……我有一点想你。".to_string()],
+            milestone: vec!["我们又一起走过一段时间了。".to_string()],
         }
     }
 }
@@ -622,6 +655,50 @@ impl Default for PetDialogue {
 struct PetPosition {
     x: f64,
     y: f64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct EnvironmentSettings {
+    /// Foreground application names are kept local and are only used for
+    /// timers/quiet rules. This is intentionally opt-in.
+    pub foreground_tracking_enabled: bool,
+    pub break_reminder_enabled: bool,
+    pub break_reminder_minutes: u32,
+    pub meeting_quiet_enabled: bool,
+    pub low_battery_enabled: bool,
+    pub low_battery_threshold: u8,
+    pub notification_events_enabled: bool,
+    pub coding_apps: Vec<String>,
+    pub meeting_apps: Vec<String>,
+}
+
+impl Default for EnvironmentSettings {
+    fn default() -> Self {
+        Self {
+            foreground_tracking_enabled: false,
+            break_reminder_enabled: true,
+            break_reminder_minutes: 180,
+            meeting_quiet_enabled: true,
+            low_battery_enabled: true,
+            low_battery_threshold: 20,
+            notification_events_enabled: false,
+            coding_apps: vec![
+                "Code".to_string(),
+                "codex".to_string(),
+                "Xcode".to_string(),
+                "Terminal".to_string(),
+                "iTerm2".to_string(),
+            ],
+            meeting_apps: vec![
+                "zoom.us".to_string(),
+                "Microsoft Teams".to_string(),
+                "Teams".to_string(),
+                "Webex".to_string(),
+                "腾讯会议".to_string(),
+            ],
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -646,6 +723,8 @@ struct AppConfig {
     ai: AiSettings,
     #[serde(default)]
     chat_positions: HashMap<String, PetPosition>,
+    #[serde(default)]
+    environment: EnvironmentSettings,
 }
 
 impl Default for AppConfig {
@@ -663,6 +742,7 @@ impl Default for AppConfig {
             next_instance_id: 2,
             ai: AiSettings::default(),
             chat_positions: HashMap::new(),
+            environment: EnvironmentSettings::default(),
         }
     }
 }
@@ -670,6 +750,7 @@ impl Default for AppConfig {
 struct AppState {
     config: Mutex<AppConfig>,
     ai: AiRuntime,
+    environment: environment::EnvironmentRuntime,
     ready: AtomicBool,
 }
 
@@ -678,6 +759,7 @@ impl AppState {
         Self {
             config: Mutex::new(AppConfig::default()),
             ai: AiRuntime::default(),
+            environment: environment::EnvironmentRuntime::default(),
             ready: AtomicBool::new(false),
         }
     }
@@ -947,6 +1029,7 @@ fn normalize_config(config: &mut AppConfig) {
         .retain(|instance| seen_pet_ids.insert(instance.pet_id.clone()));
     config.disabled_pet_ids.retain(|id| is_safe_id(id));
     config.settings = clamp_settings(config.settings.clone());
+    normalize_environment(&mut config.environment);
     config.pet_settings.retain(|id, _| is_safe_id(id));
     config
         .chat_positions
@@ -1020,7 +1103,28 @@ fn clamp_settings(mut settings: PetSettings) -> PetSettings {
     settings.scale = settings.scale.clamp(0.5, 2.5);
     settings.opacity = settings.opacity.clamp(0.2, 1.0);
     settings.speed = settings.speed.clamp(30.0, 240.0);
+    settings.sleep_start_minutes = settings.sleep_start_minutes.min(1_439);
+    settings.wake_minutes = settings.wake_minutes.min(1_439);
     settings
+}
+
+fn normalize_environment(settings: &mut EnvironmentSettings) {
+    settings.break_reminder_minutes = settings.break_reminder_minutes.clamp(30, 720);
+    settings.low_battery_threshold = settings.low_battery_threshold.clamp(5, 50);
+    settings.coding_apps = settings
+        .coding_apps
+        .iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .take(64)
+        .collect();
+    settings.meeting_apps = settings
+        .meeting_apps
+        .iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .take(64)
+        .collect();
 }
 
 fn settings_for_pet(config: &AppConfig, pet_id: &str) -> PetSettings {
@@ -1106,6 +1210,19 @@ fn normalize_dialogue(mut dialogue: PetDialogue) -> PetDialogue {
     dialogue.walk = normalize_lines(dialogue.walk);
     dialogue.drag = normalize_lines(dialogue.drag);
     dialogue.idle = normalize_lines(dialogue.idle);
+    dialogue.morning = normalize_lines(dialogue.morning);
+    dialogue.evening = normalize_lines(dialogue.evening);
+    dialogue.sleep = normalize_lines(dialogue.sleep);
+    dialogue.wake = normalize_lines(dialogue.wake);
+    dialogue.petting = normalize_lines(dialogue.petting);
+    dialogue.feed = normalize_lines(dialogue.feed);
+    dialogue.play = normalize_lines(dialogue.play);
+    dialogue.pickup = normalize_lines(dialogue.pickup);
+    dialogue.put_down = normalize_lines(dialogue.put_down);
+    dialogue.low_battery = normalize_lines(dialogue.low_battery);
+    dialogue.break_reminder = normalize_lines(dialogue.break_reminder);
+    dialogue.reunion = normalize_lines(dialogue.reunion);
+    dialogue.milestone = normalize_lines(dialogue.milestone);
     if dialogue.double_click.is_empty() {
         dialogue.double_click = PetDialogue::default().double_click;
     }
@@ -1153,6 +1270,19 @@ fn decode_character(bytes: &[u8]) -> Result<CharacterCard, String> {
         &dialogue.walk,
         &dialogue.drag,
         &dialogue.idle,
+        &dialogue.morning,
+        &dialogue.evening,
+        &dialogue.sleep,
+        &dialogue.wake,
+        &dialogue.petting,
+        &dialogue.feed,
+        &dialogue.play,
+        &dialogue.pickup,
+        &dialogue.put_down,
+        &dialogue.low_battery,
+        &dialogue.break_reminder,
+        &dialogue.reunion,
+        &dialogue.milestone,
     ]
     .into_iter()
     .any(|lines| lines.iter().any(|line| line.chars().count() > 240));
@@ -1534,6 +1664,22 @@ fn show_ai_settings(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn show_environment_settings(app: &tauri::AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("environment-settings") else {
+        return Err("环境设置窗口不可用".to_string());
+    };
+    if window.is_minimized().unwrap_or(false) {
+        let _ = window.unminimize();
+    }
+    window
+        .show()
+        .map_err(|error| format!("failed to show environment settings: {error}"))?;
+    window
+        .set_focus()
+        .map_err(|error| format!("failed to focus environment settings: {error}"))?;
+    Ok(())
+}
+
 fn chat_window_label(pet_id: &str) -> Result<String, String> {
     if !is_safe_id(pet_id) {
         return Err("invalid pet id".to_string());
@@ -1647,6 +1793,28 @@ fn open_pet_manager(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn open_ai_settings(app: tauri::AppHandle) -> Result<(), String> {
     show_ai_settings(&app)
+}
+
+#[tauri::command]
+fn open_environment_settings(app: tauri::AppHandle) -> Result<(), String> {
+    show_environment_settings(&app)
+}
+
+#[tauri::command]
+fn get_environment_settings(app: tauri::AppHandle) -> Result<EnvironmentSettings, String> {
+    Ok(config_snapshot(&app)?.environment)
+}
+
+#[tauri::command]
+fn update_environment_settings(
+    app: tauri::AppHandle,
+    settings: EnvironmentSettings,
+) -> Result<EnvironmentSettings, String> {
+    let config = update_config(&app, |config| {
+        config.environment = settings;
+        Ok(())
+    })?;
+    Ok(config.environment)
 }
 
 #[tauri::command]
@@ -2233,12 +2401,19 @@ fn toggle_all_visibility(app: &tauri::AppHandle) -> Result<(), String> {
 fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     let manage_pets = MenuItem::with_id(app, "app-manage-pets", "管理宠物", true, None::<&str>)?;
     let ai_settings = MenuItem::with_id(app, "app-ai-settings", "AI 设置", true, None::<&str>)?;
+    let environment_settings = MenuItem::with_id(
+        app,
+        "app-environment-settings",
+        "环境与权限",
+        true,
+        None::<&str>,
+    )?;
     let app_submenu = Submenu::with_id_and_items(
         app,
         "sakipet-app-menu",
         "SakiPet",
         true,
-        &[&manage_pets, &ai_settings],
+        &[&manage_pets, &ai_settings, &environment_settings],
     )?;
     let menu = Menu::with_items(app, &[&app_submenu])?;
     app.set_menu(menu)?;
@@ -2253,8 +2428,125 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
                 eprintln!("{error}");
             }
         }
+        "app-environment-settings" => {
+            if let Err(error) = show_environment_settings(app) {
+                eprintln!("{error}");
+            }
+        }
+        id if id.starts_with("pet-context:") => {
+            if let Err(error) = handle_pet_context_action(app, id) {
+                eprintln!("failed to handle pet context action: {error}");
+            }
+        }
         _ => {}
     });
+    Ok(())
+}
+
+#[tauri::command]
+fn show_pet_context_menu(app: tauri::AppHandle, window_label: String) -> Result<(), String> {
+    let instance_id =
+        instance_id_from_label(&window_label).ok_or_else(|| "无效的宠物窗口".to_string())?;
+    let config = config_snapshot(&app)?;
+    let instance = config
+        .instances
+        .iter()
+        .find(|instance| instance.id == instance_id)
+        .ok_or_else(|| "宠物实例不存在".to_string())?;
+    let window = app
+        .get_webview_window(&window_label)
+        .ok_or_else(|| "宠物窗口不可用".to_string())?;
+    let pet_id = &instance.pet_id;
+    let item = |action: &str, title: &str| -> Result<MenuItem<Wry>, String> {
+        MenuItem::with_id(
+            &app,
+            format!("pet-context:{action}:{instance_id}:{pet_id}"),
+            title,
+            true,
+            None::<&str>,
+        )
+        .map_err(|error| error.to_string())
+    };
+    let feed = item("feed", "喂食")?;
+    let play = item("play", "玩耍")?;
+    let pet = item("petting", "抚摸提示")?;
+    let sleep = item(
+        if ai::is_pet_sleeping(&app, pet_id) {
+            "wake"
+        } else {
+            "sleep"
+        },
+        if ai::is_pet_sleeping(&app, pet_id) {
+            "叫醒它"
+        } else {
+            "让它睡觉"
+        },
+    )?;
+    let chat = item("chat", "和它说话")?;
+    let settings = item("settings", "独立设置")?;
+    let hide = item("hide", "隐藏")?;
+    let menu = Menu::with_items(&app, &[&feed, &play, &pet, &sleep, &chat, &settings, &hide])
+        .map_err(|error| error.to_string())?;
+    window
+        .popup_menu(&menu)
+        .map_err(|error| format!("无法显示宠物菜单: {error}"))
+}
+
+fn handle_pet_context_action(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
+    let mut parts = id.splitn(4, ':');
+    let _prefix = parts.next();
+    let action = parts.next().ok_or_else(|| "缺少菜单动作".to_string())?;
+    let instance_id = parts.next().ok_or_else(|| "缺少宠物实例".to_string())?;
+    let pet_id = parts.next().ok_or_else(|| "缺少宠物 id".to_string())?;
+    let label = instance_label(instance_id)?;
+    let config = config_snapshot(app)?;
+    if !config
+        .instances
+        .iter()
+        .any(|instance| instance.id == instance_id && instance.pet_id == pet_id)
+    {
+        return Err("宠物实例已不存在".to_string());
+    }
+    match action {
+        "feed" | "play" | "sleep" | "wake" => {
+            let state = match action {
+                "feed" | "play" => ai::perform_pet_action_internal(app, pet_id, action)?,
+                "sleep" => ai::sleep_pet(app.clone(), pet_id.to_string())?,
+                "wake" => ai::wake_pet(app.clone(), pet_id.to_string())?,
+                _ => unreachable!(),
+            };
+            let _ = app.emit(
+                "pet://context-action",
+                serde_json::json!({"petId": pet_id, "instanceId": instance_id, "action": action, "state": state}),
+            );
+        }
+        "petting" => {
+            let _ = ai::record_petting_internal(app, pet_id)?;
+            let _ = app.emit(
+                "pet://context-action",
+                serde_json::json!({"petId": pet_id, "instanceId": instance_id, "action": action}),
+            );
+        }
+        "chat" => {
+            tauri::async_runtime::block_on(open_pet_chat(app.clone(), pet_id.to_string()))?;
+        }
+        "settings" => {
+            show_pet_manager(app)?;
+            let _ = app.emit(
+                "manager://pet-settings",
+                serde_json::json!({"petId": pet_id}),
+            );
+        }
+        "hide" => {
+            set_instance_visible_internal(app, instance_id, false)?;
+            rebuild_tray_menu(app).map_err(|error| error.to_string())?;
+        }
+        _ => return Err("不支持的宠物菜单动作".to_string()),
+    }
+    let _ = app.emit(
+        "pet://context-action-dispatched",
+        serde_json::json!({"petId": pet_id, "instanceId": instance_id, "action": action, "windowLabel": label}),
+    );
     Ok(())
 }
 
@@ -2268,6 +2560,13 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<Wry>> {
     )?;
     let manage_pets = MenuItem::with_id(app, "manage-pets", "管理宠物", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "ai-settings", "AI 设置", true, None::<&str>)?;
+    let environment_settings = MenuItem::with_id(
+        app,
+        "environment-settings",
+        "环境与权限",
+        true,
+        None::<&str>,
+    )?;
     let toggle_pause = MenuItem::with_id(
         app,
         "toggle-pause",
@@ -2346,6 +2645,7 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<Wry>> {
         &show_hide,
         &manage_pets,
         &settings,
+        &environment_settings,
         &toggle_pause,
         &autostart,
         &add_submenu,
@@ -2382,6 +2682,10 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 }
             } else if id == "ai-settings" {
                 if let Err(error) = show_ai_settings(app) {
+                    eprintln!("{error}");
+                }
+            } else if id == "environment-settings" {
+                if let Err(error) = show_environment_settings(app) {
                     eprintln!("{error}");
                 }
             } else if id == "toggle-pause" {
@@ -2539,6 +2843,7 @@ pub fn run() {
                 WindowEvent::CloseRequested { api, .. }
                     if label == "pet-manager"
                         || label == "ai-settings"
+                        || label == "environment-settings"
                         || label.starts_with("pet-chat-") =>
                 {
                     api.prevent_close();
@@ -2564,6 +2869,7 @@ pub fn run() {
             start_fullscreen_overlay_guard(&app.handle());
             build_tray(&app.handle())?;
             build_app_menu(&app.handle())?;
+            environment::start_monitor(&app.handle());
             ai::start_heartbeat_scheduler(&app.handle());
             #[cfg(target_os = "macos")]
             if let Err(error) = macos_dock_menu::install(&app.handle()) {
@@ -2590,6 +2896,15 @@ pub fn run() {
                     }
                 });
             }
+            if let Some(environment) = app.get_webview_window("environment-settings") {
+                let environment_for_close = environment.clone();
+                environment.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = environment_for_close.hide();
+                    }
+                });
+            }
             if !has_visible_pet_config(&app.handle(), &config) {
                 show_pet_manager(&app.handle())?;
             }
@@ -2601,6 +2916,10 @@ pub fn run() {
             look_direction,
             open_pet_manager,
             open_ai_settings,
+            open_environment_settings,
+            get_environment_settings,
+            update_environment_settings,
+            show_pet_context_menu,
             open_pet_chat,
             toggle_pet_chat,
             hide_pet_chat,
@@ -2627,6 +2946,11 @@ pub fn run() {
             ai::get_pet_state,
             ai::record_pet_interaction,
             ai::settle_pet_activity,
+            ai::perform_pet_action,
+            ai::record_petting,
+            ai::wake_pet,
+            ai::sleep_pet,
+            ai::get_pet_relationship,
             ai::get_chat_history,
             ai::send_chat_message,
             ai::cancel_chat_response,

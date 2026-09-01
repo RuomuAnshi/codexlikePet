@@ -30,6 +30,7 @@ const refreshButton = document.querySelector<HTMLButtonElement>("#refresh")!;
 const importButton = document.querySelector<HTMLButtonElement>("#import-pet")!;
 const importInput = document.querySelector<HTMLInputElement>("#pet-package")!;
 const openAiSettingsButton = document.querySelector<HTMLButtonElement>("#open-ai-settings")!;
+const openEnvironmentSettingsButton = document.querySelector<HTMLButtonElement>("#open-environment-settings")!;
 const settingsDialog = document.querySelector<HTMLDialogElement>("#pet-settings-dialog")!;
 const settingsDialogTitle = document.querySelector<HTMLElement>("#settings-dialog-title")!;
 const settingsDialogContent = document.querySelector<HTMLElement>("#settings-dialog-content")!;
@@ -128,10 +129,22 @@ function createBondSummary(pet: LoadedPet): HTMLElement {
   track.append(fill);
   const detail = document.createElement("small");
   detail.textContent = pet.life
-    ? `${pet.life.mood} · 互动 ${pet.life.interactionCount} 次 · 和其他宠物 ${pet.life.petInteractionCount} 次`
+    ? `${relationshipName(pet.life.relationshipLevel)} · ${pet.life.mood} · 互动 ${pet.life.interactionCount} 次`
     : "正在读取宠物状态…";
-  wrapper.append(header, track, detail);
+  if (pet.life) {
+    const milestones = document.createElement("small");
+    milestones.className = "milestone-list";
+    milestones.textContent = pet.life.unlockedMilestones.length
+      ? `已解锁：${pet.life.unlockedMilestones.length} 个里程碑 · 最高 ${pet.life.peakBond}`
+      : `最高好感 ${pet.life.peakBond} · 还没有里程碑`;
+    wrapper.append(milestones);
+  }
+  wrapper.prepend(header, track, detail);
   return wrapper;
+}
+
+function relationshipName(level: number): string {
+  return ["初识", "熟悉", "亲近", "信赖", "挚友"][Math.max(0, Math.min(4, level - 1))] ?? "初识";
 }
 
 function petInstances(petId: string): PetInstanceInfo[] {
@@ -206,6 +219,9 @@ interface PetSettingsControls {
   lockPosition: HTMLInputElement;
   clickThrough: HTMLInputElement;
   showInFullscreen: HTMLInputElement;
+  circadianEnabled: HTMLInputElement;
+  sleepStart: HTMLInputElement;
+  wake: HTMLInputElement;
   pause: HTMLButtonElement;
 }
 
@@ -267,10 +283,25 @@ function syncSettingsControls(controls: PetSettingsControls, next: PetSettings):
   controls.lockPosition.checked = next.lockPosition;
   controls.clickThrough.checked = next.clickThrough;
   controls.showInFullscreen.checked = next.showInFullscreen;
+  controls.circadianEnabled.checked = next.circadianEnabled;
+  controls.sleepStart.value = minutesToTime(next.sleepStartMinutes);
+  controls.wake.value = minutesToTime(next.wakeMinutes);
   controls.pause.textContent = next.paused ? "继续动画" : "暂停动画";
   controls.scale.output.textContent = controls.scale.format(next.scale);
   controls.opacity.output.textContent = controls.opacity.format(next.opacity * 100);
   controls.speed.output.textContent = controls.speed.format(next.speed);
+}
+
+function minutesToTime(minutes: number): string {
+  const hours = Math.floor(minutes / 60).toString().padStart(2, "0");
+  const remainder = (minutes % 60).toString().padStart(2, "0");
+  return `${hours}:${remainder}`;
+}
+
+function timeToMinutes(value: string, fallback: number): number {
+  const match = /^(\d{2}):(\d{2})$/.exec(value);
+  if (!match) return fallback;
+  return Math.min(1439, Number(match[1]) * 60 + Number(match[2]));
 }
 
 function setSettingsBusy(controls: PetSettingsControls, busy: boolean): void {
@@ -296,6 +327,9 @@ async function savePetSettings(
     quietMode: controls.quietMode.checked,
     showInFullscreen: controls.showInFullscreen.checked,
     paused: pet.info.settings.paused,
+    circadianEnabled: controls.circadianEnabled.checked,
+    sleepStartMinutes: timeToMinutes(controls.sleepStart.value, pet.info.settings.sleepStartMinutes),
+    wakeMinutes: timeToMinutes(controls.wake.value, pet.info.settings.wakeMinutes),
   };
   setSettingsBusy(controls, true);
   try {
@@ -362,7 +396,29 @@ function createSettingsForm(pet: LoadedPet, displayName: string): HTMLFormElemen
     "普通/无边框全屏仍显示（独占全屏除外）",
     pet.info.settings.showInFullscreen,
   );
-  toggleGrid.append(wander, quiet, lock, clickThrough, showInFullscreen);
+  const circadian = createToggleRow(
+    "昼夜作息",
+    "按本地时间睡觉和起床",
+    pet.info.settings.circadianEnabled,
+  );
+  const sleepStart = document.createElement("label");
+  sleepStart.className = "time-setting";
+  sleepStart.innerHTML = "<span><strong>入睡时间</strong><small>进入睡眠区间</small></span>";
+  const sleepStartInput = document.createElement("input");
+  sleepStartInput.type = "time";
+  sleepStartInput.value = minutesToTime(pet.info.settings.sleepStartMinutes);
+  sleepStart.append(sleepStartInput);
+  const wake = document.createElement("label");
+  wake.className = "time-setting";
+  wake.innerHTML = "<span><strong>起床时间</strong><small>离开睡眠区间</small></span>";
+  const wakeInput = document.createElement("input");
+  wakeInput.type = "time";
+  wakeInput.value = minutesToTime(pet.info.settings.wakeMinutes);
+  wake.append(wakeInput);
+  toggleGrid.append(wander, quiet, lock, clickThrough, showInFullscreen, circadian);
+  const scheduleGrid = document.createElement("div");
+  scheduleGrid.className = "schedule-grid";
+  scheduleGrid.append(sleepStart, wake);
 
   const pause = document.createElement("button");
   pause.type = "button";
@@ -371,7 +427,7 @@ function createSettingsForm(pet: LoadedPet, displayName: string): HTMLFormElemen
   const helper = document.createElement("p");
   helper.className = "helper-text";
   helper.textContent = "设置会自动保存。点击穿透或锁定位置后，需要从这里关闭才能再次拖动。";
-  form.append(settingGrid, toggleGrid, pause, helper);
+  form.append(settingGrid, toggleGrid, scheduleGrid, pause, helper);
   const controls: PetSettingsControls = {
     form,
     scale: scale.control,
@@ -382,6 +438,9 @@ function createSettingsForm(pet: LoadedPet, displayName: string): HTMLFormElemen
     lockPosition: lock.querySelector<HTMLInputElement>("input")!,
     clickThrough: clickThrough.querySelector<HTMLInputElement>("input")!,
     showInFullscreen: showInFullscreen.querySelector<HTMLInputElement>("input")!,
+    circadianEnabled: circadian.querySelector<HTMLInputElement>("input")!,
+    sleepStart: sleepStartInput,
+    wake: wakeInput,
     pause,
   };
   form.addEventListener("change", () => void savePetSettings(pet, controls, displayName));
@@ -581,6 +640,16 @@ openAiSettingsButton.addEventListener("click", async () => {
     setStatus(errorMessage(error), "error");
   } finally {
     setBusy(openAiSettingsButton, false);
+  }
+});
+openEnvironmentSettingsButton.addEventListener("click", async () => {
+  setBusy(openEnvironmentSettingsButton, true);
+  try {
+    await invoke("open_environment_settings");
+  } catch (error) {
+    setStatus(errorMessage(error), "error");
+  } finally {
+    setBusy(openEnvironmentSettingsButton, false);
   }
 });
 importButton.addEventListener("click", () => importInput.click());

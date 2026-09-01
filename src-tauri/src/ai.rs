@@ -1,4 +1,5 @@
 use base64::Engine;
+use chrono::{Local, Timelike};
 use futures_util::StreamExt;
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, RgbaImage};
@@ -16,7 +17,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 
-use super::{config_snapshot, AppState, CharacterCard};
+use super::{config_snapshot, AppState, CharacterCard, PetSettings};
 
 const SERVICE_NAME: &str = "com.sakipet.desktop";
 const AI_DIRECTORY: &str = "ai";
@@ -110,17 +111,31 @@ pub(crate) struct ChatMessage {
 #[serde(rename_all = "camelCase", default)]
 pub(crate) struct PetLifeState {
     pub mood: String,
+    pub mood_value: u8,
     pub energy: u8,
     pub attention: u8,
     pub bond: u8,
+    pub relationship_level: u8,
+    pub peak_bond: u8,
     pub activity: String,
     pub last_interaction_at: u64,
+    pub last_advanced_at: u64,
+    pub energy_progress_ms: u64,
+    pub attention_progress_ms: u64,
+    pub last_bond_decay_at: u64,
     pub last_spoke_at: u64,
     pub known_since: u64,
+    pub sleeping_since: u64,
+    pub sleep_override_until: u64,
+    pub last_greeting_date: String,
+    pub last_fed_at: u64,
+    pub last_played_at: u64,
+    pub last_petted_at: u64,
     pub interaction_count: u64,
     pub chat_count: u64,
     pub pet_interaction_count: u64,
     pub next_action_at: u64,
+    pub unlocked_milestones: Vec<String>,
 }
 
 impl Default for PetLifeState {
@@ -128,17 +143,61 @@ impl Default for PetLifeState {
         let now = now_ms();
         Self {
             mood: "calm".to_string(),
+            mood_value: 62,
             energy: 78,
             attention: 55,
             bond: 0,
+            relationship_level: 1,
+            peak_bond: 0,
             activity: "idle".to_string(),
             last_interaction_at: 0,
+            last_advanced_at: now,
+            energy_progress_ms: 0,
+            attention_progress_ms: 0,
+            last_bond_decay_at: now,
             last_spoke_at: 0,
             known_since: now,
+            sleeping_since: 0,
+            sleep_override_until: 0,
+            last_greeting_date: String::new(),
+            last_fed_at: 0,
+            last_played_at: 0,
+            last_petted_at: 0,
             interaction_count: 0,
             chat_count: 0,
             pet_interaction_count: 0,
             next_action_at: 0,
+            unlocked_milestones: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct PetPairRelationship {
+    pub pair_id: String,
+    pub affinity: u8,
+    pub peak_affinity: u8,
+    pub level: u8,
+    pub known_since: u64,
+    pub interaction_count: u64,
+    pub last_interaction_at: u64,
+    pub last_advanced_at: u64,
+    pub unlocked_milestones: Vec<String>,
+}
+
+impl Default for PetPairRelationship {
+    fn default() -> Self {
+        Self {
+            pair_id: String::new(),
+            affinity: 0,
+            peak_affinity: 0,
+            level: 1,
+            known_since: now_ms(),
+            interaction_count: 0,
+            last_interaction_at: 0,
+            last_advanced_at: now_ms(),
+            unlocked_milestones: Vec::new(),
         }
     }
 }
@@ -500,7 +559,32 @@ fn load_pet_life_state_from_disk(app: &tauri::AppHandle, pet_id: &str) -> PetLif
     let Ok(bytes) = fs::read(path) else {
         return PetLifeState::default();
     };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    let mut state = serde_json::from_slice(&bytes).unwrap_or_default();
+    normalize_life_state(&mut state);
+    state
+}
+
+fn normalize_life_state(state: &mut PetLifeState) {
+    let now = now_ms();
+    if state.known_since == 0 {
+        state.known_since = now;
+    }
+    if state.last_advanced_at == 0 {
+        state.last_advanced_at = now;
+    }
+    if state.last_bond_decay_at == 0 {
+        state.last_bond_decay_at = now;
+    }
+    if state.mood_value == 0 {
+        state.mood_value = match state.mood.as_str() {
+            "happy" => 86,
+            "content" => 70,
+            "sad" | "lonely" => 25,
+            _ => 62,
+        };
+    }
+    state.relationship_level = relationship_level(state.bond);
+    state.peak_bond = state.peak_bond.max(state.bond);
 }
 
 fn save_pet_life_state(
@@ -525,37 +609,168 @@ fn save_pet_life_state(
     fs::rename(temporary, path).map_err(|error| format!("无法替换宠物状态: {error}"))
 }
 
-fn advance_pet_life_state(state: &mut PetLifeState, now: u64) {
+fn relationship_level(value: u8) -> u8 {
+    match value {
+        0..=19 => 1,
+        20..=44 => 2,
+        45..=69 => 3,
+        70..=89 => 4,
+        _ => 5,
+    }
+}
+
+fn local_date() -> String {
+    Local::now().date_naive().to_string()
+}
+
+fn current_local_minutes() -> u16 {
+    let now = Local::now();
+    (now.hour() * 60 + now.minute()) as u16
+}
+
+fn is_sleep_window(settings: &PetSettings, minutes: u16) -> bool {
+    if !settings.circadian_enabled {
+        return false;
+    }
+    if settings.sleep_start_minutes == settings.wake_minutes {
+        return true;
+    }
+    if settings.sleep_start_minutes > settings.wake_minutes {
+        minutes >= settings.sleep_start_minutes || minutes < settings.wake_minutes
+    } else {
+        minutes >= settings.sleep_start_minutes && minutes < settings.wake_minutes
+    }
+}
+
+fn refresh_mood_label(state: &mut PetLifeState) {
+    state.mood = if state.activity == "sleeping" {
+        "sleepy"
+    } else if state.activity == "watching" {
+        "curious"
+    } else if state.activity == "talking" {
+        "social"
+    } else if state.attention <= 20 {
+        "lonely"
+    } else if state.mood_value >= 80 {
+        "happy"
+    } else if state.mood_value >= 65 {
+        "content"
+    } else if state.mood_value <= 25 {
+        "sad"
+    } else {
+        "calm"
+    }
+    .to_string();
+}
+
+fn advance_pet_life_state_with_settings(
+    state: &mut PetLifeState,
+    now: u64,
+    settings: &PetSettings,
+) {
     if state.known_since == 0 {
         state.known_since = now;
     }
-    if state.last_interaction_at == 0 {
+    if state.last_advanced_at == 0 {
+        // Old state files did not track a cursor. Avoid charging all time
+        // since the old version was last opened on the first migration.
+        state.last_advanced_at = now;
+    }
+    if state.last_bond_decay_at == 0 {
+        state.last_bond_decay_at = state.last_interaction_at.max(now);
+    }
+    if now < state.last_advanced_at {
+        state.last_advanced_at = now;
         return;
     }
-    let hours = now
-        .saturating_sub(state.last_interaction_at)
-        .checked_div(3_600_000)
-        .unwrap_or(0);
-    if hours > 0 {
+    let elapsed = now
+        .saturating_sub(state.last_advanced_at)
+        .min(30 * 24 * 3_600_000);
+    state.last_advanced_at = now;
+
+    let sleeping = state.activity == "sleeping";
+    let energy_elapsed = state.energy_progress_ms.saturating_add(elapsed);
+    let energy_hours = energy_elapsed / 3_600_000;
+    state.energy_progress_ms = energy_elapsed % 3_600_000;
+    if energy_hours > 0 {
+        if sleeping {
+            let recovery = energy_hours.saturating_mul(8).min(100) as u8;
+            state.energy = state.energy.saturating_add(recovery).min(100);
+        } else {
+            state.energy = state.energy.saturating_sub(energy_hours.min(100) as u8);
+        }
+        state.mood_value = if sleeping {
+            state
+                .mood_value
+                .saturating_add(energy_hours.saturating_mul(2).min(100) as u8)
+                .min(100)
+        } else {
+            state.mood_value.saturating_sub(energy_hours.min(100) as u8)
+        };
+    }
+
+    let attention_elapsed = state.attention_progress_ms.saturating_add(elapsed);
+    let attention_periods = attention_elapsed / (2 * 3_600_000);
+    state.attention_progress_ms = attention_elapsed % (2 * 3_600_000);
+    if attention_periods > 0 && !sleeping {
         state.attention = state
             .attention
-            .saturating_sub((hours.min(10) as u8).saturating_mul(2));
-        if state.activity == "sleeping" || state.mood == "sleepy" {
-            state.energy = state
-                .energy
-                .saturating_add((hours.min(12) as u8).saturating_mul(6))
-                .min(100);
+            .saturating_sub(attention_periods.min(100) as u8);
+    }
+
+    if state.last_interaction_at > 0 {
+        let decay_start = state.last_interaction_at.saturating_add(3 * 24 * 3_600_000);
+        let decay_cursor = state.last_bond_decay_at.max(decay_start);
+        if now > decay_cursor {
+            let days = (now - decay_cursor) / (24 * 3_600_000);
+            if days > 0 {
+                state.bond = state.bond.saturating_sub(days.min(14) as u8);
+                state.last_bond_decay_at = decay_cursor + days * 24 * 3_600_000;
+            }
         }
     }
-    if state.energy <= 20 {
-        state.mood = "sleepy".to_string();
-        state.activity = "sleeping".to_string();
-    } else if state.energy >= 55 && state.activity == "sleeping" {
-        state.mood = "calm".to_string();
+
+    let in_schedule = is_sleep_window(settings, current_local_minutes());
+    if state.sleep_override_until > now {
         state.activity = "idle".to_string();
-    } else if state.attention <= 20 {
-        state.mood = "lonely".to_string();
+    } else if in_schedule || state.energy <= 20 {
+        state.activity = "sleeping".to_string();
+        if state.sleeping_since == 0 {
+            state.sleeping_since = now;
+        }
+    } else if sleeping {
+        state.activity = "idle".to_string();
+        state.sleeping_since = 0;
     }
+
+    state.relationship_level = relationship_level(state.bond);
+    state.peak_bond = state.peak_bond.max(state.bond);
+    refresh_mood_label(state);
+}
+
+#[allow(dead_code)]
+fn advance_pet_life_state(state: &mut PetLifeState, now: u64) {
+    advance_pet_life_state_with_settings(state, now, &PetSettings::default());
+}
+
+fn mark_milestones(state: &mut PetLifeState, now: u64) -> bool {
+    let mut added = false;
+    let known_days = now.saturating_sub(state.known_since) / (24 * 3_600_000);
+    for (id, unlocked) in [
+        ("first-day", known_days >= 1),
+        ("one-week", known_days >= 7),
+        ("one-month", known_days >= 30),
+        ("one-hundred-days", known_days >= 100),
+        ("ten-interactions", state.interaction_count >= 10),
+        ("fifty-interactions", state.interaction_count >= 50),
+        ("two-hundred-interactions", state.interaction_count >= 200),
+    ] {
+        if unlocked && !state.unlocked_milestones.iter().any(|item| item == id) {
+            state.unlocked_milestones.push(id.to_string());
+            added = true;
+        }
+    }
+    added
 }
 
 fn update_pet_life_state<F>(
@@ -568,6 +783,14 @@ where
 {
     let now = now_ms();
     let state = app.state::<AppState>();
+    let had_long_absence = app
+        .state::<AppState>()
+        .ai
+        .life_states
+        .lock()
+        .ok()
+        .and_then(|states| states.get(pet_id).map(|life| life.last_interaction_at))
+        .is_some_and(|last| last > 0 && now.saturating_sub(last) >= 24 * 3_600_000);
     let mut states = state
         .ai
         .life_states
@@ -576,18 +799,46 @@ where
     let life = states
         .entry(pet_id.to_string())
         .or_insert_with(|| load_pet_life_state_from_disk(app, pet_id));
-    advance_pet_life_state(life, now);
+    let config = config_snapshot(app)?;
+    let settings = super::settings_for_pet(&config, pet_id);
+    advance_pet_life_state_with_settings(life, now, &settings);
     update(life);
     life.energy = life.energy.min(100);
     life.attention = life.attention.min(100);
     life.bond = life.bond.min(100);
+    life.mood_value = life.mood_value.min(100);
+    life.relationship_level = relationship_level(life.bond);
+    life.peak_bond = life.peak_bond.max(life.bond);
+    let milestone_added = mark_milestones(life, now);
     let snapshot = life.clone();
     save_pet_life_state(app, pet_id, &snapshot)?;
+    if had_long_absence && snapshot.last_interaction_at == now {
+        let _ = app.emit(
+            "pet://life-dialogue",
+            serde_json::json!({"petId": pet_id, "trigger": "reunion"}),
+        );
+    }
+    if milestone_added {
+        let _ = app.emit(
+            "pet://milestone",
+            serde_json::json!({"petId": pet_id, "milestones": snapshot.unlocked_milestones}),
+        );
+    }
     Ok(snapshot)
 }
 
 fn pet_life_state(app: &tauri::AppHandle, pet_id: &str) -> Result<PetLifeState, String> {
     update_pet_life_state(app, pet_id, |_| {})
+}
+
+pub(crate) fn is_pet_sleeping(app: &tauri::AppHandle, pet_id: &str) -> bool {
+    pet_life_state(app, pet_id)
+        .map(|state| state.activity == "sleeping")
+        .unwrap_or(false)
+}
+
+fn increase_mood(state: &mut PetLifeState, amount: u8) {
+    state.mood_value = state.mood_value.saturating_add(amount).min(100);
 }
 
 fn record_pet_interaction_internal(
@@ -598,13 +849,19 @@ fn record_pet_interaction_internal(
     update_pet_life_state(app, pet_id, |state| {
         let now = now_ms();
         let normalized = kind.to_ascii_lowercase();
+        let was_sleeping = state.activity == "sleeping";
         state.last_interaction_at = now;
+        state.last_bond_decay_at = now;
+        if was_sleeping {
+            state.sleep_override_until = now.saturating_add(10 * 60_000);
+            state.sleeping_since = 0;
+        }
         state.interaction_count = state.interaction_count.saturating_add(1);
         match normalized.as_str() {
             "doubleclick" | "double_click" | "chat" => {
                 state.attention = state.attention.saturating_add(16).min(100);
                 state.bond = state.bond.saturating_add(1).min(100);
-                state.mood = "happy".to_string();
+                increase_mood(state, 6);
                 state.activity = "chatting".to_string();
                 if normalized == "chat" {
                     state.chat_count = state.chat_count.saturating_add(1);
@@ -613,13 +870,13 @@ fn record_pet_interaction_internal(
             "drag" => {
                 state.attention = state.attention.saturating_add(6).min(100);
                 state.energy = state.energy.saturating_sub(1);
-                state.mood = "curious".to_string();
+                increase_mood(state, 2);
                 state.activity = "playing".to_string();
             }
             "walk" => {
                 state.attention = state.attention.saturating_add(3).min(100);
                 state.energy = state.energy.saturating_sub(2);
-                state.mood = "content".to_string();
+                increase_mood(state, 3);
                 state.activity = "walking".to_string();
             }
             "speak" | "heartbeat" => {
@@ -628,24 +885,139 @@ fn record_pet_interaction_internal(
             }
             "vision-change" | "vision_change" => {
                 state.attention = state.attention.saturating_add(4).min(100);
-                state.mood = "curious".to_string();
+                increase_mood(state, 2);
                 state.activity = "watching".to_string();
             }
             "pet-conversation" | "pet_conversation" => {
                 state.attention = state.attention.saturating_add(5).min(100);
                 state.bond = state.bond.saturating_add(1).min(100);
                 state.pet_interaction_count = state.pet_interaction_count.saturating_add(1);
-                state.mood = "social".to_string();
+                increase_mood(state, 4);
                 state.activity = "talking".to_string();
             }
             _ => {
                 state.attention = state.attention.saturating_add(8).min(100);
                 state.bond = state.bond.saturating_add(1).min(100);
-                state.mood = "happy".to_string();
+                increase_mood(state, 4);
                 state.activity = "playing".to_string();
             }
         }
+        state.peak_bond = state.peak_bond.max(state.bond);
+        refresh_mood_label(state);
     })
+}
+
+fn emit_interaction_feedback(
+    app: &tauri::AppHandle,
+    pet_id: &str,
+    kind: &str,
+    state: &PetLifeState,
+) {
+    let _ = app.emit(
+        "pet://interaction-feedback",
+        serde_json::json!({
+            "petId": pet_id,
+            "kind": kind,
+            "mood": state.mood,
+            "moodValue": state.mood_value,
+            "energy": state.energy,
+            "attention": state.attention,
+        }),
+    );
+}
+
+pub(crate) fn perform_pet_action_internal(
+    app: &tauri::AppHandle,
+    pet_id: &str,
+    action: &str,
+) -> Result<PetLifeState, String> {
+    let now = now_ms();
+    let current = pet_life_state(app, pet_id)?;
+    let action = action.to_ascii_lowercase();
+    match action.as_str() {
+        "feed"
+            if current.last_fed_at > 0 && now.saturating_sub(current.last_fed_at) < 10 * 60_000 =>
+        {
+            return Err("还没到下一次投喂时间".to_string());
+        }
+        "play"
+            if current.last_played_at > 0
+                && now.saturating_sub(current.last_played_at) < 30_000 =>
+        {
+            return Err("先休息一下，再来玩吧".to_string());
+        }
+        "feed" | "play" | "sleep" | "wake" => {}
+        _ => return Err("不支持的宠物动作".to_string()),
+    }
+    let state = update_pet_life_state(app, pet_id, |state| {
+        if matches!(action.as_str(), "feed" | "play") && state.activity == "sleeping" {
+            state.sleep_override_until = now.saturating_add(10 * 60_000);
+            state.sleeping_since = 0;
+        }
+        state.last_interaction_at = now;
+        state.last_bond_decay_at = now;
+        match action.as_str() {
+            "feed" => {
+                state.energy = state.energy.saturating_add(15).min(100);
+                state.attention = state.attention.saturating_add(4).min(100);
+                state.bond = state.bond.saturating_add(1).min(100);
+                increase_mood(state, 8);
+                state.last_fed_at = now;
+                state.activity = "eating".to_string();
+            }
+            "play" => {
+                state.energy = state.energy.saturating_sub(8);
+                state.attention = state.attention.saturating_add(10).min(100);
+                state.bond = state.bond.saturating_add(1).min(100);
+                increase_mood(state, 10);
+                state.last_played_at = now;
+                state.activity = "playing".to_string();
+            }
+            "sleep" => {
+                state.activity = "sleeping".to_string();
+                state.sleeping_since = now;
+                state.sleep_override_until = 0;
+            }
+            "wake" => {
+                state.activity = "idle".to_string();
+                state.sleeping_since = 0;
+                state.sleep_override_until = now.saturating_add(10 * 60_000);
+                state.mood_value = state.mood_value.max(58);
+            }
+            _ => unreachable!(),
+        }
+        refresh_mood_label(state);
+    })?;
+    emit_interaction_feedback(app, pet_id, &action, &state);
+    Ok(state)
+}
+
+pub(crate) fn record_petting_internal(
+    app: &tauri::AppHandle,
+    pet_id: &str,
+) -> Result<PetLifeState, String> {
+    let now = now_ms();
+    let current = pet_life_state(app, pet_id)?;
+    let effective =
+        current.last_petted_at == 0 || now.saturating_sub(current.last_petted_at) >= 2_000;
+    let state = update_pet_life_state(app, pet_id, |state| {
+        if state.activity == "sleeping" {
+            state.sleep_override_until = now.saturating_add(10 * 60_000);
+            state.sleeping_since = 0;
+        }
+        if effective {
+            state.last_interaction_at = now;
+            state.last_bond_decay_at = now;
+            state.last_petted_at = now;
+            state.attention = state.attention.saturating_add(4).min(100);
+            state.bond = state.bond.saturating_add(1).min(100);
+            increase_mood(state, 5);
+        }
+        state.activity = "being-petted".to_string();
+        refresh_mood_label(state);
+    })?;
+    emit_interaction_feedback(app, pet_id, "petting", &state);
+    Ok(state)
 }
 
 fn record_pet_behavior_internal(
@@ -1351,6 +1723,21 @@ fn choose_relationship_memories(app: &tauri::AppHandle, pet_id: &str) -> Vec<Mem
     relevant_memories(&memories, "宠物之间的互动和共同经历")
 }
 
+fn choose_pet_conversation_memories(
+    app: &tauri::AppHandle,
+    pet_id: &str,
+    memory_enabled: bool,
+) -> Vec<MemoryFact> {
+    let mut selected = choose_relationship_memories(app, pet_id);
+    if memory_enabled {
+        selected.extend(choose_memories(app, pet_id, "和另一只宠物的共同经历"));
+    }
+    selected.sort_by_key(|memory| if memory.kind == "relationship" { 0 } else { 1 });
+    selected.dedup_by(|left, right| left.id == right.id);
+    selected.truncate(8);
+    selected
+}
+
 fn clean_reply(text: String, max_chars: usize) -> String {
     let text = text.trim().trim_matches('`').trim().to_string();
     if text.len() > max_chars {
@@ -2003,6 +2390,33 @@ pub(crate) fn record_pet_interaction(
 }
 
 #[tauri::command]
+pub(crate) fn perform_pet_action(
+    app: tauri::AppHandle,
+    pet_id: String,
+    action: String,
+) -> Result<PetLifeState, String> {
+    perform_pet_action_internal(&app, &pet_id, &action)
+}
+
+#[tauri::command]
+pub(crate) fn record_petting(
+    app: tauri::AppHandle,
+    pet_id: String,
+) -> Result<PetLifeState, String> {
+    record_petting_internal(&app, &pet_id)
+}
+
+#[tauri::command]
+pub(crate) fn wake_pet(app: tauri::AppHandle, pet_id: String) -> Result<PetLifeState, String> {
+    perform_pet_action_internal(&app, &pet_id, "wake")
+}
+
+#[tauri::command]
+pub(crate) fn sleep_pet(app: tauri::AppHandle, pet_id: String) -> Result<PetLifeState, String> {
+    perform_pet_action_internal(&app, &pet_id, "sleep")
+}
+
+#[tauri::command]
 pub(crate) fn settle_pet_activity(
     app: tauri::AppHandle,
     pet_id: String,
@@ -2471,7 +2885,7 @@ async fn run_heartbeat(app: tauri::AppHandle, pet_id: String) -> Result<(), Stri
         return Ok(());
     }
     let pet_settings = super::settings_for_pet(&config, &pet_id);
-    if pet_settings.paused || pet_settings.quiet_mode {
+    if pet_settings.paused || pet_settings.quiet_mode || super::environment::is_auto_quiet(&app) {
         return Ok(());
     }
     let endpoint = ai
@@ -2715,6 +3129,131 @@ fn store_pet_relationship_memory(
     )
 }
 
+fn pair_relationship_key(first_id: &str, second_id: &str) -> Result<String, String> {
+    if !super::is_safe_id(first_id) || !super::is_safe_id(second_id) || first_id == second_id {
+        return Err("宠物关系 id 无效".to_string());
+    }
+    let mut ids = [first_id, second_id];
+    ids.sort_unstable();
+    Ok(format!("{}__{}", ids[0], ids[1]))
+}
+
+fn pair_relationship_path(
+    app: &tauri::AppHandle,
+    first_id: &str,
+    second_id: &str,
+) -> Result<PathBuf, String> {
+    let key = pair_relationship_key(first_id, second_id)?;
+    Ok(app_ai_path(app)?
+        .join("relationships")
+        .join(format!("{key}.json")))
+}
+
+fn load_pair_relationship(
+    app: &tauri::AppHandle,
+    first_id: &str,
+    second_id: &str,
+) -> Result<PetPairRelationship, String> {
+    let path = pair_relationship_path(app, first_id, second_id)?;
+    let mut relationship: PetPairRelationship = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    relationship.pair_id = pair_relationship_key(first_id, second_id)?;
+    let now = now_ms();
+    if relationship.known_since == 0 {
+        relationship.known_since = now;
+    }
+    if relationship.last_advanced_at == 0 {
+        relationship.last_advanced_at = now;
+    }
+    if relationship.last_interaction_at > 0 {
+        let decay_start = relationship
+            .last_interaction_at
+            .saturating_add(14 * 24 * 3_600_000);
+        let cursor = relationship.last_advanced_at.max(decay_start);
+        if now > cursor {
+            let weeks = (now - cursor) / (7 * 24 * 3_600_000);
+            relationship.affinity = relationship.affinity.saturating_sub(weeks.min(10) as u8);
+            relationship.last_advanced_at = now;
+        }
+    }
+    relationship.level = relationship_level(relationship.affinity);
+    relationship.peak_affinity = relationship.peak_affinity.max(relationship.affinity);
+    Ok(relationship)
+}
+
+fn save_pair_relationship(
+    app: &tauri::AppHandle,
+    first_id: &str,
+    second_id: &str,
+    relationship: &PetPairRelationship,
+) -> Result<(), String> {
+    let path = pair_relationship_path(app, first_id, second_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建宠物关系目录: {error}"))?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(relationship).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("无法保存宠物关系: {error}"))?;
+    #[cfg(target_os = "windows")]
+    if path.exists() {
+        fs::remove_file(&path).map_err(|error| format!("无法替换宠物关系: {error}"))?;
+    }
+    fs::rename(temporary, path).map_err(|error| format!("无法替换宠物关系: {error}"))
+}
+
+pub(crate) fn record_pet_pair_interaction(
+    app: &tauri::AppHandle,
+    first_id: &str,
+    second_id: &str,
+) -> Result<PetPairRelationship, String> {
+    let now = now_ms();
+    let mut relationship = load_pair_relationship(app, first_id, second_id)?;
+    relationship.affinity = relationship.affinity.saturating_add(2).min(100);
+    relationship.peak_affinity = relationship.peak_affinity.max(relationship.affinity);
+    relationship.level = relationship_level(relationship.affinity);
+    relationship.interaction_count = relationship.interaction_count.saturating_add(1);
+    relationship.last_interaction_at = now;
+    relationship.last_advanced_at = now;
+    for (id, unlocked) in [
+        ("first-meet", relationship.interaction_count >= 1),
+        ("ten-exchanges", relationship.interaction_count >= 10),
+        ("fifty-exchanges", relationship.interaction_count >= 50),
+    ] {
+        if unlocked
+            && !relationship
+                .unlocked_milestones
+                .iter()
+                .any(|item| item == id)
+        {
+            relationship.unlocked_milestones.push(id.to_string());
+        }
+    }
+    save_pair_relationship(app, first_id, second_id, &relationship)?;
+    let _ = app.emit(
+        "pet://pair-relationship",
+        serde_json::json!({
+            "firstPetId": first_id,
+            "secondPetId": second_id,
+            "relationship": relationship,
+        }),
+    );
+    Ok(relationship)
+}
+
+#[tauri::command]
+pub(crate) fn get_pet_relationship(
+    app: tauri::AppHandle,
+    first_pet_id: String,
+    second_pet_id: String,
+) -> Result<PetPairRelationship, String> {
+    load_pair_relationship(&app, &first_pet_id, &second_pet_id)
+}
+
 async fn run_pet_conversation(
     app: tauri::AppHandle,
     first_id: String,
@@ -2752,16 +3291,8 @@ async fn run_pet_conversation(
     let second_name = super::pet_display_name(&app, &second_id);
     let first_messages = load_messages(&app, &first_id)?;
     let second_messages = load_messages(&app, &second_id)?;
-    let first_memories = if ai.memory_enabled {
-        choose_memories(&app, &first_id, "和另一只宠物的共同经历")
-    } else {
-        choose_relationship_memories(&app, &first_id)
-    };
-    let second_memories = if ai.memory_enabled {
-        choose_memories(&app, &second_id, "和另一只宠物的共同经历")
-    } else {
-        choose_relationship_memories(&app, &second_id)
-    };
+    let first_memories = choose_pet_conversation_memories(&app, &first_id, ai.memory_enabled);
+    let second_memories = choose_pet_conversation_memories(&app, &second_id, ai.memory_enabled);
     let first_state = pet_life_state(&app, &first_id)?;
     let second_state = pet_life_state(&app, &second_id)?;
     let profile = load_profile(&app);
@@ -2778,6 +3309,12 @@ async fn run_pet_conversation(
         &second_memories,
         &second_state,
     );
+    if let Ok(pair) = load_pair_relationship(&app, &first_id, &second_id) {
+        prompt.push_str(&format!(
+            "\n\n它们之间的关系记录（优先于普通用户资料）：亲密度 {}/100，关系等级 {}，共同互动 {} 次。请延续这段关系，不要凭空改变。",
+            pair.affinity, pair.level, pair.interaction_count
+        ));
+    }
     prompt.push_str(&desktop_context_prompt(&app, &config, &first_id));
     prompt.push_str(&desktop_context_prompt(&app, &config, &second_id));
     let history = conversation_history(
@@ -2861,6 +3398,9 @@ async fn run_pet_conversation(
 
     let _ = record_pet_interaction_internal(&app, &first_id, "pet-conversation");
     let _ = record_pet_interaction_internal(&app, &second_id, "pet-conversation");
+    if let Err(error) = record_pet_pair_interaction(&app, &first_id, &second_id) {
+        eprintln!("pet pair relationship save failed: {error}");
+    }
     if let Some(message) = first_message {
         record_pet_behavior_internal(&app, &first_id, &first_behavior)?;
         let _ = app.emit(
@@ -2888,6 +3428,95 @@ async fn run_pet_conversation(
     Ok(())
 }
 
+fn advance_life_states(app: &tauri::AppHandle, config: &super::AppConfig) {
+    let mut pet_ids: Vec<String> = config
+        .instances
+        .iter()
+        .map(|instance| instance.pet_id.clone())
+        .collect();
+    pet_ids.sort();
+    pet_ids.dedup();
+
+    for pet_id in pet_ids {
+        let before_activity = app
+            .state::<AppState>()
+            .ai
+            .life_states
+            .lock()
+            .ok()
+            .and_then(|states| states.get(&pet_id).map(|state| state.activity.clone()));
+        let Ok(state) = pet_life_state(app, &pet_id) else {
+            continue;
+        };
+        let _ = app.emit(
+            "pet://life-state",
+            serde_json::json!({"petId": pet_id.clone(), "state": state}),
+        );
+        if before_activity.as_deref() != Some("sleeping") && state.activity == "sleeping" {
+            let _ = app.emit(
+                "pet://life-dialogue",
+                serde_json::json!({"petId": pet_id.clone(), "trigger": "sleep"}),
+            );
+        } else if before_activity.as_deref() == Some("sleeping") && state.activity != "sleeping" {
+            let _ = app.emit(
+                "pet://life-dialogue",
+                serde_json::json!({"petId": pet_id.clone(), "trigger": "wake"}),
+            );
+        }
+
+        let minutes = current_local_minutes();
+        let date = local_date();
+        let greeting = if (360..=659).contains(&minutes) {
+            Some("morning")
+        } else if (1080..=1379).contains(&minutes) {
+            Some("evening")
+        } else {
+            None
+        };
+        if let Some(trigger) = greeting {
+            let greeting_key = format!("{date}:{trigger}");
+            let already_greeted = state.last_greeting_date == greeting_key;
+            if !already_greeted {
+                let _ = update_pet_life_state(app, &pet_id, |life| {
+                    life.last_greeting_date = greeting_key.clone();
+                });
+                let _ = app.emit(
+                    "pet://life-dialogue",
+                    serde_json::json!({"petId": pet_id.clone(), "trigger": trigger}),
+                );
+            }
+        }
+    }
+}
+
+pub(crate) fn set_all_pets_sleeping(app: &tauri::AppHandle, sleeping: bool) {
+    let Ok(config) = config_snapshot(app) else {
+        return;
+    };
+    let mut pet_ids: Vec<String> = config
+        .instances
+        .iter()
+        .map(|instance| instance.pet_id.clone())
+        .collect();
+    pet_ids.sort();
+    pet_ids.dedup();
+    for pet_id in pet_ids {
+        let settings = super::settings_for_pet(&config, &pet_id);
+        let _ = update_pet_life_state(app, &pet_id, |state| {
+            if sleeping {
+                state.activity = "sleeping".to_string();
+                state.sleeping_since = now_ms();
+            } else {
+                state.activity = "idle".to_string();
+                state.sleeping_since = 0;
+                state.sleep_override_until = 0;
+                advance_pet_life_state_with_settings(state, now_ms(), &settings);
+            }
+            refresh_mood_label(state);
+        });
+    }
+}
+
 pub(crate) fn start_heartbeat_scheduler(app: &tauri::AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -2898,6 +3527,7 @@ pub(crate) fn start_heartbeat_scheduler(app: &tauri::AppHandle) {
             let Ok(config) = config_snapshot(&app) else {
                 continue;
             };
+            advance_life_states(&app, &config);
             if !settings_have_chat(&config.ai)
                 || (!config.ai.heartbeat_enabled && !config.ai.pet_conversation_enabled)
             {
@@ -2907,7 +3537,9 @@ pub(crate) fn start_heartbeat_scheduler(app: &tauri::AppHandle) {
                 .into_iter()
                 .filter(|instance| {
                     let settings = super::settings_for_pet(&config, &instance.pet_id);
-                    !settings.paused && !settings.quiet_mode
+                    !settings.paused
+                        && !settings.quiet_mode
+                        && !super::environment::is_auto_quiet(&app)
                 })
                 .map(|instance| instance.pet_id)
                 .collect();
@@ -3189,10 +3821,33 @@ mod tests {
     fn pet_life_state_decays_attention_and_becomes_lonely() {
         let mut state = PetLifeState::default();
         state.attention = 35;
+        state.last_advanced_at = now_ms().saturating_sub(48 * 3_600_000);
         state.last_interaction_at = now_ms().saturating_sub(10 * 3_600_000);
         advance_pet_life_state(&mut state, now_ms());
         assert!(state.attention <= 20);
         assert_eq!(state.mood, "lonely");
+    }
+
+    #[test]
+    fn relationship_levels_follow_the_documented_ranges() {
+        assert_eq!(relationship_level(0), 1);
+        assert_eq!(relationship_level(19), 1);
+        assert_eq!(relationship_level(20), 2);
+        assert_eq!(relationship_level(45), 3);
+        assert_eq!(relationship_level(70), 4);
+        assert_eq!(relationship_level(90), 5);
+    }
+
+    #[test]
+    fn sleep_window_supports_crossing_midnight() {
+        let settings = PetSettings {
+            sleep_start_minutes: 1_410,
+            wake_minutes: 450,
+            ..PetSettings::default()
+        };
+        assert!(is_sleep_window(&settings, 23 * 60 + 45));
+        assert!(is_sleep_window(&settings, 6 * 60));
+        assert!(!is_sleep_window(&settings, 12 * 60));
     }
 
     #[test]

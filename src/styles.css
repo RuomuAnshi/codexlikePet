@@ -46,6 +46,58 @@ body {
   pointer-events: auto;
 }
 
+.effect-layer,
+.emotion-icon {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.emotion-icon {
+  z-index: 3;
+  top: 18px;
+  left: auto;
+  right: 18px;
+  width: 24px;
+  height: 24px;
+  color: #f0649c;
+  font-size: 20px;
+  line-height: 24px;
+  opacity: 0;
+  transform: translateY(5px) scale(0.8);
+  transition: opacity 180ms ease, transform 180ms ease;
+}
+
+.emotion-visible {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
+.particle {
+  position: absolute;
+  z-index: 3;
+  color: #f0649c;
+  font-size: 19px;
+  line-height: 1;
+  pointer-events: none;
+  animation: pet-particle 1s ease-out forwards;
+}
+
+.particle-star { color: #66bfd2; }
+.particle-food { color: #f5b44c; }
+.particle-dust { color: #aacbd1; font-size: 25px; }
+
+.is-carried #stage {
+  transform: rotate(-4deg) translateY(-3px);
+  transform-origin: 50% 86%;
+}
+
+@keyframes pet-particle {
+  from { opacity: 0; transform: translateY(7px) scale(0.7); }
+  25% { opacity: 1; }
+  to { opacity: 0; transform: translateY(-38px) scale(1.15); }
+}
+
 .speech {
   position: absolute;
   top: 4px;
@@ -93,7 +145,11 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .speech {
+  .speech,
+  .emotion-icon {
     transition: none;
   }
+
+  .particle { animation: none; opacity: 0; }
+  .is-carried #stage { transform: none; }
 }

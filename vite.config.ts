@@ -17,6 +17,7 @@ export default defineConfig(async () => ({
         manager: "manager.html",
         "ai-settings": "ai-settings.html",
         chat: "chat.html",
+        "environment-settings": "environment.html",
       },
     },
   },

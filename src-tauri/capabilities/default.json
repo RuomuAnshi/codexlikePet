@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the pet and pet manager windows",
-  "windows": ["main", "pet-manager", "pet-*", "pet-chat-*"],
+  "windows": ["main", "pet-manager", "ai-settings", "environment-settings", "pet-*", "pet-chat-*"],
   "permissions": [
     "core:default",
     "core:window:allow-set-position",
