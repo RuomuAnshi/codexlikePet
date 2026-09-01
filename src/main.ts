@@ -255,7 +255,7 @@ async function boot(): Promise<void> {
     engine.play(!next.paused);
     if (next.paused || !next.wanderEnabled || next.quietMode || autoQuiet) walker.stop();
     else if (!dragging) walker.start();
-    if (!dragging) engine.setLook(lastDirection);
+    if (!dragging && !walking) engine.setLook(lastDirection);
     syncAnimation();
     scheduleIdleSpeech();
   };
@@ -350,7 +350,7 @@ async function boot(): Promise<void> {
 
   watchCursorDirection((direction) => {
     lastDirection = direction === null ? null : (direction as LookDirection);
-    if (!dragging) engine.setLook(lastDirection);
+    if (!dragging && !walking && !dragState.petting && !socialSceneId) engine.setLook(lastDirection);
   });
 
   attachDrag(
@@ -400,7 +400,9 @@ async function boot(): Promise<void> {
   });
   petEl.addEventListener("pointerleave", () => {
     hovered = false;
-    if (!dragging && !stateMachine.hasAction()) engine.setLook(lastDirection);
+    if (!dragging && !walking && !dragState.petting && !socialSceneId && !stateMachine.hasAction()) {
+      engine.setLook(lastDirection);
+    }
   });
   petEl.addEventListener("dblclick", (event) => {
     event.preventDefault();

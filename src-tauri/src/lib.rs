@@ -1871,6 +1871,64 @@ fn get_visible_pets(app: tauri::AppHandle) -> Result<Vec<PetInstanceInfo>, Strin
     Ok(visible_instances(&app, &config))
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PetOccupancy {
+    instance_id: String,
+    pet_id: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// Logical rects of every other visible pet window, so a pet's autonomous
+/// walker can stop before running into a sibling instead of passing through
+/// it. Self is excluded by instance id.
+#[tauri::command]
+fn get_pet_occupancies(
+    app: tauri::AppHandle,
+    instance_id: String,
+) -> Result<Vec<PetOccupancy>, String> {
+    if !is_safe_id(&instance_id) {
+        return Ok(Vec::new());
+    }
+    let config = config_snapshot(&app)?;
+    let mut result = Vec::new();
+    for instance in config.instances.iter().filter(|instance| {
+        instance.id != instance_id
+            && instance.visible
+            && !config
+                .disabled_pet_ids
+                .iter()
+                .any(|id| id == &instance.pet_id)
+    }) {
+        let label = instance_label(&instance.id)?;
+        let Some(window) = app.get_webview_window(&label) else {
+            continue;
+        };
+        if !window.is_visible().unwrap_or(false) {
+            continue;
+        }
+        let (Ok(position), Ok(size), Ok(scale_factor)) =
+            (window.outer_position(), window.outer_size(), window.scale_factor())
+        else {
+            continue;
+        };
+        let logical_position = position.to_logical(scale_factor);
+        let logical_size = size.to_logical(scale_factor);
+        result.push(PetOccupancy {
+            instance_id: instance.id.clone(),
+            pet_id: instance.pet_id.clone(),
+            x: logical_position.x,
+            y: logical_position.y,
+            width: logical_size.width,
+            height: logical_size.height,
+        });
+    }
+    Ok(result)
+}
+
 #[tauri::command]
 fn get_runtime_config(
     app: tauri::AppHandle,
@@ -3139,6 +3197,7 @@ pub fn run() {
             get_pet_settings,
             get_pet_instances,
             get_visible_pets,
+            get_pet_occupancies,
             get_runtime_config,
             set_pet_instance_visible,
             add_pet_instance,

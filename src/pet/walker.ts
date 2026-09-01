@@ -1,4 +1,5 @@
 import { LogicalPosition } from "@tauri-apps/api/dpi";
+import { invoke } from "@tauri-apps/api/core";
 import { currentMonitor, getCurrentWindow, primaryMonitor } from "@tauri-apps/api/window";
 import { dragState, type MoveDirection } from "./window";
 
@@ -6,6 +7,10 @@ const WALK_DELAY_MIN = 30000;
 const WALK_DELAY_MAX = 60000;
 const WALK_MIN_DISTANCE = 160;
 const WALK_TICK_MS = 50;
+const WALK_WOBBLE_COUNT = 3.5;
+const OCCUPANCY_REFRESH_MS = 200;
+const OCCUPANCY_MARGIN = 6;
+const STUCK_ABORT_MS = 1600;
 
 interface WalkBounds {
   minX: number;
@@ -19,6 +24,15 @@ interface WalkTarget {
   y: number;
 }
 
+interface PetOccupancy {
+  instanceId: string;
+  petId: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 /** Moves the pet occasionally while leaving long, quiet idle periods. */
 export class PetWalker {
   private readonly window = getCurrentWindow();
@@ -29,10 +43,18 @@ export class PetWalker {
   private enabled = true;
   private quietMode = false;
   private forcedTarget: WalkTarget | null = null;
+  private occupancy: PetOccupancy[] = [];
+  private occupancyStaleAt = 0;
+  private width = 0;
+  private height = 0;
 
   constructor(
     private readonly onChange: (walking: boolean, direction: MoveDirection | null) => void,
   ) {}
+
+  get isWalking(): boolean {
+    return this.walking;
+  }
 
   setSettings(speed: number, enabled: boolean, quietMode: boolean): void {
     this.speed = speed;
@@ -121,6 +143,8 @@ export class PetWalker {
       const workAreaSize = monitor.workArea.size.toLogical(monitor.scaleFactor);
       const currentPosition = position.toLogical(scaleFactor);
       const currentSize = windowSize.toLogical(scaleFactor);
+      this.width = currentSize.width;
+      this.height = currentSize.height;
       const bounds: WalkBounds = {
         minX: workAreaPosition.x,
         maxX: Math.max(workAreaPosition.x, workAreaPosition.x + workAreaSize.width - currentSize.width),
@@ -157,7 +181,7 @@ export class PetWalker {
 
       this.walking = true;
       this.onChange(true, direction);
-      await this.move(token, currentX, currentY, targetX, targetY, duration);
+      await this.move(token, currentX, currentY, targetX, targetY, duration, bounds, forcedTarget === null);
     } catch (error) {
       console.warn("autonomous pet walk stopped:", error);
       this.finish(token);
@@ -192,6 +216,29 @@ export class PetWalker {
     return horizontal < 0 ? "down-left" : "down-right";
   }
 
+  private async refreshOccupancy(): Promise<void> {
+    if (performance.now() < this.occupancyStaleAt) return;
+    this.occupancyStaleAt = performance.now() + OCCUPANCY_REFRESH_MS;
+    try {
+      this.occupancy = await invoke<PetOccupancy[]>("get_pet_occupancies", {
+        instanceId: this.window.label,
+      });
+    } catch {
+      this.occupancyStaleAt = 0;
+    }
+  }
+
+  private overlapsAny(x: number, y: number): boolean {
+    for (const other of this.occupancy) {
+      const margin = OCCUPANCY_MARGIN;
+      const overlapsX =
+        x < other.x + other.width + margin && x + this.width + margin > other.x;
+      const overlapsY = y < other.y + other.height + margin && y + this.height + margin > other.y;
+      if (overlapsX && overlapsY) return true;
+    }
+    return false;
+  }
+
   private async move(
     token: number,
     startX: number,
@@ -199,16 +246,40 @@ export class PetWalker {
     targetX: number,
     targetY: number,
     duration: number,
+    bounds: WalkBounds,
+    autonomous: boolean,
   ): Promise<void> {
+    const dx = targetX - startX;
+    const dy = targetY - startY;
+    const distance = Math.hypot(dx, dy) || 1;
+    const perpX = -dy / distance;
+    const perpY = dx / distance;
+    const amplitude = Math.min(16, distance * 0.12);
     const startedAt = performance.now();
+    let stuckSince: number | null = null;
+    await this.refreshOccupancy();
     while (token === this.walkToken && !dragState.current) {
-      const progress = Math.min(1, (performance.now() - startedAt) / duration);
-      const x = startX + (targetX - startX) * progress;
-      const y = startY + (targetY - startY) * progress;
-      await this.window.setPosition(new LogicalPosition(x, y));
+      const elapsed = performance.now() - startedAt;
+      const progress = Math.min(1, elapsed / duration);
+      const baseX = startX + dx * progress;
+      const baseY = startY + dy * progress;
+      const wobble = Math.sin(progress * Math.PI * 2 * WALK_WOBBLE_COUNT) * amplitude;
+      const x = Math.min(bounds.maxX, Math.max(bounds.minX, baseX + perpX * wobble));
+      const y = Math.min(bounds.maxY, Math.max(bounds.minY, baseY + perpY * wobble));
+
+      await this.refreshOccupancy();
+      if (this.overlapsAny(x, y)) {
+        // A sibling pet is in the way: hold still instead of passing through.
+        if (stuckSince === null) stuckSince = elapsed;
+        if (autonomous && elapsed - stuckSince >= STUCK_ABORT_MS) break;
+      } else {
+        stuckSince = null;
+        await this.window.setPosition(new LogicalPosition(x, y));
+      }
       if (progress >= 1) break;
       await new Promise<void>((resolve) => window.setTimeout(resolve, WALK_TICK_MS));
     }
+    this.occupancy = [];
     this.finish(token);
   }
 
