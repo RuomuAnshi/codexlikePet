@@ -38,6 +38,14 @@ const CONTEXT_MENU_ESTIMATED_WIDTH: f64 = 180.0;
 const CONTEXT_MENU_GAP: f64 = 8.0;
 const SPRITESHEET_WIDTH: u32 = 1536;
 const SPRITESHEET_HEIGHT: u32 = 2288;
+const FRAME_CELL_WIDTH: u32 = 192;
+const FRAME_CELL_HEIGHT: u32 = 208;
+const ANIMATION_PACK_FILE_NAME: &str = "animations.json";
+const ANIMATION_PACK_FORMAT: &str = "sakipet-frame-pack";
+const ANIMATION_PACK_VERSION: u8 = 1;
+const ANIMATION_PACK_MAX_BYTES: usize = 2 * 1024 * 1024;
+const ANIMATION_CLIP_MAX_BYTES: usize = 20 * 1024 * 1024;
+const ANIMATION_CLIP_MAX_FRAMES: u16 = 32;
 // The starter pet is a product default, not part of resource discovery. New
 // pets are still discovered from their own manifests and can be imported at
 // runtime without changing this value.
@@ -436,6 +444,55 @@ struct PetManifest {
     spritesheet_path: String,
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct AnimationClipManifest {
+    path: String,
+    frames: u16,
+    durations: Vec<u64>,
+    #[serde(rename = "loop")]
+    looped: bool,
+    #[serde(rename = "type")]
+    clip_type: String,
+    return_to: Option<String>,
+    fallback: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct AnimationPackManifest {
+    format: String,
+    version: u8,
+    cell_width: u32,
+    cell_height: u32,
+    clips: HashMap<String, AnimationClipManifest>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnimationClipRuntime {
+    path: String,
+    frames: u16,
+    durations: Vec<u64>,
+    #[serde(rename = "loop")]
+    looped: bool,
+    #[serde(rename = "type")]
+    clip_type: String,
+    return_to: Option<String>,
+    fallback: Option<String>,
+    data_url: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnimationPackRuntime {
+    format: String,
+    version: u8,
+    cell_width: u32,
+    cell_height: u32,
+    clips: HashMap<String, AnimationClipRuntime>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
@@ -800,6 +857,16 @@ struct InstalledPet {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct PetPreview {
+    id: String,
+    display_name: String,
+    description: String,
+    sprite_version_number: u8,
+    spritesheet_data_url: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PetInstanceInfo {
     id: String,
     pet_id: String,
@@ -820,6 +887,7 @@ struct RuntimeConfig {
     settings: PetSettings,
     dialogue: PetDialogue,
     character: CharacterCard,
+    animation_pack: Option<AnimationPackRuntime>,
 }
 
 #[derive(Clone, Serialize)]
@@ -843,6 +911,196 @@ fn is_safe_relative_path(value: &str) -> bool {
         && !value
             .split('/')
             .any(|part| part.is_empty() || part == ".." || part == ".")
+}
+
+fn is_valid_animation_state(value: &str) -> bool {
+    matches!(
+        value,
+        "idle"
+            | "running-right"
+            | "running-left"
+            | "waving"
+            | "jumping"
+            | "failed"
+            | "waiting"
+            | "running"
+            | "review"
+    )
+}
+
+fn parse_animation_pack(bytes: &[u8]) -> Result<AnimationPackManifest, String> {
+    if bytes.is_empty() || bytes.len() > ANIMATION_PACK_MAX_BYTES {
+        return Err("animations.json 为空或超过 2 MB".to_string());
+    }
+    let manifest = serde_json::from_slice::<AnimationPackManifest>(bytes)
+        .map_err(|error| format!("animations.json 格式错误: {error}"))?;
+    if manifest.format != ANIMATION_PACK_FORMAT || manifest.version != ANIMATION_PACK_VERSION {
+        return Err("animations.json 不是受支持的 SakiPet 帧动画包".to_string());
+    }
+    if manifest.cell_width != FRAME_CELL_WIDTH || manifest.cell_height != FRAME_CELL_HEIGHT {
+        return Err("animations.json 的帧尺寸必须为 192x208".to_string());
+    }
+    if manifest.clips.is_empty() || manifest.clips.len() > 64 {
+        return Err("animations.json 的 clips 数量必须在 1 到 64 之间".to_string());
+    }
+    Ok(manifest)
+}
+
+fn validate_animation_clip(
+    id: &str,
+    clip: &AnimationClipManifest,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if !is_safe_id(id) {
+        return Err(format!("动画 clip id 不安全: {id}"));
+    }
+    if !clip.path.starts_with("animations/") || !is_safe_relative_path(&clip.path) {
+        return Err(format!("动画 clip 路径不安全: {}", clip.path));
+    }
+    if clip.frames == 0 || clip.frames > ANIMATION_CLIP_MAX_FRAMES {
+        return Err(format!("动画 clip {id} 的帧数必须在 1 到 {ANIMATION_CLIP_MAX_FRAMES} 之间"));
+    }
+    if clip.durations.len() != usize::from(clip.frames)
+        || clip.durations.iter().any(|duration| !(30..=5_000).contains(duration))
+    {
+        return Err(format!("动画 clip {id} 的 duration 数量或范围无效"));
+    }
+    if !matches!(clip.clip_type.as_str(), "mode" | "gesture") {
+        return Err(format!("动画 clip {id} 的 type 必须为 mode 或 gesture"));
+    }
+    for target in [clip.return_to.as_deref(), clip.fallback.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if !is_valid_animation_state(target) {
+            return Err(format!("动画 clip {id} 的状态回退目标无效: {target}"));
+        }
+    }
+    if bytes.is_empty() || bytes.len() > ANIMATION_CLIP_MAX_BYTES {
+        return Err(format!("动画 clip {id} 为空或超过 20 MB"));
+    }
+    let decoded = image::load_from_memory(bytes)
+        .map_err(|error| format!("无法解码动画 clip {id}: {error}"))?;
+    let expected_width = FRAME_CELL_WIDTH * u32::from(clip.frames);
+    if decoded.width() != expected_width || decoded.height() != FRAME_CELL_HEIGHT {
+        return Err(format!(
+            "动画 clip {id} 尺寸为 {}x{}，应为 {}x{}",
+            decoded.width(),
+            decoded.height(),
+            expected_width,
+            FRAME_CELL_HEIGHT
+        ));
+    }
+    Ok(())
+}
+
+fn build_animation_pack_runtime(
+    manifest: AnimationPackManifest,
+    root: &Path,
+) -> Result<AnimationPackRuntime, String> {
+    let mut clips = HashMap::new();
+    for (id, clip) in manifest.clips {
+        let bytes = fs::read(root.join(&clip.path))
+            .map_err(|error| format!("无法读取动画 clip {}: {error}", clip.path))?;
+        validate_animation_clip(&id, &clip, &bytes)?;
+        clips.insert(
+            id,
+            AnimationClipRuntime {
+                path: clip.path.clone(),
+                frames: clip.frames,
+                durations: clip.durations.clone(),
+                looped: clip.looped,
+                clip_type: clip.clip_type.clone(),
+                return_to: clip.return_to.clone(),
+                fallback: clip.fallback.clone(),
+                data_url: data_url(&clip.path, &bytes),
+            },
+        );
+    }
+    Ok(AnimationPackRuntime {
+        format: manifest.format,
+        version: manifest.version,
+        cell_width: manifest.cell_width,
+        cell_height: manifest.cell_height,
+        clips,
+    })
+}
+
+fn animation_pack_from_root(root: &Path) -> Option<AnimationPackRuntime> {
+    let manifest_path = root.join(ANIMATION_PACK_FILE_NAME);
+    let bytes = match fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            eprintln!("无法读取 {}: {error}", manifest_path.display());
+            return None;
+        }
+    };
+    let manifest = match parse_animation_pack(&bytes) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!("忽略无效的 {}: {error}", manifest_path.display());
+            return None;
+        }
+    };
+    match build_animation_pack_runtime(manifest, root) {
+        Ok(pack) => Some(pack),
+        Err(error) => {
+            eprintln!("忽略无效的 {}: {error}", manifest_path.display());
+            None
+        }
+    }
+}
+
+fn animation_pack_for_pet(app: &tauri::AppHandle, pet_id: &str) -> Option<AnimationPackRuntime> {
+    if let Ok(root) = imported_pets_path(app) {
+        let root = root.join(pet_id);
+        if root.join("pet.json").is_file() {
+            return animation_pack_from_root(&root);
+        }
+    }
+    let bundled = pet_is_bundled(app, pet_id)?;
+    bundled_pet_roots(app)
+        .into_iter()
+        .map(|root| root.join(&bundled.path))
+        .find(|root| root.join("pet.json").is_file())
+        .and_then(|root| animation_pack_from_root(&root))
+}
+
+fn animation_pack_from_archive(
+    archive: &mut ZipArchive<Cursor<Vec<u8>>>,
+    root: &str,
+) -> Result<Option<(Vec<u8>, Vec<(String, Vec<u8>)>)>, String> {
+    let archive_manifest_path = format!("{root}{ANIMATION_PACK_FILE_NAME}");
+    if !archive
+        .file_names()
+        .any(|name| name == archive_manifest_path)
+    {
+        return Ok(None);
+    }
+    let mut manifest_bytes = Vec::new();
+    archive
+        .by_name(&archive_manifest_path)
+        .map_err(|error| format!("无法读取 animations.json: {error}"))?
+        .read_to_end(&mut manifest_bytes)
+        .map_err(|error| format!("无法读取 animations.json: {error}"))?;
+    let manifest = parse_animation_pack(&manifest_bytes)?;
+    let mut clip_files = Vec::with_capacity(manifest.clips.len());
+    for (id, clip) in &manifest.clips {
+        let archive_clip_path = format!("{root}{}", clip.path);
+        if !archive.file_names().any(|name| name == archive_clip_path) {
+            return Err(format!("宠物包内缺少动画 clip: {}", clip.path));
+        }
+        let mut bytes = Vec::new();
+        archive
+            .by_name(&archive_clip_path)
+            .map_err(|error| format!("无法读取动画 clip {}: {error}", clip.path))?
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("无法读取动画 clip {}: {error}", clip.path))?;
+        validate_animation_clip(id, clip, &bytes)?;
+        clip_files.push((clip.path.clone(), bytes));
+    }
+    Ok(Some((manifest_bytes, clip_files)))
 }
 
 /// Discover bundled pets from their own `pet.json` records. The frontend
@@ -1853,6 +2111,41 @@ fn get_pet_catalog(app: tauri::AppHandle) -> Result<Vec<InstalledPet>, String> {
 }
 
 #[tauri::command]
+fn get_pet_preview(app: tauri::AppHandle, pet_id: String) -> Result<PetPreview, String> {
+    if !is_safe_id(&pet_id) {
+        return Err("invalid pet id".to_string());
+    }
+
+    if let Some((manifest, sprite)) = pet_is_imported(&app, &pet_id) {
+        return Ok(PetPreview {
+            id: manifest.id,
+            display_name: manifest.display_name,
+            description: manifest.description,
+            sprite_version_number: manifest.sprite_version_number,
+            spritesheet_data_url: data_url(&manifest.spritesheet_path, &sprite),
+        });
+    }
+
+    let bundled = pet_is_bundled(&app, &pet_id)
+        .ok_or_else(|| "pet resource is not installed".to_string())?;
+    let sprite_path = bundled_pet_roots(&app)
+        .into_iter()
+        .map(|root| root.join(&bundled.path).join(&bundled.manifest.spritesheet_path))
+        .find(|path| path.is_file())
+        .ok_or_else(|| "pet spritesheet is not installed".to_string())?;
+    let sprite = fs::read(&sprite_path)
+        .map_err(|error| format!("failed to read pet preview: {error}"))?;
+
+    Ok(PetPreview {
+        id: bundled.manifest.id,
+        display_name: bundled.manifest.display_name,
+        description: bundled.manifest.description,
+        sprite_version_number: bundled.manifest.sprite_version_number,
+        spritesheet_data_url: data_url(&bundled.manifest.spritesheet_path, &sprite),
+    })
+}
+
+#[tauri::command]
 fn get_pet_settings(app: tauri::AppHandle, pet_id: String) -> Result<PetSettings, String> {
     if !pet_exists(&app, &pet_id) {
         return Err("宠物资源不存在或校验失败".to_string());
@@ -1954,6 +2247,7 @@ fn get_runtime_config(
             settings: settings_for_pet(&config, &instance.pet_id),
             dialogue: character.dialogue.clone(),
             character,
+            animation_pack: animation_pack_for_pet(&app, &instance.pet_id),
         });
     }
     let bundled = pet_is_bundled(&app, &instance.pet_id)
@@ -1969,6 +2263,7 @@ fn get_runtime_config(
         settings: settings_for_pet(&config, &instance.pet_id),
         dialogue: character.dialogue.clone(),
         character,
+        animation_pack: animation_pack_for_pet(&app, &instance.pet_id),
     })
 }
 
@@ -2388,6 +2683,13 @@ fn import_pet_package(
     } else {
         None
     };
+    let animation_pack = match animation_pack_from_archive(&mut archive, &root) {
+        Ok(pack) => pack,
+        Err(error) => {
+            eprintln!("忽略宠物包中的 animations.json: {error}");
+            None
+        }
+    };
     if pet_is_bundled(&app, &manifest.id).is_some() || pet_is_imported(&app, &manifest.id).is_some()
     {
         return Err(format!("宠物 id 已存在: {}", manifest.id));
@@ -2403,6 +2705,22 @@ fn import_pet_package(
     if let Some((character_bytes, _)) = &character {
         fs::write(pet_root.join("character.json"), character_bytes)
             .map_err(|error| format!("无法保存 character.json: {error}"))?;
+    }
+    if let Some((animation_manifest_bytes, clip_files)) = animation_pack {
+        fs::write(
+            pet_root.join(ANIMATION_PACK_FILE_NAME),
+            animation_manifest_bytes,
+        )
+        .map_err(|error| format!("无法保存 animations.json: {error}"))?;
+        for (clip_path, bytes) in clip_files {
+            let target = pet_root.join(&clip_path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("无法创建动画目录: {error}"))?;
+            }
+            fs::write(&target, bytes)
+                .map_err(|error| format!("无法保存动画 clip {}: {error}", clip_path))?;
+        }
     }
     rebuild_tray_menu(&app).map_err(|error| error.to_string())?;
     let config = config_snapshot(&app)?;
@@ -3194,6 +3512,7 @@ pub fn run() {
             toggle_pet_chat,
             hide_pet_chat,
             get_pet_catalog,
+            get_pet_preview,
             get_pet_settings,
             get_pet_instances,
             get_visible_pets,
@@ -3326,5 +3645,54 @@ mod tests {
     fn character_file_limit_is_one_megabyte() {
         let bytes = vec![b' '; 1024 * 1024 + 1];
         assert!(decode_character(&bytes).is_err());
+    }
+
+    #[test]
+    fn parses_optional_frame_animation_pack() {
+        let manifest = parse_animation_pack(
+            br#"{
+              "format":"sakipet-frame-pack",
+              "version":1,
+              "cellWidth":192,
+              "cellHeight":208,
+              "clips":{
+                "yawn":{
+                  "path":"animations/yawn.webp",
+                  "frames":2,
+                  "durations":[140,320],
+                  "loop":false,
+                  "type":"gesture",
+                  "returnTo":"idle"
+                }
+              }
+            }"#,
+        )
+        .expect("valid frame animation pack should parse");
+        assert_eq!(manifest.clips["yawn"].frames, 2);
+        assert_eq!(manifest.clips["yawn"].return_to.as_deref(), Some("idle"));
+    }
+
+    #[test]
+    fn rejects_frame_animation_pack_with_unsafe_clip_path() {
+        let manifest = parse_animation_pack(
+            br#"{
+              "format":"sakipet-frame-pack",
+              "version":1,
+              "cellWidth":192,
+              "cellHeight":208,
+              "clips":{
+                "escape":{
+                  "path":"../outside.webp",
+                  "frames":1,
+                  "durations":[140],
+                  "loop":false,
+                  "type":"gesture"
+                }
+              }
+            }"#,
+        )
+        .expect("manifest parsing is independent from path validation");
+        let clip = &manifest.clips["escape"];
+        assert!(validate_animation_clip("escape", clip, &[0u8; 1]).is_err());
     }
 }

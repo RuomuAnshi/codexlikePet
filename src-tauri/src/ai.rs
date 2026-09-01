@@ -218,6 +218,8 @@ pub(crate) struct PetBehavior {
     pub duration: u64,
     pub next_action_after: u64,
     pub look: Option<String>,
+    pub mode: Option<String>,
+    pub gesture: Option<String>,
 }
 
 impl Default for PetBehavior {
@@ -229,6 +231,8 @@ impl Default for PetBehavior {
             duration: 5_200,
             next_action_after: 1_800,
             look: None,
+            mode: None,
+            gesture: None,
         }
     }
 }
@@ -1037,12 +1041,19 @@ fn record_pet_behavior_internal(
         if !behavior.mood.trim().is_empty() {
             state.mood = behavior.mood.clone();
         }
-        state.activity = match behavior.action.as_str() {
-            "walk" => "walking",
-            "sleep" => "sleeping",
-            "waving" | "jumping" => "playing",
-            _ if !behavior.say.trim().is_empty() => "speaking",
-            _ => "idle",
+        state.activity = match behavior.mode.as_deref() {
+            Some("sleeping") => "sleeping",
+            Some("working") => "working",
+            Some("waiting") => "waiting",
+            Some("idle") => "idle",
+            _ => match behavior.action.as_str() {
+                "walk" => "walking",
+                "sleep" => "sleeping",
+                "waving" | "jumping" | "failed" => "playing",
+                "running" => "working",
+                _ if !behavior.say.trim().is_empty() => "speaking",
+                _ => "idle",
+            },
         }
         .to_string();
         if !behavior.say.trim().is_empty() {
@@ -1259,7 +1270,7 @@ fn prompt_for(
         state.pet_interaction_count,
     ));
     prompt.push_str(
-        "回复要求：使用自然简短的中文，保持角色语气。只返回 JSON，不要 Markdown 或解释，格式为 {\"say\":\"要说的话\",\"action\":\"idle|waving|jumping|waiting|review|walk|sleep\",\"mood\":\"当前心情\",\"look\":\"up|up-right|right|down-right|down|down-left|left|up-left|null\",\"duration\":5200,\"nextActionAfter\":1800}。普通聊天优先使用 idle，只有确实适合时才选择动作；不要凭空描述用户没有提供或观察到的事实。",
+        "回复要求：使用自然简短的中文，保持角色语气。只返回 JSON，不要 Markdown 或解释，格式为 {\"say\":\"要说的话\",\"action\":\"idle|waving|jumping|failed|waiting|running|review|walk|sleep\",\"mode\":\"idle|working|waiting|sleeping|null\",\"gesture\":\"yawn|wake|ear-twitch|tail-swish|groom|celebrate|startled|null\",\"mood\":\"当前心情\",\"look\":\"up|up-right|right|down-right|down|down-left|left|up-left|null\",\"duration\":5200,\"nextActionAfter\":1800}。mode 表示持续状态，gesture 表示一次性逐帧动作；只有资源存在时才使用 gesture。普通聊天优先使用 idle，只有确实适合时才选择动作；不要凭空描述用户没有提供或观察到的事实。",
     );
     if !card.post_history_instructions.is_empty() {
         prompt.push_str(&format!(
@@ -1329,7 +1340,7 @@ fn pet_conversation_prompt(
          宠物 A 的说话要求：{first_style}\n\n\
          宠物 B（{second_name}，id: {second_id}）的角色上下文：\n{second_context}\n\
          宠物 B 的说话要求：{second_style}\n\n\
-         只返回 JSON，不要 Markdown，格式为：{{\"first\":{{\"say\":\"A 的台词\",\"action\":\"idle|waving|jumping|waiting|review|walk|sleep\",\"mood\":\"心情\",\"look\":\"up|up-right|right|down-right|down|down-left|left|up-left|null\",\"duration\":5200,\"nextActionAfter\":1800}},\"second\":{{\"say\":\"B 的台词\",\"action\":\"idle|waving|jumping|waiting|review|walk|sleep\",\"mood\":\"心情\",\"look\":\"up|up-right|right|down-right|down|down-left|left|up-left|null\",\"duration\":5200,\"nextActionAfter\":1800}}}}。",
+         只返回 JSON，不要 Markdown，格式为：{{\"first\":{{\"say\":\"A 的台词\",\"action\":\"idle|waving|jumping|failed|waiting|running|review|walk|sleep\",\"mode\":\"idle|working|waiting|sleeping|null\",\"gesture\":\"yawn|wake|ear-twitch|tail-swish|groom|celebrate|startled|null\",\"mood\":\"心情\",\"look\":\"up|up-right|right|down-right|down|down-left|left|up-left|null\",\"duration\":5200,\"nextActionAfter\":1800}},\"second\":{{\"say\":\"B 的台词\",\"action\":\"idle|waving|jumping|failed|waiting|running|review|walk|sleep\",\"mode\":\"idle|working|waiting|sleeping|null\",\"gesture\":\"yawn|wake|ear-twitch|tail-swish|groom|celebrate|startled|null\",\"mood\":\"心情\",\"look\":\"up|up-right|right|down-right|down|down-left|left|up-left|null\",\"duration\":5200,\"nextActionAfter\":1800}}}}。",
     )
 }
 
@@ -1647,6 +1658,7 @@ async fn call_stream(
 pub(crate) async fn request_social_director(
     app: &tauri::AppHandle,
     prompt: &str,
+    on_delta: impl FnMut(String) + Send,
 ) -> Result<String, String> {
     let config = config_snapshot(app)?;
     let Some(model) = config.ai.chat_model.clone() else {
@@ -1657,10 +1669,10 @@ pub(crate) async fn request_social_director(
     }
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| format!("无法创建模型连接: {error}"))?;
-    call_stream(&client, &model, prompt, &[], None, false, |_| {}).await
+    call_stream(&client, &model, prompt, &[], None, true, on_delta).await
 }
 
 fn card_for_pet(app: &tauri::AppHandle, pet_id: &str) -> Result<CharacterCard, String> {
@@ -1825,7 +1837,7 @@ fn extract_json(text: &str) -> Option<Value> {
 
 fn normalize_behavior(mut behavior: PetBehavior) -> PetBehavior {
     behavior.action = match behavior.action.trim().to_ascii_lowercase().as_str() {
-        "idle" | "waving" | "jumping" | "waiting" | "review" | "walk" | "sleep" => {
+        "idle" | "waving" | "jumping" | "failed" | "waiting" | "running" | "review" | "walk" | "sleep" => {
             behavior.action.trim().to_ascii_lowercase()
         }
         _ => "idle".to_string(),
@@ -1846,6 +1858,14 @@ fn normalize_behavior(mut behavior: PetBehavior) -> PetBehavior {
         } else {
             None
         }
+    });
+    behavior.mode = behavior.mode.take().and_then(|mode| {
+        let mode = mode.trim().to_ascii_lowercase();
+        matches!(mode.as_str(), "idle" | "working" | "waiting" | "sleeping").then_some(mode)
+    });
+    behavior.gesture = behavior.gesture.take().and_then(|gesture| {
+        let gesture = gesture.trim().to_ascii_lowercase();
+        (super::is_safe_id(&gesture) && gesture.len() <= 64).then_some(gesture)
     });
     behavior.say = clean_reply(behavior.say, 600);
     behavior.duration = behavior.duration.clamp(2_500, 12_000);

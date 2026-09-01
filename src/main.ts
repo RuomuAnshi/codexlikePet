@@ -2,8 +2,7 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { CELL_HEIGHT, CELL_WIDTH, type AnimationState, type LookDirection } from "./pet/atlas";
-import { loadPet } from "./pet/loader";
-import { loadPetFromData } from "./pet/loader";
+import { loadAnimationPack, loadPet, loadPetFromData } from "./pet/loader";
 import { PetEngine } from "./pet/engine";
 import { watchCursorDirection } from "./pet/cursorWatcher";
 import { PetStateMachine, type PetAction } from "./pet/stateMachine";
@@ -62,6 +61,7 @@ async function boot(): Promise<void> {
   };
 
   const initialPet = await loadRuntimePet();
+  const animationClips = await loadAnimationPack(runtime.animationPack);
   let dialogue = runtime.dialogue ?? DEFAULT_DIALOGUE;
   let settings: PetSettings = runtime.settings;
   const stage = document.querySelector<HTMLCanvasElement>("#stage")!;
@@ -78,6 +78,7 @@ async function boot(): Promise<void> {
   petEl.style.opacity = String(settings.opacity);
 
   const engine = new PetEngine(initialPet.canvas, stage, settings.scale);
+  engine.setAnimationClips(animationClips);
   const stateMachine = new PetStateMachine();
   let paused = settings.paused;
   let dragging = false;
@@ -215,6 +216,22 @@ async function boot(): Promise<void> {
     engine.setState(stateMachine.animationState());
   };
 
+  const stopFrameClip = (): void => {
+    if (!engine.isPlayingClip()) return;
+    engine.cancelClip();
+    stateMachine.finishClip();
+    if (!dragging) engine.setLook(lastDirection);
+    syncAnimation();
+  };
+
+  const setBaseMode = (mode: NonNullable<PetBehavior["mode"]>): void => {
+    stopFrameClip();
+    stateMachine.setBaseState(
+      mode === "working" ? "running" : mode === "waiting" || mode === "sleeping" ? "waiting" : "idle",
+    );
+    if (!dragging && !stateMachine.hasAction()) syncAnimation();
+  };
+
   const savePosition = async (): Promise<void> => {
     try {
       const [position, scaleFactor] = await Promise.all([window.outerPosition(), window.scaleFactor()]);
@@ -296,6 +313,7 @@ async function boot(): Promise<void> {
   speech.addEventListener("click", () => void openPetChat());
 
   const playAction = (action: PetAction): void => {
+    stopFrameClip();
     if (paused || dragging || dragState.petting || !stateMachine.startAction(action)) return;
     engine.setLook(null);
     engine.playOnce(action, () => {
@@ -306,21 +324,60 @@ async function boot(): Promise<void> {
     });
   };
 
+  const playFrameClip = (clipId: string, onComplete?: () => void): boolean => {
+    if (paused || dragging || dragState.petting || !engine.hasAnimationClip(clipId)) return false;
+    if (!stateMachine.startClip(clipId)) return false;
+    engine.setLook(null);
+    if (!engine.playClip(clipId, () => {
+      const returnTo = animationClips.get(clipId)?.manifest.returnTo;
+      stateMachine.finishClip();
+      if (returnTo) stateMachine.setBaseState(returnTo);
+      if (!dragging) engine.setLook(lastDirection);
+      syncAnimation();
+      settlePetActivity();
+      onComplete?.();
+    })) {
+      stateMachine.finishClip();
+      return false;
+    }
+    return true;
+  };
+
   const applyPetBehavior = (behavior: PetBehavior | null | undefined): void => {
     if (!behavior || paused || settings.quietMode) return;
     if (behaviorLookTimer !== undefined) globalThis.clearTimeout(behaviorLookTimer);
     behaviorLookTimer = undefined;
+    if (behavior.mode) setBaseMode(behavior.mode);
+    else if (behavior.action !== "walk" && behavior.action !== "sleep" && behavior.action !== "running") {
+      setBaseMode("idle");
+    }
+    const playedGesture = behavior.action !== "sleep" && behavior.gesture
+      ? playFrameClip(behavior.gesture)
+      : false;
     switch (behavior.action) {
       case "walk":
         walker.walkNow();
         break;
       case "sleep":
-        playAction("waiting");
+        setBaseMode("sleeping");
+        if (behavior.gesture && behavior.gesture !== "sleep") {
+          const playedSleepGesture = playFrameClip(behavior.gesture, () => {
+            setBaseMode("sleeping");
+            if (!playFrameClip("sleep")) syncAnimation();
+          });
+          if (!playedSleepGesture && !playFrameClip("sleep")) syncAnimation();
+        } else if (!playFrameClip("sleep")) {
+          syncAnimation();
+        }
+        break;
+      case "running":
+        setBaseMode("working");
         break;
       case "idle":
+        if (!behavior.mode) setBaseMode("idle");
         break;
       default:
-        playAction(behavior.action);
+        if (!playedGesture) playAction(behavior.action);
         break;
     }
     if (behavior.action === "idle" && behavior.look) {
@@ -429,7 +486,8 @@ async function boot(): Promise<void> {
         engine.cancelAction();
       }
       engine.setLook(null);
-      engine.setState("waiting");
+      stateMachine.setBaseState("waiting");
+      syncAnimation();
       sayLine("petting");
       showEffect("heart");
       void invoke("record_petting", { petId: runtime.petId });
@@ -531,8 +589,12 @@ async function boot(): Promise<void> {
       if (payload.petId !== runtime.petId) return;
       if (payload.state.activity === "sleeping") {
         walker.stop();
-        engine.setState("waiting");
+        stateMachine.setBaseState("waiting");
+        if (!engine.isPlayingClip()) playFrameClip("sleep");
+        if (!engine.isPlayingClip()) syncAnimation();
       } else if (!dragging && !dragState.petting) {
+        stopFrameClip();
+        stateMachine.setBaseState("idle");
         syncAnimation();
       }
       showEmotion(
@@ -561,8 +623,11 @@ async function boot(): Promise<void> {
         showEmotion(action === "sleep" ? "sleeping" : "happy");
         if (action === "sleep") {
           walker.stop();
-          engine.setState("waiting");
+          stateMachine.setBaseState("waiting");
+          if (!playFrameClip("sleep")) syncAnimation();
         } else if (!dragging) {
+          stopFrameClip();
+          stateMachine.setBaseState("idle");
           syncAnimation();
         }
       }
@@ -578,8 +643,11 @@ async function boot(): Promise<void> {
       if (payload.lowBattery) sayLine("lowBattery");
       if (payload.autoQuiet || payload.snapshot.session !== "active") {
         walker.stop();
-        engine.setState("waiting");
+        stopFrameClip();
+        stateMachine.setBaseState("waiting");
+        syncAnimation();
       } else {
+        stateMachine.setBaseState("idle");
         if (!paused && !dragging && settings.wanderEnabled && !settings.quietMode) walker.start();
         if (!dragging && !dragState.petting) syncAnimation();
       }
@@ -600,6 +668,7 @@ async function boot(): Promise<void> {
     if (payload.petId !== runtime.petId) return;
     if (chatRequestId !== null && payload.requestId !== chatRequestId) return;
     chatRequestId ??= payload.requestId;
+    if (!dragging && !stateMachine.hasAction()) setBaseMode("working");
     chatReply += payload.delta;
     showSpeech(extractSayText(chatReply), 7_000);
   });
@@ -629,6 +698,9 @@ async function boot(): Promise<void> {
     if (chatRequestId !== null && payload.requestId !== chatRequestId) return;
     chatRequestId = null;
     chatReply = "";
+    stopFrameClip();
+    stateMachine.setBaseState("idle");
+    playAction("failed");
     showSpeech(`刚才没听清……${payload.message}`, 5_200);
   });
 

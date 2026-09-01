@@ -12,10 +12,21 @@
         <div>
           <p class="eyebrow">SAKIPET SOCIAL</p>
           <h1>宠物日志</h1>
-          <p>看看它们什么时候靠近、玩耍，以及关系如何慢慢变化。</p>
+          <p>看看它们什么时候靠近、玩耍，以及关系如何慢慢变化。点击宠物名称可以预览。</p>
         </div>
         <button id="clear-log" class="secondary" type="button">清空日志</button>
       </header>
+      <section id="pet-preview" class="pet-preview" aria-labelledby="preview-title">
+        <div class="preview-stage" aria-hidden="true">
+          <canvas id="preview-canvas" width="192" height="208"></canvas>
+        </div>
+        <div class="preview-copy">
+          <p class="eyebrow">CURRENT PET</p>
+          <h2 id="preview-title">选择一只宠物</h2>
+          <p id="preview-description">点击关系卡或日志中的宠物名称，查看它的待机预览。</p>
+          <p id="preview-meta" class="relationship-meta"></p>
+        </div>
+      </section>
       <section class="filters" aria-label="日志筛选">
         <label>宠物 <select id="pet-filter"><option value="">全部</option></select></label>
         <label>互动 <select id="type-filter"><option value="">全部</option></select></label>

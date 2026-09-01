@@ -45,7 +45,9 @@ my-pet.zip
 └── my-pet/
     ├── pet.json
     ├── character.json  # 可选
-    └── spritesheet.webp
+    ├── spritesheet.webp
+    ├── animations.json  # 可选，SakiPet 扩展帧动画索引
+    └── animations/      # 可选，每个动作是完整的 192×208 帧条
 ```
 
 可以额外放入 `character.json` 配置角色卡和不同情况下显示的静态台词。推荐使用
@@ -217,19 +219,25 @@ AI 设置位于独立的“AI 设置”窗口。窗口位置会在移动后保�
 超过 40 条消息后，应用会在后台更新摘要，完整消息仍然保留。
 
 普通聊天窗口默认只显示输入框，模型的完整回答会显示在桌宠本体的粉色气泡中，
-并可同时返回受限的行为决策。行为只能是 `idle`、`waving`、`jumping`、`waiting`、
-`review`、`walk` 或 `sleep`，应用不会把模型当作系统工具执行。行为协议示例：
+并可同时返回受限的行为决策。旧版 `action` 字段继续兼容，也可以用 `mode` 表示持续状态、
+用 `gesture` 表示旁挂的逐帧动作；应用不会把模型当作系统工具执行。行为协议示例：
 
 ```json
 {
   "say": "欢迎回来。",
   "action": "waving",
+  "mode": "idle",
+  "gesture": "celebrate",
   "mood": "happy",
   "look": "right",
   "duration": 5200,
   "nextActionAfter": 1800
 }
 ```
+
+扩展动作不修改 `pet.json`。在 `pet.json` 同目录放置可选的 `animations.json`，并在
+`animations/` 下提供水平帧条；每帧必须是完整的 192×208 透明角色图。缺少或校验失败时，
+应用自动回退到 Codex V2 的 9 个标准动作和 16 个 look 方向。
 
 每只宠物还会在应用数据中保存独立的生活状态，包括心情、精力、注意力、亲密度、
 互动次数、与其他宠物互动次数和当前活动。状态会被点击、拖拽、聊天、散步和模型行为

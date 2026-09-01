@@ -21,9 +21,12 @@ use super::{config_snapshot, is_safe_id, AppConfig, AppState, CharacterCard, Pet
 const SOCIAL_DIRECTORY: &str = "social";
 const SOCIAL_EVENT_MAX_CHARS: usize = 240;
 const PROXIMITY_DISTANCE: f64 = 260.0;
+const PROXIMITY_COOLDOWN_MS: u64 = 30_000;
+const SOCIAL_DIRECTOR_TIMEOUT_SECS: u64 = 30;
 const SCENE_TICK_MS: u64 = 40;
 const SCENE_BUSY_ERROR: &str = "社交舞台正在使用中，请稍后再试";
 static SCENE_COUNTER: AtomicU64 = AtomicU64::new(1);
+static LAST_AI_FALLBACK_LOG_AT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase", default)]
@@ -56,6 +59,7 @@ pub(crate) struct SocialRuntime {
     pub(crate) active: Mutex<HashMap<String, ActiveScene>>,
     pub(crate) runtime: Mutex<HashMap<String, RuntimePetState>>,
     last_proximity_scenes: Mutex<HashMap<String, String>>,
+    proximity_cooldowns: Mutex<HashMap<String, u64>>,
     pub(crate) next_scheduled_at: Mutex<u64>,
 }
 
@@ -954,6 +958,20 @@ fn extract_json(value: &str) -> Option<Value> {
     })
 }
 
+fn log_ai_fallback(message: &str) {
+    let now = now_ms();
+    let previous = LAST_AI_FALLBACK_LOG_AT.load(Ordering::Relaxed);
+    if now.saturating_sub(previous) < 60_000 {
+        return;
+    }
+    if LAST_AI_FALLBACK_LOG_AT
+        .compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        eprintln!("[social] AI 社交导演降级为本地互动: {message}");
+    }
+}
+
 async fn choose_scene_with_ai(
     app: &tauri::AppHandle,
     config: &AppConfig,
@@ -967,29 +985,31 @@ async fn choose_scene_with_ai(
     }
     let prompt = scene_prompt(app, config, candidates);
     let result = match tokio::time::timeout(
-        Duration::from_secs(8),
-        super::ai::request_social_director(app, &prompt),
+        Duration::from_secs(SOCIAL_DIRECTOR_TIMEOUT_SECS),
+        super::ai::request_social_director(app, &prompt, |_| {}),
     )
     .await
     {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
-            eprintln!("[social] AI 社交导演请求失败，使用本地互动: {error}");
+            log_ai_fallback(&format!("请求失败: {error}"));
             return None;
         }
         Err(_) => {
-            eprintln!("[social] AI 社交导演请求超过 8 秒，使用本地互动");
+            log_ai_fallback(&format!(
+                "请求超过 {SOCIAL_DIRECTOR_TIMEOUT_SECS} 秒"
+            ));
             return None;
         }
     };
     let Some(value) = extract_json(&result) else {
-        eprintln!("[social] AI 社交导演返回的内容不是有效 JSON，使用本地互动");
+        log_ai_fallback("返回内容不是有效 JSON");
         return None;
     };
     match serde_json::from_value(value) {
         Ok(decision) => Some(decision),
         Err(error) => {
-            eprintln!("[social] AI 社交导演 JSON 未通过校验，使用本地互动: {error}");
+            log_ai_fallback(&format!("JSON 未通过校验: {error}"));
             None
         }
     }
@@ -1996,6 +2016,23 @@ async fn start_scene_once(
     Ok(summary)
 }
 
+fn claim_proximity_cooldown(app: &tauri::AppHandle, first: &str, second: &str) -> bool {
+    let Ok((pair_id, _, _)) = pair_key(first, second) else {
+        return false;
+    };
+    let state = app.state::<AppState>();
+    let Ok(mut cooldowns) = state.social.proximity_cooldowns.lock() else {
+        return false;
+    };
+    let now = now_ms();
+    cooldowns.retain(|_, until| *until > now);
+    if cooldowns.contains_key(&pair_id) {
+        return false;
+    }
+    cooldowns.insert(pair_id, now.saturating_add(PROXIMITY_COOLDOWN_MS));
+    true
+}
+
 fn maybe_start_proximity(app: &tauri::AppHandle, pet_id: &str) {
     let Ok(config) = config_snapshot(app) else {
         return;
@@ -2027,6 +2064,9 @@ fn maybe_start_proximity(app: &tauri::AppHandle, pet_id: &str) {
     else {
         return;
     };
+    if !claim_proximity_cooldown(app, pet_id, &target.pet_id) {
+        return;
+    }
     let app = app.clone();
     let ids = vec![pet_id.to_string(), target.pet_id.clone()];
     tauri::async_runtime::spawn(async move {

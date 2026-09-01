@@ -18,7 +18,7 @@ export type AnimationState =
   | "review";
 
 // Frame durations (ms) per standard animation row, from
-// hatch-pet/references/animation-rows.md. Durations describe one loop for the
+// sakipet-hatch-pet/references/animation-rows.md. Durations describe one loop for the
 // *used* columns; trailing cells in a row are transparent and skipped.
 export const STATE_TIMING: Record<AnimationState, { row: number; used: number; durations: number[] }> = {
   idle: { row: 0, used: 6, durations: [280, 110, 110, 140, 140, 320] },

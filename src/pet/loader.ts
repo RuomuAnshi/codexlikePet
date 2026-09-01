@@ -9,9 +9,15 @@ import {
   type PetManifest,
   lookSlot,
 } from "./atlas";
+import type { PetAnimationClip, PetAnimationPack } from "./animations";
 
 export interface PetLoaderResult {
   manifest: PetManifest;
+  canvas: HTMLCanvasElement;
+}
+
+export interface LoadedAnimationClip {
+  manifest: PetAnimationClip;
   canvas: HTMLCanvasElement;
 }
 
@@ -55,6 +61,41 @@ export async function loadPetFromData(
 ): Promise<PetLoaderResult> {
   const response = await fetch(spritesheetDataUrl);
   return decodePet(manifest, await response.blob());
+}
+
+/** Decode optional SakiPet full-body frame clips from the Rust runtime payload. */
+export async function loadAnimationPack(
+  pack: PetAnimationPack | null | undefined,
+): Promise<Map<string, LoadedAnimationClip>> {
+  const loaded = new Map<string, LoadedAnimationClip>();
+  if (!pack || pack.format !== "sakipet-frame-pack" || pack.version !== 1) return loaded;
+  if (pack.cellWidth !== CELL_WIDTH || pack.cellHeight !== CELL_HEIGHT) return loaded;
+
+  await Promise.all(
+    Object.entries(pack.clips).map(async ([id, manifest]) => {
+      try {
+        if (!/^[-a-zA-Z0-9_]{1,64}$/.test(id)) throw new Error("invalid clip id");
+        if (!Number.isInteger(manifest.frames) || manifest.frames < 1) throw new Error("invalid frame count");
+        if (manifest.durations.length !== manifest.frames || manifest.durations.some((duration) => duration <= 0)) {
+          throw new Error("invalid frame durations");
+        }
+        const bitmap = await createImageBitmap(await (await fetch(manifest.dataUrl)).blob());
+        if (bitmap.width !== CELL_WIDTH * manifest.frames || bitmap.height !== CELL_HEIGHT) {
+          bitmap.close();
+          throw new Error(`clip is ${bitmap.width}x${bitmap.height}; expected ${CELL_WIDTH * manifest.frames}x${CELL_HEIGHT}`);
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = bitmap.width;
+        canvas.height = bitmap.height;
+        canvas.getContext("2d")!.drawImage(bitmap, 0, 0);
+        bitmap.close();
+        loaded.set(id, { manifest, canvas });
+      } catch (error) {
+        console.warn(`skipping invalid animation clip ${id}:`, error);
+      }
+    }),
+  );
+  return loaded;
 }
 
 // Draw the plane sprite for a standard animation row onto a target canvas.

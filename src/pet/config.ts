@@ -1,4 +1,5 @@
 import type { PetManifest } from "./atlas";
+import type { PetAnimationPack } from "./animations";
 
 export interface PetSettings {
   scale: number;
@@ -75,6 +76,7 @@ export interface RuntimeConfig {
   settings: PetSettings;
   dialogue: PetDialogue;
   character?: CharacterCard;
+  animationPack?: PetAnimationPack | null;
 }
 
 export interface CharacterCard {
@@ -167,7 +169,9 @@ export interface EnvironmentSettings {
 
 export interface PetBehavior {
   say: string;
-  action: "idle" | "waving" | "jumping" | "waiting" | "review" | "walk" | "sleep";
+  action: "idle" | "waving" | "jumping" | "failed" | "waiting" | "running" | "review" | "walk" | "sleep";
+  mode?: "idle" | "working" | "waiting" | "sleeping" | null;
+  gesture?: string | null;
   mood: string;
   duration: number;
   nextActionAfter: number;
