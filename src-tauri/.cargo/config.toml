@@ -1,5 +1,10 @@
-# No `target-dir` override: macOS and Windows both use the default
-# `src-tauri/target`. CI sets `CARGO_TARGET_DIR` explicitly instead.
+# The repo lives on an ExFAT volume, where macOS auto-creates AppleDouble
+# `._*` files that break Tauri's build script (it reads them as TOML).
+# Redirect the target directory to APFS to avoid that failure. CI sets
+# `CARGO_TARGET_DIR` explicitly instead of relying on this file.
+
+[build]
+target-dir = "/Users/ifan/.cache/codexlikepet/cargo-target"
 
 [env]
 # xcap uses CoreGraphics on macOS and does not require the Swift runtime.
