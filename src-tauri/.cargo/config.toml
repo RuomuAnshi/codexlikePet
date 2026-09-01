@@ -1,5 +1,5 @@
-[build]
-target-dir = "/Volumes/SakiPetTarget/cargo-target"
+# No `target-dir` override: macOS and Windows both use the default
+# `src-tauri/target`. CI sets `CARGO_TARGET_DIR` explicitly instead.
 
 [env]
 # xcap uses CoreGraphics on macOS and does not require the Swift runtime.

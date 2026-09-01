@@ -10,7 +10,6 @@
     <main class="chat-shell">
       <section id="setup" class="setup-card" hidden>
         <h2>还没有连接聊天模型</h2>
-        <p>请先在 AI 设置中填写模型地址和模型名称。API Key 只会保存到系统密钥环。</p>
         <button id="setup-button" class="primary-button" type="button">打开 AI 设置</button>
       </section>
       <section id="messages" class="messages" aria-live="polite"></section>
@@ -19,6 +18,7 @@
         <textarea id="input" rows="2" maxlength="4000" placeholder="说点什么…"></textarea>
         <div class="composer-footer">
           <div>
+            <button id="close" class="ghost-button" type="button">关闭</button>
             <button id="stop" class="ghost-button" type="button" hidden>停止</button>
             <button id="send" class="primary-button" type="submit">发送</button>
           </div>

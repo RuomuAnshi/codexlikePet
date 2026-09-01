@@ -231,6 +231,14 @@ struct ScreenObservation {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ChatDeltaEvent {
+    request_id: String,
+    pet_id: String,
+    delta: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ChatCompleteEvent {
     request_id: String,
     pet_id: String,
@@ -1755,7 +1763,28 @@ async fn run_chat_task(
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|error| error.to_string())?;
-    let reply = call_stream(&client, &endpoint, &prompt, &recent, None, true, |_| {}).await?;
+    let delta_app = app.clone();
+    let delta_pet = pet_id.clone();
+    let delta_request = request_id.clone();
+    let reply = call_stream(
+        &client,
+        &endpoint,
+        &prompt,
+        &recent,
+        None,
+        true,
+        move |delta| {
+            let _ = delta_app.emit(
+                "chat://delta",
+                ChatDeltaEvent {
+                    request_id: delta_request.clone(),
+                    pet_id: delta_pet.clone(),
+                    delta,
+                },
+            );
+        },
+    )
+    .await?;
     let (reply, behavior) = parse_behavior_response(reply, 600);
     if reply.is_empty() {
         return Err("模型没有返回文字".to_string());

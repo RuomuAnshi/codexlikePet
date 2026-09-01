@@ -117,7 +117,7 @@ async function boot(): Promise<void> {
   };
 
   const sayLine = (trigger: DialogueTrigger): void => {
-    if (paused || settings.quietMode) return;
+    if (settings.quietMode) return;
     const lines = dialogue[trigger];
     if (!lines.length) return;
     const index = dialogueIndices[trigger] % lines.length;
@@ -128,10 +128,10 @@ async function boot(): Promise<void> {
   const scheduleIdleSpeech = (): void => {
     if (idleSpeechTimer !== undefined) globalThis.clearTimeout(idleSpeechTimer);
     idleSpeechTimer = undefined;
-    if (paused || settings.quietMode || !dialogue.idle.length) return;
+    if (settings.quietMode || !dialogue.idle.length) return;
     idleSpeechTimer = globalThis.setTimeout(() => {
       idleSpeechTimer = undefined;
-      if (!paused && !settings.quietMode && !dragging && !walking && !stateMachine.hasAction()) {
+      if (!settings.quietMode && !dragging && !walking && !stateMachine.hasAction()) {
         sayLine("idle");
       }
       scheduleIdleSpeech();
@@ -292,7 +292,7 @@ async function boot(): Promise<void> {
         if (!paused && settings.wanderEnabled && !settings.quietMode) walker.start();
       }
     },
-    () => !settings.lockPosition && !settings.clickThrough && !paused,
+    () => !settings.lockPosition && !settings.clickThrough,
   );
 
   petEl.addEventListener("pointerenter", () => {

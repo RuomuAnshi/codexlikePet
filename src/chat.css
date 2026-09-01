@@ -7,7 +7,7 @@
 }
 
 * { box-sizing: border-box; }
-body { margin: 0; min-width: 320px; background: linear-gradient(145deg, #fff8fc, #eafaff); }
+body { margin: 0; overflow: hidden; background: linear-gradient(145deg, #fff8fc, #eafaff); }
 button, textarea { font: inherit; }
 button:focus-visible, textarea:focus-visible { outline: 3px solid #e6ad42; outline-offset: 3px; }
 .chat-shell { min-height: 100vh; display: flex; flex-direction: column; padding: 10px; }

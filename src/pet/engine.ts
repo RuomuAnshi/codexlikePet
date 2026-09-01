@@ -97,13 +97,28 @@ export class PetEngine {
   }
 
   play(active: boolean): void {
-    if (active === this.playing) return;
+    if (active === this.playing) {
+      // A paused pet must still render a static frame; otherwise the
+      // transparent window shows nothing at all.
+      if (!active) this.drawStaticFrame();
+      return;
+    }
     this.playing = active;
     if (active) {
       this.lastTick = performance.now();
       this.rafId = requestAnimationFrame(this.tick);
     } else {
       cancelAnimationFrame(this.rafId);
+      this.drawStaticFrame();
+    }
+  }
+
+  private drawStaticFrame(): void {
+    const x = (this.target.canvas.width - CELL_WIDTH * this.scale) / 2;
+    if (this.look !== null && !this.pausedLookFrames) {
+      drawLookCell(this.source, this.target, this.look, this.scale, x, 0);
+    } else {
+      drawStateFrame(this.source, this.target, this.state, this.stateFrame, this.scale, x, 0);
     }
   }
 

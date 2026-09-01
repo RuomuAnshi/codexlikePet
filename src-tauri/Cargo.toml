@@ -46,3 +46,9 @@ windows = { version = "0.61", features = [
 ] }
 xcap = { version = "0.9", features = ["image"] }
 windows-core = "0.61"
+
+# debuginfo=2 makes rustc 1.88 crash (0xc0000409, stack fail-fast) while
+# compiling tauri-utils/brotli on Windows. Disable dev debug info so the same
+# Cargo.toml builds on both Windows and macOS.
+[profile.dev]
+debug = 0

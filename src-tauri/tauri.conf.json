@@ -30,7 +30,8 @@
         "minimizable": false,
         "maximizable": false,
         "fullscreen": false,
-        "visible": true
+        "visible": true,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling"
       },
       {
         "label": "pet-manager",
@@ -43,7 +44,8 @@
         "alwaysOnTop": false,
         "skipTaskbar": false,
         "resizable": true,
-        "visible": false
+        "visible": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling"
       },
       {
         "label": "ai-settings",
@@ -56,7 +58,8 @@
         "alwaysOnTop": false,
         "skipTaskbar": false,
         "resizable": true,
-        "visible": false
+        "visible": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling"
       }
     ],
     "security": {
