@@ -207,6 +207,16 @@ async function boot(): Promise<void> {
     }
   };
 
+  const togglePetChat = async (): Promise<void> => {
+    try {
+      const opened = await invoke<boolean>("toggle_pet_chat", { petId: runtime.petId });
+      if (opened) sayLine("doubleClick");
+    } catch (error) {
+      console.error("failed to toggle pet chat:", error);
+      sayLine("doubleClick");
+    }
+  };
+
   speech.addEventListener("click", () => void openPetChat());
 
   const playAction = (action: PetAction): void => {
@@ -310,7 +320,7 @@ async function boot(): Promise<void> {
       globalThis.clearTimeout(clickTimer);
       clickTimer = undefined;
     }
-    void openPetChat();
+    void togglePetChat();
     recordPetInteraction("doubleClick");
     playAction("jumping");
   });

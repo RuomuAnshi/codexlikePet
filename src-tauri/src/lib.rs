@@ -17,11 +17,11 @@ use std::sync::{
 };
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
-use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri::{
     Emitter, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
     Wry,
 };
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use zip::ZipArchive;
 
 mod ai;
@@ -33,6 +33,10 @@ const PET_WIDTH: f64 = 192.0;
 const PET_HEIGHT: f64 = 208.0;
 const SPRITESHEET_WIDTH: u32 = 1536;
 const SPRITESHEET_HEIGHT: u32 = 2288;
+// The starter pet is a product default, not part of resource discovery. New
+// pets are still discovered from their own manifests and can be imported at
+// runtime without changing this value.
+const DEFAULT_PET_ID: &str = "sakimiao";
 const CONFIG_FILE_NAME: &str = "config.json";
 // Transparent always-on-top webviews get misjudged as occluded by Chromium,
 // which freezes timers (walker), rAF (animation) and input handling. Keep the
@@ -651,7 +655,7 @@ impl Default for AppConfig {
             pet_settings: HashMap::new(),
             instances: vec![PetInstanceConfig {
                 id: "main".to_string(),
-                pet_id: "sakimiao".to_string(),
+                pet_id: DEFAULT_PET_ID.to_string(),
                 visible: true,
                 position: None,
             }],
@@ -928,7 +932,7 @@ fn normalize_config(config: &mut AppConfig) {
             0,
             PetInstanceConfig {
                 id: "main".to_string(),
-                pet_id: "sakimiao".to_string(),
+                pet_id: DEFAULT_PET_ID.to_string(),
                 visible: true,
                 position: None,
             },
@@ -1535,6 +1539,28 @@ fn chat_window_label(pet_id: &str) -> Result<String, String> {
         return Err("invalid pet id".to_string());
     }
     Ok(format!("pet-chat-{pet_id}"))
+}
+
+#[tauri::command]
+async fn toggle_pet_chat(app: tauri::AppHandle, pet_id: String) -> Result<bool, String> {
+    if !pet_exists(&app, &pet_id) {
+        return Err("宠物资源不存在或校验失败".to_string());
+    }
+    let label = chat_window_label(&pet_id)?;
+    if let Some(window) = app.get_webview_window(&label) {
+        if window.is_visible().map_err(|error| error.to_string())? {
+            hide_pet_chat(app.clone(), pet_id)?;
+            return Ok(false);
+        }
+        if window.is_minimized().unwrap_or(false) {
+            let _ = window.unminimize();
+        }
+        window.show().map_err(|error| error.to_string())?;
+        window.set_focus().map_err(|error| error.to_string())?;
+        return Ok(true);
+    }
+    open_pet_chat(app, pet_id).await?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -2410,12 +2436,21 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 fn restore_windows(app: &tauri::AppHandle, config: &AppConfig) -> Result<(), String> {
     sync_macos_activation_policy(app, config)?;
     if let Some(main) = app.get_webview_window("main") {
-        let main_settings = config
+        let main_instance = config
             .instances
             .iter()
-            .find(|instance| instance.id == "main")
+            .find(|instance| instance.id == "main");
+        let main_settings = main_instance
             .map(|instance| settings_for_pet(config, &instance.pet_id))
             .unwrap_or_else(|| config.settings.clone());
+        let main_can_show = main_instance.is_some_and(|instance| {
+            instance.visible
+                && !config
+                    .disabled_pet_ids
+                    .iter()
+                    .any(|id| id == &instance.pet_id)
+                && pet_exists(app, &instance.pet_id)
+        });
         apply_window_settings(&main, &main_settings)?;
         if let Some(position) = config
             .instances
@@ -2426,13 +2461,7 @@ fn restore_windows(app: &tauri::AppHandle, config: &AppConfig) -> Result<(), Str
             main.set_position(LogicalPosition::new(position.x, position.y))
                 .map_err(|error| error.to_string())?;
         }
-        if config
-            .instances
-            .iter()
-            .find(|instance| instance.id == "main")
-            .map(|instance| instance.visible)
-            .unwrap_or(true)
-        {
+        if main_can_show {
             main.show().map_err(|error| error.to_string())?;
             apply_fullscreen_visibility(&main, main_settings.show_in_fullscreen)?;
         } else {
@@ -2573,6 +2602,7 @@ pub fn run() {
             open_pet_manager,
             open_ai_settings,
             open_pet_chat,
+            toggle_pet_chat,
             hide_pet_chat,
             get_pet_catalog,
             get_pet_settings,
