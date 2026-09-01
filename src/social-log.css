@@ -1,0 +1,64 @@
+:root {
+  color: #263b48;
+  color-scheme: light;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+  background: #f4fbfd;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-width: 520px;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 8% 8%, rgba(238, 134, 170, .2) 0 3px, transparent 4px),
+    radial-gradient(circle at 86% 22%, rgba(74, 175, 193, .2) 0 2px, transparent 3px),
+    linear-gradient(135deg, #f4fcff, #fff6fa 55%, #eefafd);
+  background-size: 68px 68px, 54px 54px, auto;
+}
+button, select { font: inherit; }
+button {
+  min-height: 38px;
+  border: 2px solid #a9dce6;
+  border-radius: 12px;
+  padding: 7px 13px;
+  color: #277487;
+  background: #e8f8fb;
+  font-weight: 800;
+  cursor: pointer;
+}
+button:hover { filter: brightness(1.04); transform: translateY(-1px); }
+.log-page { max-width: 760px; margin: 0 auto; padding: 22px 22px 40px; }
+.log-header, .filters, .log-card, .relationship-card {
+  border: 1px solid #b8e1ea;
+  border-radius: 18px;
+  background: rgba(255,255,255,.94);
+  box-shadow: 0 10px 24px rgba(74,141,157,.1);
+}
+.log-header { display: flex; justify-content: space-between; gap: 18px; padding: 20px; }
+.eyebrow { margin: 0 0 5px; color: #e66b9c; font-size: 11px; font-weight: 900; letter-spacing: .16em; }
+h1 { margin: 0; font-size: 28px; }
+.log-header p:last-child { margin: 7px 0 0; color: #627a86; }
+.filters { display: flex; align-items: end; gap: 12px; margin-top: 14px; padding: 13px 16px; }
+label { display: grid; gap: 5px; color: #627a86; font-size: 12px; font-weight: 800; }
+select { min-width: 124px; border: 1px solid #a9dce6; border-radius: 9px; padding: 7px; color: #263b48; background: #f8fdfe; }
+.filters button { margin-left: auto; }
+.status { color: #627a86; font-size: 13px; }
+.status[data-kind="error"] { color: #c95d7e; }
+.relationship-list, .log-list { display: grid; gap: 10px; margin-top: 14px; }
+.relationship-card { padding: 14px 16px; }
+.relationship-title { display: flex; justify-content: space-between; font-weight: 900; }
+.relationship-meta { margin-top: 5px; color: #627a86; font-size: 12px; }
+.log-card { padding: 14px 16px; }
+.log-card header { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
+.log-kind { color: #277487; font-weight: 900; }
+.log-time { color: #8aa0a8; font-size: 11px; }
+.log-dialogue { display: grid; gap: 6px; margin-top: 10px; }
+.bubble { width: fit-content; max-width: 90%; border-radius: 12px; padding: 7px 10px; background: #eefafd; color: #355664; font-size: 13px; }
+.bubble:nth-child(even) { margin-left: auto; background: #fff0f6; }
+.milestones { margin-top: 8px; color: #d86b91; font-size: 12px; font-weight: 800; }
+@media (max-width: 600px) {
+  body { min-width: 0; }
+  .log-page { padding: 12px; }
+  .filters { flex-wrap: wrap; }
+  .filters button { margin-left: 0; }
+}

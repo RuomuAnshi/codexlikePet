@@ -16,6 +16,7 @@ export class PetStateMachine {
   private dragDirection: DragDirection | null = null;
   private carried = false;
   private action: PetAction | null = null;
+  private socialState: AnimationState | null = null;
 
   setDragging(
     dragging: boolean,
@@ -33,13 +34,17 @@ export class PetStateMachine {
   }
 
   startAction(action: PetAction): boolean {
-    if (this.dragging || this.walking || this.action !== null) return false;
+    if (this.dragging || this.walking || this.socialState !== null || this.action !== null) return false;
     this.action = action;
     return true;
   }
 
   finishAction(): void {
     this.action = null;
+  }
+
+  setSocialState(state: AnimationState | null): void {
+    this.socialState = state;
   }
 
   reset(): void {
@@ -49,6 +54,7 @@ export class PetStateMachine {
     this.dragDirection = null;
     this.carried = false;
     this.action = null;
+    this.socialState = null;
   }
 
   hasAction(): boolean {
@@ -64,6 +70,7 @@ export class PetStateMachine {
       return "running-right";
     }
     if (this.dragging) return "running";
+    if (this.socialState !== null) return this.socialState;
     if (
       this.walkingDirection === "left" ||
       this.walkingDirection === "up-left" ||

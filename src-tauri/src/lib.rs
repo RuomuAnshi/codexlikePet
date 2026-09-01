@@ -26,7 +26,9 @@ use zip::ZipArchive;
 
 mod ai;
 mod environment;
+mod social;
 use ai::{AiRuntime, AiSettings};
+use social::SocialSettings;
 
 const LOOK_MARGIN_LOGICAL: f64 = 72.0;
 const LOOK_DEADZONE_LOGICAL: f64 = 60.0;
@@ -450,6 +452,7 @@ struct PetSettings {
     circadian_enabled: bool,
     sleep_start_minutes: u16,
     wake_minutes: u16,
+    social_enabled: bool,
 }
 
 impl Default for PetSettings {
@@ -467,6 +470,7 @@ impl Default for PetSettings {
             circadian_enabled: true,
             sleep_start_minutes: 1_410,
             wake_minutes: 450,
+            social_enabled: true,
         }
     }
 }
@@ -727,6 +731,8 @@ struct AppConfig {
     chat_positions: HashMap<String, PetPosition>,
     #[serde(default)]
     environment: EnvironmentSettings,
+    #[serde(default)]
+    social: SocialSettings,
 }
 
 impl Default for AppConfig {
@@ -745,6 +751,7 @@ impl Default for AppConfig {
             ai: AiSettings::default(),
             chat_positions: HashMap::new(),
             environment: EnvironmentSettings::default(),
+            social: SocialSettings::default(),
         }
     }
 }
@@ -753,6 +760,7 @@ struct AppState {
     config: Mutex<AppConfig>,
     ai: AiRuntime,
     environment: environment::EnvironmentRuntime,
+    social: social::SocialRuntime,
     ready: AtomicBool,
 }
 
@@ -762,6 +770,7 @@ impl AppState {
             config: Mutex::new(AppConfig::default()),
             ai: AiRuntime::default(),
             environment: environment::EnvironmentRuntime::default(),
+            social: social::SocialRuntime::default(),
             ready: AtomicBool::new(false),
         }
     }
@@ -1032,6 +1041,7 @@ fn normalize_config(config: &mut AppConfig) {
     config.disabled_pet_ids.retain(|id| is_safe_id(id));
     config.settings = clamp_settings(config.settings.clone());
     normalize_environment(&mut config.environment);
+    normalize_social(&mut config.social);
     config.pet_settings.retain(|id, _| is_safe_id(id));
     config
         .chat_positions
@@ -1127,6 +1137,14 @@ fn normalize_environment(settings: &mut EnvironmentSettings) {
         .filter(|item| !item.is_empty())
         .take(64)
         .collect();
+}
+
+fn normalize_social(settings: &mut SocialSettings) {
+    settings.min_interval_minutes = settings.min_interval_minutes.clamp(1, 120);
+    settings.max_interval_minutes = settings
+        .max_interval_minutes
+        .clamp(settings.min_interval_minutes, 240);
+    settings.max_participants = settings.max_participants.clamp(2, 4);
 }
 
 fn settings_for_pet(config: &AppConfig, pet_id: &str) -> PetSettings {
@@ -1682,6 +1700,10 @@ fn show_environment_settings(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn show_social_log(app: &tauri::AppHandle) -> Result<(), String> {
+    social::open_social_log(app.clone())
+}
+
 fn chat_window_label(pet_id: &str) -> Result<String, String> {
     if !is_safe_id(pet_id) {
         return Err("invalid pet id".to_string());
@@ -1906,6 +1928,9 @@ fn set_instance_visible_internal(
         .iter()
         .find(|instance| instance.id == instance_id)
         .ok_or_else(|| "pet instance is not configured".to_string())?;
+    if !visible {
+        social::cancel_scenes_for_pet(app, &instance.pet_id);
+    }
     let window = app
         .get_webview_window(&instance_label(instance_id)?)
         .ok_or_else(|| "pet window is not available".to_string())?;
@@ -2014,6 +2039,7 @@ fn remove_pet_instance(
         window.close().map_err(|error| error.to_string())?;
     }
     if let Some(pet_id) = removed_pet_id {
+        social::cancel_scenes_for_pet(&app, &pet_id);
         let pet_still_has_instance = config
             .instances
             .iter()
@@ -2098,6 +2124,9 @@ fn update_pet_settings(
     })?;
     sync_macos_activation_policy(&app, &config)?;
     let saved = settings_for_pet(&config, &pet_id);
+    if !saved.social_enabled || saved.paused || saved.quiet_mode {
+        social::cancel_scenes_for_pet(&app, &pet_id);
+    }
     broadcast_settings(&app, &pet_id, &saved)?;
     Ok(saved)
 }
@@ -2113,6 +2142,9 @@ fn toggle_pet_pause_internal(app: &tauri::AppHandle, pet_id: &str) -> Result<Pet
         Ok(())
     })?;
     let settings = settings_for_pet(&config, pet_id);
+    if settings.paused {
+        social::cancel_scenes_for_pet(app, pet_id);
+    }
     broadcast_settings(app, pet_id, &settings)?;
     Ok(settings)
 }
@@ -2157,6 +2189,9 @@ fn set_pet_enabled(
 ) -> Result<Vec<InstalledPet>, String> {
     if !pet_exists(&app, &pet_id) {
         return Err("宠物资源不存在或校验失败".to_string());
+    }
+    if !enabled {
+        social::cancel_scenes_for_pet(&app, &pet_id);
     }
     let config = update_config(&app, |config| {
         config.disabled_pet_ids.retain(|id| id != &pet_id);
@@ -2410,12 +2445,14 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         true,
         None::<&str>,
     )?;
+    let social_settings = MenuItem::with_id(app, "app-social-settings", "社交设置", true, None::<&str>)?;
+    let social_log = MenuItem::with_id(app, "app-social-log", "宠物日志", true, None::<&str>)?;
     let app_submenu = Submenu::with_id_and_items(
         app,
         "sakipet-app-menu",
         "SakiPet",
         true,
-        &[&manage_pets, &ai_settings, &environment_settings],
+        &[&manage_pets, &ai_settings, &environment_settings, &social_settings, &social_log],
     )?;
     let menu = Menu::with_items(app, &[&app_submenu])?;
     app.set_menu(menu)?;
@@ -2432,6 +2469,16 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         }
         "app-environment-settings" => {
             if let Err(error) = show_environment_settings(app) {
+                eprintln!("{error}");
+            }
+        }
+        "app-social-log" => {
+            if let Err(error) = show_social_log(app) {
+                eprintln!("{error}");
+            }
+        }
+        "app-social-settings" => {
+            if let Err(error) = social::open_social_settings(app.clone()) {
                 eprintln!("{error}");
             }
         }
@@ -2487,7 +2534,88 @@ fn show_pet_context_menu(app: tauri::AppHandle, window_label: String) -> Result<
     let chat = item("chat", "和它说话")?;
     let settings = item("settings", "独立设置")?;
     let hide = item("hide", "隐藏")?;
-    let menu = Menu::with_items(&app, &[&feed, &play, &pet, &sleep, &chat, &settings, &hide])
+    let friends = item("find-friends", "找朋友")?;
+    let source_monitor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| {
+            (
+                monitor.position().x,
+                monitor.position().y,
+                monitor.size().width,
+                monitor.size().height,
+            )
+        });
+    let mut friend_items = Vec::new();
+    for candidate in &config.instances {
+        if candidate.id == instance_id
+            || !candidate.visible
+            || !settings_for_pet(&config, &candidate.pet_id).social_enabled
+            || config
+                .disabled_pet_ids
+                .iter()
+                .any(|id| id == &candidate.pet_id)
+        {
+            continue;
+        }
+        let Some(candidate_window) = app.get_webview_window(&instance_label(&candidate.id)?)
+        else {
+            continue;
+        };
+        let candidate_monitor = candidate_window
+            .current_monitor()
+            .ok()
+            .flatten()
+            .map(|monitor| {
+                (
+                    monitor.position().x,
+                    monitor.position().y,
+                    monitor.size().width,
+                    monitor.size().height,
+                )
+            });
+        if source_monitor.is_some() && candidate_monitor != source_monitor {
+            continue;
+        }
+        let name = pet_display_name(&app, &candidate.pet_id);
+        friend_items.push(MenuItem::with_id(
+            &app,
+            format!(
+                "pet-context:find-friend-{}:{}:{}",
+                candidate.pet_id, instance_id, pet_id
+            ),
+            format!("和 {name} 互动"),
+            true,
+            None::<&str>,
+        ).map_err(|error| error.to_string())?);
+    }
+    let friend_refs: Vec<&dyn tauri::menu::IsMenuItem<Wry>> = friend_items
+        .iter()
+        .map(|item| item as &dyn tauri::menu::IsMenuItem<Wry>)
+        .collect();
+    let friend_submenu = Submenu::with_id_and_items(
+        &app,
+        format!("pet-friends-menu-{instance_id}"),
+        "同屏宠物",
+        !friend_refs.is_empty(),
+        &friend_refs,
+    )
+    .map_err(|error| error.to_string())?;
+    let menu = Menu::with_items(
+        &app,
+        &[
+            &feed,
+            &play,
+            &pet,
+            &sleep,
+            &friends,
+            &friend_submenu,
+            &chat,
+            &settings,
+            &hide,
+        ],
+    )
         .map_err(|error| error.to_string())?;
     window
         .popup_menu_at(&menu, pet_context_menu_position(&window))
@@ -2571,6 +2699,24 @@ fn handle_pet_context_action(app: &tauri::AppHandle, id: &str) -> Result<(), Str
         "chat" => {
             tauri::async_runtime::block_on(open_pet_chat(app.clone(), pet_id.to_string()))?;
         }
+        "find-friends" => {
+            tauri::async_runtime::block_on(social::start_social_interaction(
+                app.clone(),
+                Some(pet_id.to_string()),
+                None,
+            ))?;
+        }
+        action if action.starts_with("find-friend-") => {
+            let target_pet_id = action
+                .strip_prefix("find-friend-")
+                .filter(|id| is_safe_id(id))
+                .ok_or_else(|| "无效的目标宠物".to_string())?;
+            tauri::async_runtime::block_on(social::start_social_interaction(
+                app.clone(),
+                Some(pet_id.to_string()),
+                Some(vec![target_pet_id.to_string()]),
+            ))?;
+        }
         "settings" => {
             show_pet_manager(app)?;
             let _ = app.emit(
@@ -2608,6 +2754,8 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<Wry>> {
         true,
         None::<&str>,
     )?;
+    let social_settings = MenuItem::with_id(app, "social-settings", "社交设置", true, None::<&str>)?;
+    let social_log = MenuItem::with_id(app, "social-log", "宠物日志", true, None::<&str>)?;
     let toggle_pause = MenuItem::with_id(
         app,
         "toggle-pause",
@@ -2687,6 +2835,8 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<Wry>> {
         &manage_pets,
         &settings,
         &environment_settings,
+        &social_settings,
+        &social_log,
         &toggle_pause,
         &autostart,
         &add_submenu,
@@ -2727,6 +2877,14 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 }
             } else if id == "environment-settings" {
                 if let Err(error) = show_environment_settings(app) {
+                    eprintln!("{error}");
+                }
+            } else if id == "social-log" {
+                if let Err(error) = show_social_log(app) {
+                    eprintln!("{error}");
+                }
+            } else if id == "social-settings" {
+                if let Err(error) = social::open_social_settings(app.clone()) {
                     eprintln!("{error}");
                 }
             } else if id == "toggle-pause" {
@@ -2885,6 +3043,8 @@ pub fn run() {
                     if label == "pet-manager"
                         || label == "ai-settings"
                         || label == "environment-settings"
+                        || label == "social-log"
+                        || label == "social-settings"
                         || label.starts_with("pet-chat-") =>
                 {
                     api.prevent_close();
@@ -2912,6 +3072,7 @@ pub fn run() {
             build_app_menu(&app.handle())?;
             environment::start_monitor(&app.handle());
             ai::start_heartbeat_scheduler(&app.handle());
+            social::start_scheduler(&app.handle());
             #[cfg(target_os = "macos")]
             if let Err(error) = macos_dock_menu::install(&app.handle()) {
                 eprintln!("failed to install Dock menu: {error}");
@@ -2958,6 +3119,8 @@ pub fn run() {
             open_pet_manager,
             open_ai_settings,
             open_environment_settings,
+            social::open_social_log,
+            social::open_social_settings,
             get_environment_settings,
             update_environment_settings,
             show_pet_context_menu,
@@ -3003,7 +3166,15 @@ pub fn run() {
             ai::get_shared_memories,
             ai::delete_shared_memory,
             ai::update_shared_memory,
-            ai::clear_shared_memories
+            ai::clear_shared_memories,
+            social::get_social_settings,
+            social::update_social_settings,
+            social::start_social_interaction,
+            social::cancel_social_scene,
+            social::report_pet_runtime_state,
+            social::get_public_relationships,
+            social::get_social_log,
+            social::clear_social_log
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

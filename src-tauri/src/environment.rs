@@ -187,6 +187,9 @@ fn process_snapshot(
     if session_changed {
         crate::ai::set_all_pets_sleeping(app, should_sleep);
     }
+    if session_changed || is_auto_quiet(app) {
+        crate::social::cancel_all_scenes(app);
+    }
     if changed || break_due || low_battery_due {
         let _ = app.emit(
             "environment://state",

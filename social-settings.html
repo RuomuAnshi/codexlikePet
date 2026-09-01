@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>社交设置</title>
+    <link rel="stylesheet" href="/src/social-settings.css" />
+  </head>
+  <body>
+    <main class="settings-page">
+      <header>
+        <p class="eyebrow">SAKIPET SOCIAL</p>
+        <h1>社交设置</h1>
+        <p>决定宠物什么时候靠近、玩耍和一起说悄悄话。</p>
+      </header>
+      <form id="form">
+        <label class="toggle"><input id="enabled" type="checkbox" /><span><strong>允许宠物社交</strong><small>关闭后仍保留独立宠物的散步和对话。</small></span></label>
+        <div class="grid">
+          <label><span>最短间隔（分钟）</span><input id="min" type="number" min="1" max="120" step="1" /></label>
+          <label><span>最长间隔（分钟）</span><input id="max" type="number" min="1" max="240" step="1" /></label>
+          <label><span>同屏最多参与者</span><input id="participants" type="number" min="2" max="4" step="1" /></label>
+        </div>
+        <label class="toggle"><input id="proximity" type="checkbox" /><span><strong>靠近时触发互动</strong><small>把一只宠物拖到另一只附近并释放，会触发即时反应。</small></span></label>
+        <label class="toggle"><input id="manual" type="checkbox" /><span><strong>允许手动“找朋友”</strong><small>可以从宠物右键菜单发起互动。</small></span></label>
+        <label class="toggle"><input id="props" type="checkbox" /><span><strong>显示共享道具</strong><small>在追逐、抢玩具和分享零食时显示简单的应用内道具。</small></span></label>
+        <p id="status" class="status">正在读取……</p>
+        <button id="save" type="submit">保存社交设置</button>
+      </form>
+    </main>
+    <script type="module" src="/src/social-settings.ts"></script>
+  </body>
+</html>

@@ -13,6 +13,7 @@ export interface PetSettings {
   circadianEnabled: boolean;
   sleepStartMinutes: number;
   wakeMinutes: number;
+  socialEnabled: boolean;
 }
 
 export interface PetSettingsEvent {

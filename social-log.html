@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>宠物日志</title>
+    <link rel="stylesheet" href="/src/social-log.css" />
+  </head>
+  <body>
+    <main class="log-page">
+      <header class="log-header">
+        <div>
+          <p class="eyebrow">SAKIPET SOCIAL</p>
+          <h1>宠物日志</h1>
+          <p>看看它们什么时候靠近、玩耍，以及关系如何慢慢变化。</p>
+        </div>
+        <button id="clear-log" class="secondary" type="button">清空日志</button>
+      </header>
+      <section class="filters" aria-label="日志筛选">
+        <label>宠物 <select id="pet-filter"><option value="">全部</option></select></label>
+        <label>互动 <select id="type-filter"><option value="">全部</option></select></label>
+        <button id="refresh" class="secondary" type="button">刷新</button>
+      </section>
+      <p id="status" class="status">正在读取……</p>
+      <section id="relationship-list" class="relationship-list" aria-label="关系"></section>
+      <section id="log-list" class="log-list" aria-live="polite"></section>
+    </main>
+    <script type="module" src="/src/social-log.ts"></script>
+  </body>
+</html>

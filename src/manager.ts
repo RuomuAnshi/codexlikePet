@@ -31,6 +31,8 @@ const importButton = document.querySelector<HTMLButtonElement>("#import-pet")!;
 const importInput = document.querySelector<HTMLInputElement>("#pet-package")!;
 const openAiSettingsButton = document.querySelector<HTMLButtonElement>("#open-ai-settings")!;
 const openEnvironmentSettingsButton = document.querySelector<HTMLButtonElement>("#open-environment-settings")!;
+const openSocialSettingsButton = document.querySelector<HTMLButtonElement>("#open-social-settings")!;
+const openSocialLogButton = document.querySelector<HTMLButtonElement>("#open-social-log")!;
 const settingsDialog = document.querySelector<HTMLDialogElement>("#pet-settings-dialog")!;
 const settingsDialogTitle = document.querySelector<HTMLElement>("#settings-dialog-title")!;
 const settingsDialogContent = document.querySelector<HTMLElement>("#settings-dialog-content")!;
@@ -220,6 +222,7 @@ interface PetSettingsControls {
   clickThrough: HTMLInputElement;
   showInFullscreen: HTMLInputElement;
   circadianEnabled: HTMLInputElement;
+  socialEnabled: HTMLInputElement;
   sleepStart: HTMLInputElement;
   wake: HTMLInputElement;
   pause: HTMLButtonElement;
@@ -284,6 +287,7 @@ function syncSettingsControls(controls: PetSettingsControls, next: PetSettings):
   controls.clickThrough.checked = next.clickThrough;
   controls.showInFullscreen.checked = next.showInFullscreen;
   controls.circadianEnabled.checked = next.circadianEnabled;
+  controls.socialEnabled.checked = next.socialEnabled;
   controls.sleepStart.value = minutesToTime(next.sleepStartMinutes);
   controls.wake.value = minutesToTime(next.wakeMinutes);
   controls.pause.textContent = next.paused ? "继续动画" : "暂停动画";
@@ -330,6 +334,7 @@ async function savePetSettings(
     circadianEnabled: controls.circadianEnabled.checked,
     sleepStartMinutes: timeToMinutes(controls.sleepStart.value, pet.info.settings.sleepStartMinutes),
     wakeMinutes: timeToMinutes(controls.wake.value, pet.info.settings.wakeMinutes),
+    socialEnabled: controls.socialEnabled.checked,
   };
   setSettingsBusy(controls, true);
   try {
@@ -401,6 +406,11 @@ function createSettingsForm(pet: LoadedPet, displayName: string): HTMLFormElemen
     "按本地时间睡觉和起床",
     pet.info.settings.circadianEnabled,
   );
+  const social = createToggleRow(
+    "参与宠物社交",
+    "允许这只宠物加入靠近、玩耍和群体活动",
+    pet.info.settings.socialEnabled,
+  );
   const sleepStart = document.createElement("label");
   sleepStart.className = "time-setting";
   sleepStart.innerHTML = "<span><strong>入睡时间</strong><small>进入睡眠区间</small></span>";
@@ -415,7 +425,7 @@ function createSettingsForm(pet: LoadedPet, displayName: string): HTMLFormElemen
   wakeInput.type = "time";
   wakeInput.value = minutesToTime(pet.info.settings.wakeMinutes);
   wake.append(wakeInput);
-  toggleGrid.append(wander, quiet, lock, clickThrough, showInFullscreen, circadian);
+  toggleGrid.append(wander, quiet, lock, clickThrough, showInFullscreen, circadian, social);
   const scheduleGrid = document.createElement("div");
   scheduleGrid.className = "schedule-grid";
   scheduleGrid.append(sleepStart, wake);
@@ -439,6 +449,7 @@ function createSettingsForm(pet: LoadedPet, displayName: string): HTMLFormElemen
     clickThrough: clickThrough.querySelector<HTMLInputElement>("input")!,
     showInFullscreen: showInFullscreen.querySelector<HTMLInputElement>("input")!,
     circadianEnabled: circadian.querySelector<HTMLInputElement>("input")!,
+    socialEnabled: social.querySelector<HTMLInputElement>("input")!,
     sleepStart: sleepStartInput,
     wake: wakeInput,
     pause,
@@ -650,6 +661,26 @@ openEnvironmentSettingsButton.addEventListener("click", async () => {
     setStatus(errorMessage(error), "error");
   } finally {
     setBusy(openEnvironmentSettingsButton, false);
+  }
+});
+openSocialSettingsButton.addEventListener("click", async () => {
+  setBusy(openSocialSettingsButton, true);
+  try {
+    await invoke("open_social_settings");
+  } catch (error) {
+    setStatus(errorMessage(error), "error");
+  } finally {
+    setBusy(openSocialSettingsButton, false);
+  }
+});
+openSocialLogButton.addEventListener("click", async () => {
+  setBusy(openSocialLogButton, true);
+  try {
+    await invoke("open_social_log");
+  } catch (error) {
+    setStatus(errorMessage(error), "error");
+  } finally {
+    setBusy(openSocialLogButton, false);
   }
 });
 importButton.addEventListener("click", () => importInput.click());

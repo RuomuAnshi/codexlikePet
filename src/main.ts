@@ -1,7 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { CELL_HEIGHT, CELL_WIDTH, type LookDirection } from "./pet/atlas";
+import { CELL_HEIGHT, CELL_WIDTH, type AnimationState, type LookDirection } from "./pet/atlas";
 import { loadPet } from "./pet/loader";
 import { loadPetFromData } from "./pet/loader";
 import { PetEngine } from "./pet/engine";
@@ -32,6 +32,21 @@ interface PetMeetupEvent {
   targetX: number;
   targetY: number;
   travelMs: number;
+}
+
+interface SocialSceneParticipant {
+  instanceId: string;
+  petId: string;
+  role: string;
+}
+
+interface SocialScenePhaseParticipant {
+  instanceId: string;
+  petId: string;
+  animation: string;
+  look?: string | null;
+  say?: string | null;
+  effect?: string | null;
 }
 
 async function boot(): Promise<void> {
@@ -99,6 +114,7 @@ async function boot(): Promise<void> {
   let behaviorLookTimer: number | undefined;
   let pettingTimer: number | undefined;
   let autoQuiet = false;
+  let socialSceneId: string | null = null;
 
   const speechPreview = (text: string): string => {
     const chars = [...text.trim()];
@@ -213,6 +229,22 @@ async function boot(): Promise<void> {
     }
   };
 
+  const reportRuntimeState = async (isDragging: boolean): Promise<void> => {
+    try {
+      const [position, scaleFactor] = await Promise.all([window.outerPosition(), window.scaleFactor()]);
+      const logical = position.toLogical(scaleFactor);
+      await invoke("report_pet_runtime_state", {
+        instanceId: runtime.instanceId,
+        petId: runtime.petId,
+        dragging: isDragging,
+        busy: chatRequestId !== null,
+        position: { x: logical.x, y: logical.y },
+      });
+    } catch (error) {
+      console.warn("failed to report social runtime state:", error);
+    }
+  };
+
   const applySettings = (next: PetSettings): void => {
     settings = next;
     paused = next.paused;
@@ -238,6 +270,9 @@ async function boot(): Promise<void> {
 
   const openPetChat = async (): Promise<void> => {
     try {
+      if (socialSceneId) {
+        await invoke("cancel_social_scene", { sceneId: socialSceneId });
+      }
       await invoke("open_pet_chat", { petId: runtime.petId });
     } catch (error) {
       console.error("failed to open pet chat:", error);
@@ -247,6 +282,9 @@ async function boot(): Promise<void> {
 
   const togglePetChat = async (): Promise<void> => {
     try {
+      if (socialSceneId) {
+        await invoke("cancel_social_scene", { sceneId: socialSceneId });
+      }
       const opened = await invoke<boolean>("toggle_pet_chat", { petId: runtime.petId });
       if (opened) sayLine("doubleClick");
     } catch (error) {
@@ -344,9 +382,11 @@ async function boot(): Promise<void> {
       else engine.setLook(lastDirection);
       syncAnimation();
       if (enabled) void savePosition();
+      void reportRuntimeState(enabled);
       if (!enabled) {
         dragDialogueShown = false;
         void savePosition();
+        void reportRuntimeState(false);
         if (!paused && settings.wanderEnabled && !settings.quietMode) walker.start();
       }
     },
@@ -426,6 +466,62 @@ async function boot(): Promise<void> {
   await listen<PetMeetupEvent>("pet://meetup", ({ payload }) => {
     if (payload.petId !== runtime.petId) return;
     walker.walkTo(payload.targetX, payload.targetY);
+  });
+  await listen<{ sceneId: string; participants: SocialSceneParticipant[] }>(
+    "pet://social-scene-start",
+    ({ payload }) => {
+      if (!payload.participants.some((participant) => participant.instanceId === runtime.instanceId)) return;
+      socialSceneId = payload.sceneId;
+      walker.stop();
+      stateMachine.setSocialState("waiting");
+      syncAnimation();
+    },
+  );
+  await listen<{ sceneId: string; participants: SocialScenePhaseParticipant[] }>(
+    "pet://social-phase",
+    ({ payload }) => {
+      if (payload.sceneId !== socialSceneId) return;
+      const participant = payload.participants.find((item) => item.instanceId === runtime.instanceId);
+      if (!participant || dragging) return;
+      const animationMap: Record<string, AnimationState> = {
+        idle: "idle",
+        walking: "running",
+        running: "running",
+        waving: "waving",
+        jumping: "jumping",
+        waiting: "waiting",
+      };
+      stateMachine.setSocialState(animationMap[participant.animation] ?? "idle");
+      if (participant.look) {
+        const directionNames: Record<string, LookDirection> = {
+          up: 0,
+          "up-right": 2,
+          right: 4,
+          "down-right": 6,
+          down: 8,
+          "down-left": 10,
+          left: 12,
+          "up-left": 14,
+        };
+        const direction = directionNames[participant.look];
+        if (direction !== undefined) engine.setLook(direction);
+      }
+      if (participant.say) showSpeech(participant.say, 4_200);
+      if (participant.effect === "heart") showEffect("heart");
+      if (participant.effect === "food") showEffect("food");
+      if (participant.effect === "dust") showEffect("dust");
+      if (participant.effect === "star" || participant.effect === "sparkle") showEffect("star");
+      syncAnimation();
+    },
+  );
+  await listen<{ sceneId: string }>("pet://social-scene-end", ({ payload }) => {
+    if (payload.sceneId !== socialSceneId) return;
+    socialSceneId = null;
+    stateMachine.setSocialState(null);
+    if (!dragging && !paused && !settings.quietMode && !autoQuiet && settings.wanderEnabled) walker.start();
+    if (!dragging) engine.setLook(lastDirection);
+    syncAnimation();
+    void savePosition();
   });
   await listen<{ petId: string; state: { activity: string; mood: string; energy: number } }>(
     "pet://life-state",
@@ -538,6 +634,7 @@ async function boot(): Promise<void> {
   engine.play(!paused);
   walker.setSettings(settings.speed, settings.wanderEnabled, settings.quietMode);
   scheduleIdleSpeech();
+  void reportRuntimeState(false);
   if (!paused && settings.wanderEnabled && !settings.quietMode) walker.start();
 }
 

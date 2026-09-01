@@ -953,6 +953,9 @@ pub(crate) fn perform_pet_action_internal(
         "feed" | "play" | "sleep" | "wake" => {}
         _ => return Err("不支持的宠物动作".to_string()),
     }
+    if action == "sleep" {
+        super::social::cancel_scenes_for_pet(app, pet_id);
+    }
     let state = update_pet_life_state(app, pet_id, |state| {
         if matches!(action.as_str(), "feed" | "play") && state.activity == "sleeping" {
             state.sleep_override_until = now.saturating_add(10 * 60_000);
@@ -1615,6 +1618,28 @@ async fn call_stream(
     }
 }
 
+/// Small non-streaming request used by the local social director. The social
+/// runtime owns timeout, validation and local fallback; this wrapper keeps
+/// credentials and provider-specific payloads inside the AI module.
+pub(crate) async fn request_social_director(
+    app: &tauri::AppHandle,
+    prompt: &str,
+) -> Result<String, String> {
+    let config = config_snapshot(app)?;
+    let Some(model) = config.ai.chat_model.clone() else {
+        return Err("未配置聊天模型".to_string());
+    };
+    if !config.ai.enabled || !settings_have_chat(&config.ai) {
+        return Err("AI 未启用或聊天模型未配置".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|error| format!("无法创建模型连接: {error}"))?;
+    call_stream(&client, &model, prompt, &[], None, false, |_| {}).await
+}
+
 fn card_for_pet(app: &tauri::AppHandle, pet_id: &str) -> Result<CharacterCard, String> {
     super::load_pet_character(app, pet_id)
 }
@@ -2061,6 +2086,73 @@ fn store_memory(app: &tauri::AppHandle, pet_id: &str, fact: &MemoryFact) -> Resu
         return Ok(());
     }
     append_jsonl(path, fact)
+}
+
+/// Keeps completed local social scenes available to each participating pet.
+/// This is intentionally a small, durable fact rather than a second chat
+/// transcript: social logs remain the public audit trail, while this memory
+/// is what lets a pet recall an important shared event later.
+pub(crate) fn record_social_scene_memory(
+    app: &tauri::AppHandle,
+    scene: &str,
+    dialogue: &[(String, String)],
+) -> Result<(), String> {
+    if dialogue.len() < 2 {
+        return Ok(());
+    }
+    let timestamp = now_ms();
+    let shared = dialogue
+        .iter()
+        .map(|(pet_id, text)| {
+            let name = super::load_pet_character(app, pet_id)
+                .map(|card| {
+                    if card.name.trim().is_empty() {
+                        pet_id.clone()
+                    } else {
+                        card.name
+                    }
+                })
+                .unwrap_or_else(|_| pet_id.clone());
+            format!("{name}：“{}”", text.chars().take(120).collect::<String>())
+        })
+        .collect::<Vec<_>>()
+        .join("；");
+    for (pet_id, _) in dialogue {
+        let others = dialogue
+            .iter()
+            .filter(|(other_id, _)| other_id != pet_id)
+            .map(|(other_id, _)| {
+                super::load_pet_character(app, other_id)
+                    .map(|card| {
+                        if card.name.trim().is_empty() {
+                            other_id.clone()
+                        } else {
+                            card.name
+                        }
+                    })
+                    .unwrap_or_else(|_| other_id.clone())
+            })
+            .collect::<Vec<_>>()
+            .join("、");
+        let content = format!("我和{others}进行了一次{scene}：{shared}");
+        store_memory(
+            app,
+            pet_id,
+            &MemoryFact {
+                id: format!("social-scene-{timestamp}-{scene}-{pet_id}"),
+                content,
+                kind: "relationship".to_string(),
+                scope: "pet".to_string(),
+                importance: 0.9,
+                confidence: 1.0,
+                created_at: timestamp,
+                updated_at: timestamp,
+                status: "active".to_string(),
+                expires_at: None,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 async fn refresh_summary(
@@ -3516,6 +3608,9 @@ fn advance_life_states(app: &tauri::AppHandle, config: &super::AppConfig) {
 }
 
 pub(crate) fn set_all_pets_sleeping(app: &tauri::AppHandle, sleeping: bool) {
+    if sleeping {
+        super::social::cancel_all_scenes(app);
+    }
     let Ok(config) = config_snapshot(app) else {
         return;
     };
@@ -3548,6 +3643,10 @@ pub(crate) fn start_heartbeat_scheduler(app: &tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut next_heartbeat: HashMap<String, u64> = HashMap::new();
         let mut next_pet_conversation: HashMap<String, u64> = HashMap::new();
+        // Pet-to-pet scenes are now owned by the dedicated social
+        // coordinator. Keep the old response path for compatibility with
+        // existing history, but do not schedule a second competing scene.
+        let legacy_pet_conversation = false;
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
             let Ok(config) = config_snapshot(&app) else {
@@ -3585,7 +3684,7 @@ pub(crate) fn start_heartbeat_scheduler(app: &tauri::AppHandle) {
             }
 
             let mut conversation_pairs = Vec::new();
-            if config.ai.pet_conversation_enabled {
+            if legacy_pet_conversation && config.ai.pet_conversation_enabled {
                 for (index, first_id) in candidates.iter().enumerate() {
                     for second_id in candidates.iter().skip(index + 1) {
                         let pair_key = format!("{first_id}\u{1f}{second_id}");
@@ -3622,7 +3721,11 @@ pub(crate) fn start_heartbeat_scheduler(app: &tauri::AppHandle) {
                 .map(|pets| pets.is_empty())
                 .unwrap_or(false);
 
-            if config.ai.pet_conversation_enabled && companion_cooldown_over && no_active_task {
+            if legacy_pet_conversation
+                && config.ai.pet_conversation_enabled
+                && companion_cooldown_over
+                && no_active_task
+            {
                 if let Some((pair_key, first_id, second_id)) = conversation_pairs
                     .iter()
                     .find(|(pair_key, _, _)| {
