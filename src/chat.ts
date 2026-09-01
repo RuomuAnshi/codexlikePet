@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { waitForAppReady } from "./appReady";
+import { extractSayText } from "./pet/streaming";
 import type { AiSettings, ChatMessage } from "./pet/config";
 
 const params = new URLSearchParams(location.search);
@@ -17,6 +18,7 @@ const setup = document.querySelector<HTMLElement>("#setup")!;
 const chatWindow = getCurrentWindow();
 let activeRequest: string | null = null;
 let streamingMessage: HTMLElement | null = null;
+let streamRaw = "";
 let pendingUserMessage: HTMLElement | null = null;
 let historyVisible = false;
 let historyMessages: ChatMessage[] = [];
@@ -84,6 +86,7 @@ async function load(): Promise<void> {
 
 async function send(content: string): Promise<void> {
   if (activeRequest || !content.trim()) return;
+  streamRaw = "";
   pendingUserMessage = addMessage({
     id: `local-${Date.now()}`,
     role: "user",
@@ -127,10 +130,12 @@ function removeStreamingMessage(): void {
 
 function applyDelta(payload: PendingEvent["payload"] & { delta: string }): void {
   if (payload.petId !== petId || payload.requestId !== activeRequest) return;
+  streamRaw += payload.delta;
+  const say = extractSayText(streamRaw);
   streamingMessage ??= addMessage({ id: "stream", role: "assistant", content: "", timestamp: Date.now(), source: "chat" });
-  streamingMessage.textContent += payload.delta;
+  streamingMessage.textContent = say;
   const streamedMessage = lastSessionMessage();
-  if (streamedMessage?.id === "stream") streamedMessage.content += payload.delta;
+  if (streamedMessage?.id === "stream") streamedMessage.content = say;
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
@@ -150,6 +155,7 @@ function applyComplete(payload: Extract<PendingEvent, { type: "complete" }>["pay
   pendingUserMessage = null;
   activeRequest = null;
   streamingMessage = null;
+  streamRaw = "";
   sendButton.disabled = false;
   stopButton.hidden = true;
   setStatus("");
@@ -159,6 +165,7 @@ function applyError(payload: Extract<PendingEvent, { type: "error" }>["payload"]
   if (payload.petId !== petId || payload.requestId !== activeRequest) return;
   activeRequest = null;
   removeStreamingMessage();
+  streamRaw = "";
   pendingUserMessage = null;
   sendButton.disabled = false;
   stopButton.hidden = true;
@@ -215,6 +222,7 @@ async function bootChat(): Promise<void> {
     await invoke("cancel_chat_response", { petId });
     activeRequest = null;
     removeStreamingMessage();
+    streamRaw = "";
     sendButton.disabled = false;
     stopButton.hidden = true;
     setStatus("已停止");

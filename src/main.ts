@@ -9,6 +9,7 @@ import { watchCursorDirection } from "./pet/cursorWatcher";
 import { PetStateMachine, type PetAction } from "./pet/stateMachine";
 import { attachDrag, attachGestures, dragState, type DragDirection, type Gesture } from "./pet/window";
 import { PetWalker } from "./pet/walker";
+import { extractSayText } from "./pet/streaming";
 import { waitForAppReady } from "./appReady";
 import type {
   PetBehavior,
@@ -502,7 +503,7 @@ async function boot(): Promise<void> {
     if (chatRequestId !== null && payload.requestId !== chatRequestId) return;
     chatRequestId ??= payload.requestId;
     chatReply += payload.delta;
-    showSpeech(chatReply, 7_000);
+    showSpeech(extractSayText(chatReply), 7_000);
   });
   await listen<{
     requestId: string;
