@@ -20,6 +20,10 @@ use tauri::{Emitter, Manager};
 use super::{config_snapshot, AppState, CharacterCard, PetSettings};
 
 const SERVICE_NAME: &str = "com.sakipet.desktop";
+// Keys saved before the app identity was anonymized live in the keychain
+// under this legacy service name. Keep reading them so existing installs do
+// not silently lose their configured API keys.
+const LEGACY_KEYRING_SERVICE: &str = "com.ifan.sakipet";
 const AI_DIRECTORY: &str = "ai";
 const MAX_MESSAGE_CHARS: usize = 4_000;
 const MAX_HISTORY_MESSAGES: usize = 200;
@@ -1115,11 +1119,8 @@ fn load_memories(app: &tauri::AppHandle, pet_id: &str) -> Result<Vec<MemoryFact>
     Ok(facts)
 }
 
-fn get_secret(reference: &Option<String>) -> Result<Option<String>, String> {
-    let Some(reference) = reference else {
-        return Ok(None);
-    };
-    let entry = keyring::Entry::new(SERVICE_NAME, reference)
+fn read_secret(service: &str, account: &str) -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new(service, account)
         .map_err(|error| format!("无法访问系统密钥环: {error}"))?;
     match entry.get_password() {
         Ok(secret) if !secret.is_empty() => Ok(Some(secret)),
@@ -1127,6 +1128,16 @@ fn get_secret(reference: &Option<String>) -> Result<Option<String>, String> {
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => Err(format!("无法读取 API Key: {error}")),
     }
+}
+
+fn get_secret(reference: &Option<String>) -> Result<Option<String>, String> {
+    let Some(reference) = reference else {
+        return Ok(None);
+    };
+    if let Some(secret) = read_secret(SERVICE_NAME, reference)? {
+        return Ok(Some(secret));
+    }
+    read_secret(LEGACY_KEYRING_SERVICE, reference)
 }
 
 fn normalized_endpoint(config: &ModelEndpointConfig) -> Result<(String, Option<String>), String> {
@@ -2299,15 +2310,30 @@ pub(crate) fn set_ai_secret(reference: String, secret: String) -> Result<(), Str
     let entry = keyring::Entry::new(SERVICE_NAME, &reference).map_err(|error| error.to_string())?;
     entry
         .set_password(&secret)
-        .map_err(|error| format!("保存 API Key 失败: {error}"))
+        .map_err(|error| format!("保存 API Key 失败: {error}"))?;
+    if let Ok(legacy) = keyring::Entry::new(LEGACY_KEYRING_SERVICE, &reference) {
+        let _ = legacy.delete_credential();
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub(crate) fn delete_ai_secret(reference: String) -> Result<(), String> {
-    let entry = keyring::Entry::new(SERVICE_NAME, &reference).map_err(|error| error.to_string())?;
-    match entry.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(error.to_string()),
+    let mut first_error: Option<String> = None;
+    for service in [SERVICE_NAME, LEGACY_KEYRING_SERVICE] {
+        let result = keyring::Entry::new(service, &reference)
+            .map_err(|error| error.to_string())
+            .and_then(|entry| match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(error) => Err(error.to_string()),
+            });
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
