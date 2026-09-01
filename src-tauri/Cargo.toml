@@ -1,6 +1,6 @@
 [package]
 name = "sakipet"
-version = "0.1.3"
+version = "0.1.4"
 description = "A cute animated desktop pet rendered from a V2 sprite atlas"
 authors = ["Ruomu Anshi"]
 license = "MIT"
