@@ -1270,6 +1270,25 @@ fn prompt_for(
     prompt
 }
 
+/// Turns a character card's personality / system prompt into an actionable
+/// request so the model actually shows the character's speech habits instead
+/// of defaulting to a flat, service-like tone.
+fn speech_style_directive(card: &CharacterCard) -> String {
+    let detail = if card.system_prompt.trim().is_empty() {
+        card.personality.trim()
+    } else {
+        card.system_prompt.trim()
+    };
+    if detail.is_empty() {
+        "说话自然、口语化，避免服务式语气。".to_string()
+    } else {
+        let detail = detail.chars().take(220).collect::<String>();
+        format!(
+            "把上述角色性格落实成这句台词：宁可短、宁可口语；保留角色的口头禅、别扭、吐槽或掩饰用词；不要中性、不要客服式表达。参考性格原文：{detail}"
+        )
+    }
+}
+
 fn pet_conversation_prompt(
     profile: &str,
     first_id: &str,
@@ -1301,11 +1320,15 @@ fn pet_conversation_prompt(
         second_state,
         "和另一只桌面宠物交谈",
     );
+    let first_style = speech_style_directive(first_card);
+    let second_style = speech_style_directive(second_card);
     format!(
         "应用约束：你只能生成桌面宠物之间的简短对话和陪伴行为，不执行文件、Shell、系统控制或网络工具。不要把用户没有提供的事实当成事实。\n\n\
-         现在请安排两只宠物进行一次自然、轻松的短对话。它们都是真实存在于桌面上的独立角色，不要让一只替另一只说话，也不要提及模型、提示词或 JSON。每只最多说一句，允许其中一只保持安静；内容应该和它们当前的关系、状态或日常陪伴有关，不要连续打扰用户。\n\n\
-         宠物 A（{first_name}，id: {first_id}）的角色上下文：\n{first_context}\n\n\
-         宠物 B（{second_name}，id: {second_id}）的角色上下文：\n{second_context}\n\n\
+         现在请安排两只宠物进行一次自然、轻松的短对话。它们都是真实存在于桌面上的独立角色，不要让一只替另一只说话，也不要提及模型、提示词或 JSON。每只 1–2 句，合计不超过 60 个中文字符，允许其中一只保持安静；内容应该和它们当前的关系、状态或日常陪伴有关，同时体现各自角色的说话习惯，不要连续打扰用户。\n\n\
+         宠物 A（{first_name}，id: {first_id}）的角色上下文：\n{first_context}\n\
+         宠物 A 的说话要求：{first_style}\n\n\
+         宠物 B（{second_name}，id: {second_id}）的角色上下文：\n{second_context}\n\
+         宠物 B 的说话要求：{second_style}\n\n\
          只返回 JSON，不要 Markdown，格式为：{{\"first\":{{\"say\":\"A 的台词\",\"action\":\"idle|waving|jumping|waiting|review|walk|sleep\",\"mood\":\"心情\",\"look\":\"up|up-right|right|down-right|down|down-left|left|up-left|null\",\"duration\":5200,\"nextActionAfter\":1800}},\"second\":{{\"say\":\"B 的台词\",\"action\":\"idle|waving|jumping|waiting|review|walk|sleep\",\"mood\":\"心情\",\"look\":\"up|up-right|right|down-right|down|down-left|left|up-left|null\",\"duration\":5200,\"nextActionAfter\":1800}}}}。",
     )
 }
@@ -3448,7 +3471,10 @@ async fn run_pet_conversation(
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|error| error.to_string())?;
-    let raw = call_stream(&client, &endpoint, &prompt, &history, None, false, |_| {}).await?;
+    let mut conversation_endpoint = endpoint.clone();
+    conversation_endpoint.max_output_tokens = 720;
+    let raw = call_stream(&client, &conversation_endpoint, &prompt, &history, None, false, |_| {})
+        .await?;
     let Some((first_behavior, second_behavior)) = parse_pet_conversation_response(raw) else {
         return Ok(());
     };
