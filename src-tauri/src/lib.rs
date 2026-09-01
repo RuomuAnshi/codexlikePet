@@ -15,8 +15,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Mutex,
 };
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri::{
     Emitter, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
     Wry,
@@ -2248,6 +2249,14 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<Wry>> {
         true,
         None::<&str>,
     )?;
+    let autostart = CheckMenuItem::with_id(
+        app,
+        "toggle-autostart",
+        "开机自启动",
+        true,
+        app.autolaunch().is_enabled().unwrap_or(false),
+        None::<&str>,
+    )?;
     let config = config_snapshot(app).unwrap_or_default();
     let catalog = installed_pets(app, &config);
     let mut add_items = Vec::new();
@@ -2312,6 +2321,7 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<Wry>> {
         &manage_pets,
         &settings,
         &toggle_pause,
+        &autostart,
         &add_submenu,
         &instance_submenu,
         &separator,
@@ -2351,6 +2361,19 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             } else if id == "toggle-pause" {
                 if let Err(error) = toggle_all_pause_internal(app) {
                     eprintln!("failed to toggle pet animation: {error}");
+                }
+            } else if id == "toggle-autostart" {
+                let next = !app.autolaunch().is_enabled().unwrap_or(false);
+                let result = if next {
+                    app.autolaunch().enable()
+                } else {
+                    app.autolaunch().disable()
+                };
+                if let Err(error) = result {
+                    eprintln!("failed to toggle autostart: {error}");
+                }
+                if let Err(error) = rebuild_tray_menu(app) {
+                    eprintln!("failed to refresh tray menu: {error}");
                 }
             } else if let Some(pet_id) = id.strip_prefix("add-pet:") {
                 if let Err(error) = add_pet_instance_internal(app, pet_id) {
@@ -2470,6 +2493,10 @@ fn look_direction(app: tauri::AppHandle, window_label: String) -> Option<u8> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
         // Register state before the runtime creates configured WebViews. A
         // page can execute JavaScript before the setup hook is entered.
         .manage(AppState::new())
