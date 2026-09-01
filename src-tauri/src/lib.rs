@@ -1012,6 +1012,12 @@ fn load_config(app: &tauri::AppHandle) -> AppConfig {
     };
     let mut config = serde_json::from_slice::<AppConfig>(&bytes).unwrap_or_default();
     normalize_config(&mut config);
+    // Drop instances whose pet resources no longer exist. Their windows were
+    // never created, and leaving them in place makes aggregate operations such
+    // as toggle_all_visibility fail halfway through.
+    config
+        .instances
+        .retain(|instance| instance.id == "main" || pet_exists(app, &instance.pet_id));
     config
 }
 
@@ -2430,7 +2436,9 @@ fn toggle_all_visibility(app: &tauri::AppHandle) -> Result<(), String> {
         .map(|instance| instance.id.clone())
         .collect();
     for id in ids {
-        set_instance_visible_internal(app, &id, target)?;
+        if let Err(error) = set_instance_visible_internal(app, &id, target) {
+            eprintln!("failed to toggle pet instance {id}: {error}");
+        }
     }
     rebuild_tray_menu(app).map_err(|error| error.to_string())
 }
