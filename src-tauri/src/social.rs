@@ -55,6 +55,7 @@ impl Default for SocialSettings {
 pub(crate) struct SocialRuntime {
     pub(crate) active: Mutex<HashMap<String, ActiveScene>>,
     pub(crate) runtime: Mutex<HashMap<String, RuntimePetState>>,
+    last_proximity_scenes: Mutex<HashMap<String, String>>,
     pub(crate) next_scheduled_at: Mutex<u64>,
 }
 
@@ -650,7 +651,7 @@ fn valid_prop(value: Option<&str>) -> Option<String> {
     }
 }
 
-fn generic_line(scene: &str, role: &str, index: usize) -> String {
+fn generic_line(scene: &str, role: &str) -> String {
     let lines: &[&str] = match (scene, role) {
         ("greet", "leader") => &["你也在这里呀。", "要一起待一会儿吗？"],
         ("greet", _) => &["嗯，来打个招呼。", "我看到你啦。"],
@@ -686,7 +687,7 @@ fn generic_line(scene: &str, role: &str, index: usize) -> String {
         ("toy-scramble", _) => &["玩具在这里！快抢！"],
         _ => &["我们一起玩吧。"],
     };
-    lines[index % lines.len()].to_string()
+    lines[rand::rng().random_range(0..lines.len())].to_string()
 }
 
 fn role_for(scene: &str, index: usize) -> String {
@@ -763,14 +764,13 @@ fn local_dialogue(
     pet_id: &str,
     scene: &str,
     role: &str,
-    index: usize,
     partner: Option<&str>,
 ) -> String {
     let card = super::load_pet_character(app, pet_id).unwrap_or_default();
     let social = card_social(&card);
     let key = if role == "winner" { "tug-win" } else { scene };
     if let Some(lines) = social.dialogue.get(key).filter(|lines| !lines.is_empty()) {
-        return lines[index % lines.len()]
+        return lines[rand::rng().random_range(0..lines.len())]
             .chars()
             .take(SOCIAL_EVENT_MAX_CHARS)
             .collect();
@@ -778,14 +778,14 @@ fn local_dialogue(
     if let Some(partner) = partner {
         if let Some(relationship) = social.relationships.get(partner) {
             if let Some(lines) = relationship.dialogue.get(key).filter(|lines| !lines.is_empty()) {
-                return lines[index % lines.len()]
+                return lines[rand::rng().random_range(0..lines.len())]
                     .chars()
                     .take(SOCIAL_EVENT_MAX_CHARS)
                     .collect();
             }
         }
     }
-    generic_line(scene, role, index)
+    generic_line(scene, role)
 }
 
 fn snapshots(app: &tauri::AppHandle, config: &AppConfig) -> Vec<Snapshot> {
@@ -966,15 +966,64 @@ async fn choose_scene_with_ai(
         return None;
     }
     let prompt = scene_prompt(app, config, candidates);
-    let result = tokio::time::timeout(
+    let result = match tokio::time::timeout(
         Duration::from_secs(8),
         super::ai::request_social_director(app, &prompt),
     )
     .await
-    .ok()?
-    .ok()?;
-    let value = extract_json(&result)?;
-    serde_json::from_value(value).ok()
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            eprintln!("[social] AI 社交导演请求失败，使用本地互动: {error}");
+            return None;
+        }
+        Err(_) => {
+            eprintln!("[social] AI 社交导演请求超过 8 秒，使用本地互动");
+            return None;
+        }
+    };
+    let Some(value) = extract_json(&result) else {
+        eprintln!("[social] AI 社交导演返回的内容不是有效 JSON，使用本地互动");
+        return None;
+    };
+    match serde_json::from_value(value) {
+        Ok(decision) => Some(decision),
+        Err(error) => {
+            eprintln!("[social] AI 社交导演 JSON 未通过校验，使用本地互动: {error}");
+            None
+        }
+    }
+}
+
+fn fallback_scene(
+    app: &tauri::AppHandle,
+    candidates: &[Snapshot],
+    trigger: &str,
+) -> String {
+    const PROXIMITY_SCENES: &[&str] = &["greet", "whisper", "nuzzle", "bump"];
+    if trigger == "proximity" {
+        let mut pair = candidates
+            .iter()
+            .map(|candidate| candidate.pet_id.as_str())
+            .collect::<Vec<_>>();
+        pair.sort_unstable();
+        let pair_key = pair.join("\u{1f}");
+        if let Ok(mut previous_scenes) = app.state::<AppState>().social.last_proximity_scenes.lock() {
+            let previous = previous_scenes.get(&pair_key).map(String::as_str);
+            let choices = PROXIMITY_SCENES
+                .iter()
+                .copied()
+                .filter(|scene| Some(*scene) != previous)
+                .collect::<Vec<_>>();
+            let selected = choices[rand::rng().random_range(0..choices.len())].to_string();
+            previous_scenes.insert(pair_key, selected.clone());
+            return selected;
+        }
+        return PROXIMITY_SCENES[rand::rng().random_range(0..PROXIMITY_SCENES.len())].to_string();
+    }
+
+    let options = scene_options(candidates.len());
+    options[rand::rng().random_range(0..options.len())].to_string()
 }
 
 fn compile_decision(
@@ -1028,13 +1077,7 @@ fn compile_decision(
             }
         }
     }
-    let options = scene_options(candidates.len());
-    let index = if trigger == "scheduled" {
-        rand::rng().random_range(0..options.len())
-    } else {
-        0
-    };
-    let scene = options[index].to_string();
+    let scene = fallback_scene(app, candidates, trigger);
     let actors = candidates
         .iter()
         .enumerate()
@@ -1047,7 +1090,7 @@ fn compile_decision(
             (
                 actor.pet_id.clone(),
                 role.clone(),
-                local_dialogue(app, &actor.pet_id, &scene, &role, index, partner),
+                local_dialogue(app, &actor.pet_id, &scene, &role, partner),
             )
         })
         .collect();
@@ -1069,6 +1112,7 @@ fn target_positions(scene: &str, candidates: &[Snapshot]) -> Vec<PetPosition> {
     let center_y =
         candidates.iter().map(|item| item.position.y).sum::<f64>() / candidates.len() as f64;
     if candidates.len() == 2 {
+        let margin = window_margin(&candidates[0], &candidates[1]);
         let direction = if candidates[1].position.x >= candidates[0].position.x {
             1.0
         } else {
@@ -1077,11 +1121,11 @@ fn target_positions(scene: &str, candidates: &[Snapshot]) -> Vec<PetPosition> {
         return match scene {
             "chase" | "tag" => vec![
                 PetPosition {
-                    x: center_x - 90.0 * direction,
+                    x: center_x - (margin / 2.0 + 90.0) * direction,
                     y: center_y,
                 },
                 PetPosition {
-                    x: center_x + 90.0 * direction,
+                    x: center_x + (margin / 2.0 + 90.0) * direction,
                     y: center_y,
                 },
             ],
@@ -1097,11 +1141,11 @@ fn target_positions(scene: &str, candidates: &[Snapshot]) -> Vec<PetPosition> {
             ],
             _ => vec![
                 PetPosition {
-                    x: center_x - 82.0,
+                    x: center_x - (margin / 2.0 + 12.0) * direction,
                     y: center_y,
                 },
                 PetPosition {
-                    x: center_x + 82.0,
+                    x: center_x + (margin / 2.0 + 12.0) * direction,
                     y: center_y,
                 },
             ],
@@ -1119,29 +1163,47 @@ fn target_positions(scene: &str, candidates: &[Snapshot]) -> Vec<PetPosition> {
 }
 
 fn clamp_targets(targets: &mut [PetPosition], candidates: &[Snapshot]) {
-    let min_x = candidates
-        .iter()
-        .map(|item| item.bounds.left)
-        .fold(f64::INFINITY, f64::min)
-        - 240.0;
-    let min_y = candidates
-        .iter()
-        .map(|item| item.bounds.top)
-        .fold(f64::INFINITY, f64::min)
-        - 120.0;
-    let max_x = candidates
-        .iter()
-        .map(|item| item.bounds.right)
-        .fold(f64::NEG_INFINITY, f64::max)
-        + 240.0;
-    let max_y = candidates
-        .iter()
-        .map(|item| item.bounds.bottom)
-        .fold(f64::NEG_INFINITY, f64::max)
-        + 120.0;
-    for target in targets {
+    let clamp_to_screen = |target: &mut PetPosition| {
+        let min_x = candidates
+            .iter()
+            .map(|item| item.bounds.left)
+            .fold(f64::INFINITY, f64::min)
+            - 240.0;
+        let min_y = candidates
+            .iter()
+            .map(|item| item.bounds.top)
+            .fold(f64::INFINITY, f64::min)
+            - 120.0;
+        let max_x = candidates
+            .iter()
+            .map(|item| item.bounds.right)
+            .fold(f64::NEG_INFINITY, f64::max)
+            + 240.0;
+        let max_y = candidates
+            .iter()
+            .map(|item| item.bounds.bottom)
+            .fold(f64::NEG_INFINITY, f64::max)
+            + 120.0;
         target.x = target.x.clamp(min_x, max_x);
         target.y = target.y.clamp(min_y, max_y);
+    };
+    for target in targets.iter_mut() {
+        clamp_to_screen(target);
+    }
+    // Keep every pair of targets far enough apart that their windows never
+    // overlap, then re-clamp after the separation pushes.
+    for first in 0..candidates.len() {
+        for second in (first + 1)..candidates.len() {
+            let margin = window_margin(&candidates[first], &candidates[second]);
+            let dx = targets[second].x - targets[first].x;
+            if dx.abs() < margin {
+                let direction = if dx >= 0.0 { 1.0 } else { -1.0 };
+                targets[second].x = targets[first].x + direction * margin;
+            }
+        }
+    }
+    for target in targets.iter_mut() {
+        clamp_to_screen(target);
     }
 }
 
@@ -1197,7 +1259,6 @@ fn build_plan(
                             &snapshot.pet_id,
                             &scene,
                             &role,
-                            index,
                             partner,
                         ),
                     )
@@ -1352,14 +1413,25 @@ async fn move_actors(app: &tauri::AppHandle, plan: &ScenePlan, cancel: &AtomicBo
         }
         let progress = (started.elapsed().as_secs_f64() / duration.as_secs_f64()).min(1.0);
         let eased = progress * progress * (3.0 - 2.0 * progress);
-        for actor in &plan.actors {
-            let x = actor.snapshot.position.x
-                + (actor.target.x - actor.snapshot.position.x) * eased;
-            let y = actor.snapshot.position.y
-                + (actor.target.y - actor.snapshot.position.y) * eased;
+        let mut positions: Vec<PetPosition> = plan
+            .actors
+            .iter()
+            .map(|actor| {
+                let x = actor.snapshot.position.x
+                    + (actor.target.x - actor.snapshot.position.x) * eased;
+                let y = actor.snapshot.position.y
+                    + (actor.target.y - actor.snapshot.position.y) * eased;
+                PetPosition { x, y }
+            })
+            .collect();
+        separate_positions(&mut positions, plan);
+        for (move_index, actor) in plan.actors.iter().enumerate() {
             if let Ok(label) = super::instance_label(&actor.snapshot.instance_id) {
                 if let Some(window) = app.get_webview_window(&label) {
-                    let _ = window.set_position(LogicalPosition::new(x, y));
+                    let _ = window.set_position(LogicalPosition::new(
+                        positions[move_index].x,
+                        positions[move_index].y,
+                    ));
                 }
             }
         }
@@ -1370,12 +1442,188 @@ async fn move_actors(app: &tauri::AppHandle, plan: &ScenePlan, cancel: &AtomicBo
     }
 }
 
-fn update_scene_runtime_positions(app: &tauri::AppHandle, plan: &ScenePlan) {
+/// Minimum horizontal margin so two pet windows never visually overlap.
+/// Window width comes from each snapshot's logical bounds (scale-aware).
+fn window_margin(first: &Snapshot, second: &Snapshot) -> f64 {
+    let first_width = first.bounds.right - first.bounds.left;
+    let second_width = second.bounds.right - second.bounds.left;
+    (first_width + second_width) / 2.0 + 28.0
+}
+
+/// Pushes overlapping windows apart (half the overshoot on each side) so the
+/// pet rects never cross each other while a scene is in motion.
+fn separate_positions(positions: &mut [PetPosition], plan: &ScenePlan) {
+    for first in 0..plan.actors.len() {
+        for second in (first + 1)..plan.actors.len() {
+            let margin = window_margin(&plan.actors[first].snapshot, &plan.actors[second].snapshot);
+            let dx = positions[second].x - positions[first].x;
+            let dy = positions[second].y - positions[first].y;
+            let distance = dx.hypot(dy);
+            if distance >= margin {
+                continue;
+            }
+            let direction = if distance > 0.0001 {
+                (dx / distance, dy / distance)
+            } else {
+                (1.0, 0.0)
+            };
+            let push = (margin - distance) / 2.0;
+            positions[first].x -= direction.0 * push;
+            positions[first].y -= direction.1 * push;
+            positions[second].x += direction.0 * push;
+            positions[second].y += direction.1 * push;
+        }
+    }
+}
+
+const CHASE_RUNNER_SPEED: f64 = 34.0;
+const CHASE_CHASER_MULTIPLIER: f64 = 1.55;
+
+/// Rectangle the chase can roam in, widened to give a real pursuit lane.
+fn chase_bounds(plan: &ScenePlan) -> Rect {
+    let mut rect = Rect::from_points(
+        plan.actors
+            .iter()
+            .map(|actor| (actor.snapshot.position.x, actor.snapshot.position.y)),
+    )
+    .unwrap_or(Rect {
+        left: 0.0,
+        top: 0.0,
+        right: 1_200.0,
+        bottom: 800.0,
+    });
+    rect = rect.padded(220.0);
+    if plan.actors.len() == 2 {
+        let margin = window_margin(&plan.actors[0].snapshot, &plan.actors[1].snapshot);
+        if rect.right - rect.left < margin * 3.0 {
+            let center = (rect.left + rect.right) / 2.0;
+            rect.left = center - margin * 2.2;
+            rect.right = center + margin * 2.2;
+        }
+    }
+    rect
+}
+
+fn chase_phase_actors(plan: &ScenePlan, speaker: usize) -> Vec<ScenePhaseActor> {
+    plan.actors
+        .iter()
+        .enumerate()
+        .map(|(index, actor)| ScenePhaseActor {
+            instance_id: actor.snapshot.instance_id.clone(),
+            pet_id: actor.snapshot.pet_id.clone(),
+            animation: "running".to_string(),
+            look: Some(if index % 2 == 0 { "right" } else { "left" }.to_string()),
+            say: if index == speaker {
+                Some(actor.say.clone())
+            } else {
+                None
+            },
+            effect: Some("dust".to_string()),
+        })
+        .collect()
+}
+
+/// Real pursuit for chase-like scenes: the chaser window genuinely moves
+/// toward the runner every tick, the runner flees around the stage, windows
+/// are kept apart by their own margins, and each pet says its line when it
+/// catches the other. Runs for several seconds so it reads as a chase rather
+/// than a single glide to a static spot.
+async fn run_chase_movement(
+    app: &tauri::AppHandle,
+    plan: &ScenePlan,
+    cancel: &AtomicBool,
+) -> bool {
+    if plan.actors.len() != 2 {
+        return move_actors(app, plan, cancel).await;
+    }
+    let margin = window_margin(&plan.actors[0].snapshot, &plan.actors[1].snapshot);
+    let bounds = chase_bounds(plan);
+    let mut chaser = if plan.actors[0].role == "runner" { 1 } else { 0 };
+    let mut runner = 1 - chaser;
+    let mut positions: Vec<PetPosition> = plan
+        .actors
+        .iter()
+        .map(|actor| actor.snapshot.position.clone())
+        .collect();
+    let started = tokio::time::Instant::now();
+    let minimum_ms = plan.duration_ms.max(5_600);
+    let mut voiced = [false, false];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let elapsed = started.elapsed().as_millis() as u64;
+        if elapsed >= minimum_ms {
+            break;
+        }
+        let dt = SCENE_TICK_MS as f64 / 1000.0;
+        let dx = positions[runner].x - positions[chaser].x;
+        let dy = positions[runner].y - positions[chaser].y;
+        let distance = dx.hypot(dy).max(1.0);
+        positions[chaser].x += dx / distance * CHASE_RUNNER_SPEED * CHASE_CHASER_MULTIPLIER * dt;
+        positions[chaser].y += dy / distance * CHASE_RUNNER_SPEED * CHASE_CHASER_MULTIPLIER * dt;
+        positions[runner].x -= dx / distance * CHASE_RUNNER_SPEED * dt;
+        positions[runner].y -= dy / distance * CHASE_RUNNER_SPEED * dt;
+        for position in positions.iter_mut() {
+            position.x = position.x.clamp(bounds.left, bounds.right);
+            position.y = position.y.clamp(bounds.top, bounds.bottom);
+        }
+        separate_positions(&mut positions, plan);
+        for (chase_index, actor) in plan.actors.iter().enumerate() {
+            if let Ok(label) = super::instance_label(&actor.snapshot.instance_id) {
+                if let Some(window) = app.get_webview_window(&label) {
+                    let _ = window.set_position(LogicalPosition::new(
+                        positions[chase_index].x,
+                        positions[chase_index].y,
+                    ));
+                }
+            }
+        }
+        let caught =
+            (positions[runner].x - positions[chaser].x)
+                .hypot(positions[runner].y - positions[chaser].y)
+                < (margin - 44.0).max(24.0);
+        if caught {
+            if !voiced[chaser] {
+                emit_phase(
+                    app,
+                    &plan.scene_id,
+                    "interaction",
+                    &chase_phase_actors(plan, chaser),
+                );
+                voiced[chaser] = true;
+            }
+            std::mem::swap(&mut chaser, &mut runner);
+            let direction = if positions[runner].x >= positions[chaser].x {
+                1.0
+            } else {
+                -1.0
+            };
+            positions[runner].x = positions[chaser].x + direction * margin;
+            if positions[runner].x > bounds.right {
+                positions[runner].x = bounds.right;
+                positions[chaser].x = bounds.right - direction * margin;
+            }
+            if positions[runner].x < bounds.left {
+                positions[runner].x = bounds.left;
+                positions[chaser].x = bounds.left + direction * margin;
+            }
+            if voiced.iter().all(|value| *value) && elapsed >= (minimum_ms * 3) / 4 {
+                break;
+            }
+        }
+        let _ = sleep_or_cancel(Duration::from_millis(SCENE_TICK_MS), cancel).await;
+    }
+    update_runtime_positions(app, plan, &positions);
+    true
+}
+
+fn update_runtime_positions(app: &tauri::AppHandle, plan: &ScenePlan, positions: &[PetPosition]) {
     let state = app.state::<AppState>();
     let Ok(mut runtime) = state.social.runtime.lock() else {
         return;
     };
-    for actor in &plan.actors {
+    for (index, actor) in plan.actors.iter().enumerate() {
         let entry = runtime
             .entry(actor.snapshot.instance_id.clone())
             .or_insert_with(|| RuntimePetState {
@@ -1383,10 +1631,19 @@ fn update_scene_runtime_positions(app: &tauri::AppHandle, plan: &ScenePlan) {
                 pet_id: actor.snapshot.pet_id.clone(),
                 ..RuntimePetState::default()
             });
-        entry.position = Some(actor.target.clone());
+        entry.position = positions.get(index).cloned().or_else(|| Some(actor.target.clone()));
         entry.dragging = false;
         entry.busy = false;
     }
+}
+
+fn update_scene_runtime_positions(app: &tauri::AppHandle, plan: &ScenePlan) {
+    let positions: Vec<PetPosition> = plan
+        .actors
+        .iter()
+        .map(|actor| actor.target.clone())
+        .collect();
+    update_runtime_positions(app, plan, &positions);
 }
 
 fn create_prop_window(
@@ -1444,9 +1701,19 @@ async fn run_scene(app: tauri::AppHandle, plan: ScenePlan, cancel: Arc<AtomicBoo
         },
     );
     emit_phase(&app, &plan.scene_id, "approach", &phase_actors(&plan, "approach"));
-    let arrived = move_actors(&app, &plan, &cancel).await;
+    let chased = matches!(
+        plan.scene.as_str(),
+        "chase" | "tag" | "chain-chase" | "follow"
+    );
+    let arrived = if chased {
+        run_chase_movement(&app, &plan, &cancel).await
+    } else {
+        move_actors(&app, &plan, &cancel).await
+    };
     if arrived {
-        update_scene_runtime_positions(&app, &plan);
+        if !chased {
+            update_scene_runtime_positions(&app, &plan);
+        }
         let mut prop_label = None;
         if let Some(kind) = plan.prop.as_deref() {
             let center = plan.stage;
@@ -1460,15 +1727,22 @@ async fn run_scene(app: tauri::AppHandle, plan: ScenePlan, cancel: Arc<AtomicBoo
                 },
             );
         }
-        emit_phase(
-            &app,
-            &plan.scene_id,
-            "interaction",
-            &phase_actors(&plan, "interaction"),
-        );
-        let _ = sleep_or_cancel(Duration::from_millis(2_400), &cancel).await;
-        emit_phase(&app, &plan.scene_id, "settle", &phase_actors(&plan, "settle"));
-        let _ = sleep_or_cancel(Duration::from_millis(600), &cancel).await;
+        if chased {
+            // The chase already emitted its interactive lines while moving;
+            // a short settle still leaves a readable beat before the end.
+            emit_phase(&app, &plan.scene_id, "settle", &phase_actors(&plan, "settle"));
+            let _ = sleep_or_cancel(Duration::from_millis(900), &cancel).await;
+        } else {
+            emit_phase(
+                &app,
+                &plan.scene_id,
+                "interaction",
+                &phase_actors(&plan, "interaction"),
+            );
+            let _ = sleep_or_cancel(Duration::from_millis(2_400), &cancel).await;
+            emit_phase(&app, &plan.scene_id, "settle", &phase_actors(&plan, "settle"));
+            let _ = sleep_or_cancel(Duration::from_millis(600), &cancel).await;
+        }
         if let Some(label) = prop_label {
             if let Some(window) = app.get_webview_window(&label) {
                 let _ = window.destroy();
