@@ -25,6 +25,7 @@ const PROXIMITY_COOLDOWN_MS: u64 = 30_000;
 const SOCIAL_DIRECTOR_TIMEOUT_SECS: u64 = 30;
 const SCENE_TICK_MS: u64 = 40;
 const SCENE_BUSY_ERROR: &str = "社交舞台正在使用中，请稍后再试";
+const SOCIAL_COLLISION_GAP: f64 = 12.0;
 static SCENE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static LAST_AI_FALLBACK_LOG_AT: AtomicU64 = AtomicU64::new(0);
 
@@ -114,6 +115,14 @@ impl Rect {
             right: self.right + amount,
             bottom: self.bottom + amount,
         }
+    }
+
+    fn width(self) -> f64 {
+        (self.right - self.left).max(0.0)
+    }
+
+    fn height(self) -> f64 {
+        (self.bottom - self.top).max(0.0)
     }
 
     fn overlaps(self, other: Self) -> bool {
@@ -1159,46 +1168,81 @@ fn default_prop(scene: &str) -> Option<String> {
 }
 
 fn target_positions(scene: &str, candidates: &[Snapshot]) -> Vec<PetPosition> {
-    let center_x =
-        candidates.iter().map(|item| item.position.x).sum::<f64>() / candidates.len() as f64;
-    let center_y =
-        candidates.iter().map(|item| item.position.y).sum::<f64>() / candidates.len() as f64;
+    let center_x = candidates
+        .iter()
+        .map(|item| item.position.x + item.bounds.width() / 2.0)
+        .sum::<f64>()
+        / candidates.len() as f64;
+    let center_y = candidates
+        .iter()
+        .map(|item| item.position.y + item.bounds.height() / 2.0)
+        .sum::<f64>()
+        / candidates.len() as f64;
     if candidates.len() == 2 {
-        let margin = window_margin(&candidates[0], &candidates[1]);
         let direction = if candidates[1].position.x >= candidates[0].position.x {
             1.0
         } else {
             -1.0
         };
+        let first_width = candidates[0].bounds.width();
+        let second_width = candidates[1].bounds.width();
+        let first_height = candidates[0].bounds.height();
+        let second_height = candidates[1].bounds.height();
         return match scene {
             "chase" | "tag" => vec![
                 PetPosition {
-                    x: center_x - (margin / 2.0 + 90.0) * direction,
-                    y: center_y,
+                    x: if direction > 0.0 {
+                        center_x - (first_width + second_width + SOCIAL_COLLISION_GAP + 180.0) / 2.0
+                    } else {
+                        center_x + (first_width + second_width + SOCIAL_COLLISION_GAP + 180.0) / 2.0
+                            - first_width
+                    },
+                    y: center_y - first_height / 2.0,
                 },
                 PetPosition {
-                    x: center_x + (margin / 2.0 + 90.0) * direction,
-                    y: center_y,
+                    x: if direction > 0.0 {
+                        center_x - (first_width + second_width + SOCIAL_COLLISION_GAP + 180.0) / 2.0
+                            + first_width
+                            + SOCIAL_COLLISION_GAP
+                            + 180.0
+                    } else {
+                        center_x - (first_width + second_width + SOCIAL_COLLISION_GAP + 180.0) / 2.0
+                    },
+                    y: center_y - second_height / 2.0,
                 },
             ],
             "stack" => vec![
                 PetPosition {
-                    x: center_x,
-                    y: center_y + 18.0,
+                    x: center_x - first_width / 2.0,
+                    y: center_y - (first_height + second_height + SOCIAL_COLLISION_GAP) / 2.0,
                 },
                 PetPosition {
-                    x: center_x,
-                    y: center_y - 76.0,
+                    x: center_x - second_width / 2.0,
+                    y: center_y - (first_height + second_height + SOCIAL_COLLISION_GAP) / 2.0
+                        + first_height
+                        + SOCIAL_COLLISION_GAP,
                 },
             ],
             _ => vec![
                 PetPosition {
-                    x: center_x - (margin / 2.0 + 12.0) * direction,
-                    y: center_y,
+                    x: if direction > 0.0 {
+                        center_x - (first_width + second_width + SOCIAL_COLLISION_GAP + 24.0) / 2.0
+                    } else {
+                        center_x + (first_width + second_width + SOCIAL_COLLISION_GAP + 24.0) / 2.0
+                            - first_width
+                    },
+                    y: center_y - first_height / 2.0,
                 },
                 PetPosition {
-                    x: center_x + (margin / 2.0 + 12.0) * direction,
-                    y: center_y,
+                    x: if direction > 0.0 {
+                        center_x - (first_width + second_width + SOCIAL_COLLISION_GAP + 24.0) / 2.0
+                            + first_width
+                            + SOCIAL_COLLISION_GAP
+                            + 24.0
+                    } else {
+                        center_x - (first_width + second_width + SOCIAL_COLLISION_GAP + 24.0) / 2.0
+                    },
+                    y: center_y - second_height / 2.0,
                 },
             ],
         };
@@ -1206,16 +1250,19 @@ fn target_positions(scene: &str, candidates: &[Snapshot]) -> Vec<PetPosition> {
     (0..candidates.len())
         .map(|index| {
             let angle = (index as f64 / candidates.len() as f64) * std::f64::consts::TAU;
+            let snapshot = &candidates[index];
             PetPosition {
-                x: center_x + angle.cos() * 110.0,
-                y: center_y + angle.sin() * 46.0,
+                x: center_x + angle.cos() * 190.0 - snapshot.bounds.width() / 2.0,
+                y: center_y + angle.sin() * 110.0 - snapshot.bounds.height() / 2.0,
             }
         })
         .collect()
 }
 
 fn clamp_targets(targets: &mut [PetPosition], candidates: &[Snapshot]) {
-    let clamp_to_screen = |target: &mut PetPosition| {
+    let clamp_to_screen = |target: &mut PetPosition, index: usize| {
+        let width = candidates[index].bounds.width();
+        let height = candidates[index].bounds.height();
         let min_x = candidates
             .iter()
             .map(|item| item.bounds.left)
@@ -1236,26 +1283,17 @@ fn clamp_targets(targets: &mut [PetPosition], candidates: &[Snapshot]) {
             .map(|item| item.bounds.bottom)
             .fold(f64::NEG_INFINITY, f64::max)
             + 120.0;
-        target.x = target.x.clamp(min_x, max_x);
-        target.y = target.y.clamp(min_y, max_y);
+        target.x = target.x.clamp(min_x, (max_x - width).max(min_x));
+        target.y = target.y.clamp(min_y, (max_y - height).max(min_y));
     };
-    for target in targets.iter_mut() {
-        clamp_to_screen(target);
+    for (index, target) in targets.iter_mut().enumerate() {
+        clamp_to_screen(target, index);
     }
-    // Keep every pair of targets far enough apart that their windows never
-    // overlap, then re-clamp after the separation pushes.
-    for first in 0..candidates.len() {
-        for second in (first + 1)..candidates.len() {
-            let margin = window_margin(&candidates[first], &candidates[second]);
-            let dx = targets[second].x - targets[first].x;
-            if dx.abs() < margin {
-                let direction = if dx >= 0.0 { 1.0 } else { -1.0 };
-                targets[second].x = targets[first].x + direction * margin;
-            }
+    for _ in 0..4 {
+        separate_snapshot_positions(targets, candidates);
+        for (index, target) in targets.iter_mut().enumerate() {
+            clamp_to_screen(target, index);
         }
-    }
-    for target in targets.iter_mut() {
-        clamp_to_screen(target);
     }
 }
 
@@ -1477,6 +1515,8 @@ async fn move_actors(app: &tauri::AppHandle, plan: &ScenePlan, cancel: &AtomicBo
             })
             .collect();
         separate_positions(&mut positions, plan);
+        clamp_scene_positions(&mut positions, plan);
+        separate_positions(&mut positions, plan);
         for (move_index, actor) in plan.actors.iter().enumerate() {
             if let Ok(label) = super::instance_label(&actor.snapshot.instance_id) {
                 if let Some(window) = app.get_webview_window(&label) {
@@ -1494,38 +1534,87 @@ async fn move_actors(app: &tauri::AppHandle, plan: &ScenePlan, cancel: &AtomicBo
     }
 }
 
-/// Minimum horizontal margin so two pet windows never visually overlap.
-/// Window width comes from each snapshot's logical bounds (scale-aware).
+/// A conservative separation distance used only for choosing a chase stage.
+/// Actual collision checks below always use both rectangle axes and the
+/// scale-aware window dimensions.
 fn window_margin(first: &Snapshot, second: &Snapshot) -> f64 {
-    let first_width = first.bounds.right - first.bounds.left;
-    let second_width = second.bounds.right - second.bounds.left;
-    (first_width + second_width) / 2.0 + 28.0
+    first.bounds.width() + second.bounds.width() + SOCIAL_COLLISION_GAP
 }
 
-/// Pushes overlapping windows apart (half the overshoot on each side) so the
-/// pet rects never cross each other while a scene is in motion.
-fn separate_positions(positions: &mut [PetPosition], plan: &ScenePlan) {
-    for first in 0..plan.actors.len() {
-        for second in (first + 1)..plan.actors.len() {
-            let margin = window_margin(&plan.actors[first].snapshot, &plan.actors[second].snapshot);
-            let dx = positions[second].x - positions[first].x;
-            let dy = positions[second].y - positions[first].y;
-            let distance = dx.hypot(dy);
-            if distance >= margin {
-                continue;
+fn separate_snapshot_positions(positions: &mut [PetPosition], snapshots: &[Snapshot]) {
+    for _ in 0..8 {
+        let mut changed = false;
+        for first in 0..snapshots.len() {
+            for second in (first + 1)..snapshots.len() {
+                let first_rect = Rect {
+                    left: positions[first].x,
+                    top: positions[first].y,
+                    right: positions[first].x + snapshots[first].bounds.width(),
+                    bottom: positions[first].y + snapshots[first].bounds.height(),
+                };
+                let second_rect = Rect {
+                    left: positions[second].x,
+                    top: positions[second].y,
+                    right: positions[second].x + snapshots[second].bounds.width(),
+                    bottom: positions[second].y + snapshots[second].bounds.height(),
+                };
+                let overlap_x =
+                    (first_rect.right.min(second_rect.right) + SOCIAL_COLLISION_GAP)
+                        - first_rect.left.max(second_rect.left);
+                let overlap_y =
+                    (first_rect.bottom.min(second_rect.bottom) + SOCIAL_COLLISION_GAP)
+                        - first_rect.top.max(second_rect.top);
+                if overlap_x <= 0.0 || overlap_y <= 0.0 {
+                    continue;
+                }
+                changed = true;
+                let first_center_x = (first_rect.left + first_rect.right) / 2.0;
+                let second_center_x = (second_rect.left + second_rect.right) / 2.0;
+                let first_center_y = (first_rect.top + first_rect.bottom) / 2.0;
+                let second_center_y = (second_rect.top + second_rect.bottom) / 2.0;
+                if overlap_x <= overlap_y {
+                    let direction = if second_center_x >= first_center_x { 1.0 } else { -1.0 };
+                    let push = overlap_x / 2.0;
+                    positions[first].x -= direction * push;
+                    positions[second].x += direction * push;
+                } else {
+                    let direction = if second_center_y >= first_center_y { 1.0 } else { -1.0 };
+                    let push = overlap_y / 2.0;
+                    positions[first].y -= direction * push;
+                    positions[second].y += direction * push;
+                }
             }
-            let direction = if distance > 0.0001 {
-                (dx / distance, dy / distance)
-            } else {
-                (1.0, 0.0)
-            };
-            let push = (margin - distance) / 2.0;
-            positions[first].x -= direction.0 * push;
-            positions[first].y -= direction.1 * push;
-            positions[second].x += direction.0 * push;
-            positions[second].y += direction.1 * push;
+        }
+        if !changed {
+            break;
         }
     }
+}
+
+fn clamp_scene_positions(positions: &mut [PetPosition], plan: &ScenePlan) {
+    for (position, actor) in positions.iter_mut().zip(plan.actors.iter()) {
+        let width = actor.snapshot.bounds.width();
+        let height = actor.snapshot.bounds.height();
+        position.x = position
+            .x
+            .clamp(plan.stage.left, (plan.stage.right - width).max(plan.stage.left));
+        position.y = position
+            .y
+            .clamp(plan.stage.top, (plan.stage.bottom - height).max(plan.stage.top));
+    }
+}
+
+/// Push overlapping windows apart along their minimum translation axis. A
+/// distance check is not sufficient here: two tall windows can be close in
+/// Euclidean distance without touching, while two windows with the same
+/// centre can overlap completely.
+fn separate_positions(positions: &mut [PetPosition], plan: &ScenePlan) {
+    let snapshots = plan
+        .actors
+        .iter()
+        .map(|actor| actor.snapshot.clone())
+        .collect::<Vec<_>>();
+    separate_snapshot_positions(positions, &snapshots);
 }
 
 const CHASE_RUNNER_SPEED: f64 = 34.0;
@@ -1588,7 +1677,6 @@ async fn run_chase_movement(
     if plan.actors.len() != 2 {
         return move_actors(app, plan, cancel).await;
     }
-    let margin = window_margin(&plan.actors[0].snapshot, &plan.actors[1].snapshot);
     let bounds = chase_bounds(plan);
     let mut chaser = if plan.actors[0].role == "runner" { 1 } else { 0 };
     let mut runner = 1 - chaser;
@@ -1621,6 +1709,8 @@ async fn run_chase_movement(
             position.y = position.y.clamp(bounds.top, bounds.bottom);
         }
         separate_positions(&mut positions, plan);
+        clamp_scene_positions(&mut positions, plan);
+        separate_positions(&mut positions, plan);
         for (chase_index, actor) in plan.actors.iter().enumerate() {
             if let Ok(label) = super::instance_label(&actor.snapshot.instance_id) {
                 if let Some(window) = app.get_webview_window(&label) {
@@ -1631,10 +1721,19 @@ async fn run_chase_movement(
                 }
             }
         }
-        let caught =
-            (positions[runner].x - positions[chaser].x)
-                .hypot(positions[runner].y - positions[chaser].y)
-                < (margin - 44.0).max(24.0);
+        let chaser_bounds = &plan.actors[chaser].snapshot.bounds;
+        let runner_bounds = &plan.actors[runner].snapshot.bounds;
+        let chaser_center = (
+            positions[chaser].x + chaser_bounds.width() / 2.0,
+            positions[chaser].y + chaser_bounds.height() / 2.0,
+        );
+        let runner_center = (
+            positions[runner].x + runner_bounds.width() / 2.0,
+            positions[runner].y + runner_bounds.height() / 2.0,
+        );
+        let caught = (runner_center.0 - chaser_center.0)
+            .hypot(runner_center.1 - chaser_center.1)
+            < ((chaser_bounds.width() + runner_bounds.width()) / 2.0 + 24.0).max(36.0);
         if caught {
             if !voiced[chaser] {
                 emit_phase(
@@ -1651,15 +1750,21 @@ async fn run_chase_movement(
             } else {
                 -1.0
             };
-            positions[runner].x = positions[chaser].x + direction * margin;
-            if positions[runner].x > bounds.right {
-                positions[runner].x = bounds.right;
-                positions[chaser].x = bounds.right - direction * margin;
+            if direction > 0.0 {
+                positions[runner].x = positions[chaser].x
+                    + plan.actors[chaser].snapshot.bounds.width()
+                    + SOCIAL_COLLISION_GAP;
+            } else {
+                positions[runner].x = positions[chaser].x
+                    - plan.actors[runner].snapshot.bounds.width()
+                    - SOCIAL_COLLISION_GAP;
             }
-            if positions[runner].x < bounds.left {
-                positions[runner].x = bounds.left;
-                positions[chaser].x = bounds.left + direction * margin;
+            for position in positions.iter_mut() {
+                position.x = position.x.clamp(bounds.left, bounds.right);
+                position.y = position.y.clamp(bounds.top, bounds.bottom);
             }
+            separate_positions(&mut positions, plan);
+            clamp_scene_positions(&mut positions, plan);
             if voiced.iter().all(|value| *value) && elapsed >= (minimum_ms * 3) / 4 {
                 break;
             }
@@ -2184,6 +2289,29 @@ pub(crate) fn report_pet_runtime_state(
     if dragging {
         cancel_scenes_for_pet(&app, &pet_id);
     }
+    let safe_position = position.map(|position| PetPosition {
+        x: position.x,
+        y: position.y,
+    });
+    // Boot and scene recovery can expose two persisted windows at the same
+    // coordinates. Repair that state at the shared backend boundary before
+    // publishing it to the social coordinator.
+    let safe_position = if !dragging && !busy {
+        safe_position
+            .as_ref()
+            .and_then(|requested| {
+                super::set_pet_position_safely(
+                    app.clone(),
+                    instance_id.clone(),
+                    requested.x,
+                    requested.y,
+                )
+                .ok()
+            })
+            .or(safe_position)
+    } else {
+        safe_position
+    };
     let state = app.state::<AppState>();
     if let Ok(mut runtime) = state.social.runtime.lock() {
         runtime.insert(
@@ -2191,10 +2319,7 @@ pub(crate) fn report_pet_runtime_state(
             RuntimePetState {
                 instance_id,
                 pet_id: pet_id.clone(),
-                position: position.map(|position| PetPosition {
-                    x: position.x,
-                    y: position.y,
-                }),
+                position: safe_position,
                 dragging,
                 busy,
             },
@@ -2383,5 +2508,70 @@ mod tests {
     fn model_json_is_extracted_from_fenced_output() {
         let value = extract_json("{\"scene\":\"greet\"}").unwrap();
         assert_eq!(value["scene"], "greet");
+    }
+
+    fn test_snapshot(id: &str, x: f64, y: f64, width: f64, height: f64) -> Snapshot {
+        Snapshot {
+            instance_id: id.to_string(),
+            pet_id: id.to_string(),
+            position: PetPosition { x, y },
+            monitor_key: "test".to_string(),
+            bounds: Rect {
+                left: x,
+                top: y,
+                right: x + width,
+                bottom: y + height,
+            },
+        }
+    }
+
+    fn has_collision_gap(first: &Snapshot, first_position: &PetPosition, second: &Snapshot, second_position: &PetPosition) -> bool {
+        let first_right = first_position.x + first.bounds.width();
+        let first_bottom = first_position.y + first.bounds.height();
+        let second_right = second_position.x + second.bounds.width();
+        let second_bottom = second_position.y + second.bounds.height();
+        first_right + SOCIAL_COLLISION_GAP <= second_position.x
+            || second_right + SOCIAL_COLLISION_GAP <= first_position.x
+            || first_bottom + SOCIAL_COLLISION_GAP <= second_position.y
+            || second_bottom + SOCIAL_COLLISION_GAP <= first_position.y
+    }
+
+    #[test]
+    fn rectangle_separation_uses_real_width_and_height() {
+        let snapshots = vec![
+            test_snapshot("small", 0.0, 0.0, 96.0, 104.0),
+            test_snapshot("large", 4.0, 8.0, 192.0, 208.0),
+            test_snapshot("wide", 12.0, 16.0, 260.0, 120.0),
+        ];
+        let mut positions = snapshots
+            .iter()
+            .map(|snapshot| snapshot.position.clone())
+            .collect::<Vec<_>>();
+        separate_snapshot_positions(&mut positions, &snapshots);
+        for first in 0..snapshots.len() {
+            for second in (first + 1)..snapshots.len() {
+                assert!(has_collision_gap(
+                    &snapshots[first],
+                    &positions[first],
+                    &snapshots[second],
+                    &positions[second]
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn stack_targets_are_vertical_without_window_overlap() {
+        let snapshots = vec![
+            test_snapshot("first", 100.0, 100.0, 192.0, 208.0),
+            test_snapshot("second", 100.0, 100.0, 96.0, 104.0),
+        ];
+        let targets = target_positions("stack", &snapshots);
+        assert!(has_collision_gap(
+            &snapshots[0],
+            &targets[0],
+            &snapshots[1],
+            &targets[1]
+        ));
     }
 }

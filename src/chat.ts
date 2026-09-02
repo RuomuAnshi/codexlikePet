@@ -6,7 +6,10 @@ import { extractSayText } from "./pet/streaming";
 import type { AiSettings, ChatMessage } from "./pet/config";
 
 const params = new URLSearchParams(location.search);
-const petId = params.get("petId") ?? "sakimiao";
+// Chat windows are always opened with the target pet id by the backend. Keep
+// a blank value as an invalid-input guard rather than silently routing a
+// malformed window to a bundled pet.
+const petId = params.get("petId") ?? "";
 const messagesEl = document.querySelector<HTMLElement>("#messages")!;
 const input = document.querySelector<HTMLTextAreaElement>("#input")!;
 const composer = document.querySelector<HTMLFormElement>("#composer")!;
@@ -74,6 +77,9 @@ async function setHistoryVisible(visible: boolean): Promise<void> {
 }
 
 async function load(): Promise<void> {
+  if (!petId) {
+    throw new Error("聊天窗口缺少宠物标识");
+  }
   const history = await invoke<{ petId: string; messages: ChatMessage[] }>("get_chat_history", { petId });
   historyMessages = history.messages;
   sessionMessages.length = 0;

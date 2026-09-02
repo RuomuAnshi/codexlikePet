@@ -2524,6 +2524,61 @@ pub(crate) async fn test_ai_provider(
     Ok(result.chars().take(80).collect())
 }
 
+/// Lists model ids from an OpenAI-compatible `/models` endpoint so the AI
+/// settings page can offer the models the provider actually serves.
+#[tauri::command]
+pub(crate) async fn list_models(config: ModelEndpointConfig) -> Result<Vec<String>, String> {
+    if matches!(config.provider, ProviderKind::AnthropicMessages) {
+        return Err("Anthropic Messages 协议没有标准的模型列表接口".to_string());
+    }
+    let base = config.base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("请先填写 Base URL".to_string());
+    }
+    let secret = get_secret(&config.credential_ref)?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut request = client.get(format!("{base}/models"));
+    if let Some(secret) = secret.as_deref() {
+        request = request.header(AUTHORIZATION, format!("Bearer {secret}"));
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("连接模型服务失败: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "模型列表接口返回 HTTP {}: {}",
+            status.as_u16(),
+            body.chars().take(400).collect::<String>()
+        ));
+    }
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("解析模型列表失败: {error}"))?;
+    let mut ids: Vec<String> = value
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        return Err("没有解析到模型列表，接口返回结构可能不同".to_string());
+    }
+    Ok(ids)
+}
+
 fn test_image_data_url() -> Result<String, String> {
     let image = RgbaImage::from_pixel(2, 2, image::Rgba([157, 218, 228, 255]));
     let dynamic = DynamicImage::ImageRgba8(image);
@@ -4108,6 +4163,7 @@ mod tests {
         let anthropic = ModelEndpointConfig {
             provider: ProviderKind::AnthropicMessages,
             model: "claude-test".to_string(),
+            max_output_tokens: 300,
             ..ModelEndpointConfig::default()
         };
         let anthropic_payload = build_payload(&anthropic, "system", &messages, None, false);

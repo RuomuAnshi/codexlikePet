@@ -22,6 +22,8 @@ use tauri::{
     Wry,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+use tauri_plugin_opener::OpenerExt;
 use zip::ZipArchive;
 
 mod ai;
@@ -34,6 +36,9 @@ const LOOK_MARGIN_LOGICAL: f64 = 72.0;
 const LOOK_DEADZONE_LOGICAL: f64 = 60.0;
 const PET_WIDTH: f64 = 192.0;
 const PET_HEIGHT: f64 = 208.0;
+const SPEECH_WINDOW_WIDTH: f64 = 260.0;
+const SPEECH_WINDOW_HEIGHT: f64 = 82.0;
+const SPEECH_WINDOW_GAP: f64 = 10.0;
 const CONTEXT_MENU_ESTIMATED_WIDTH: f64 = 180.0;
 const CONTEXT_MENU_GAP: f64 = 8.0;
 const SPRITESHEET_WIDTH: u32 = 1536;
@@ -818,6 +823,7 @@ struct AppState {
     ai: AiRuntime,
     environment: environment::EnvironmentRuntime,
     social: social::SocialRuntime,
+    speech_ready: Mutex<HashSet<String>>,
     ready: AtomicBool,
 }
 
@@ -828,6 +834,7 @@ impl AppState {
             ai: AiRuntime::default(),
             environment: environment::EnvironmentRuntime::default(),
             social: social::SocialRuntime::default(),
+            speech_ready: Mutex::new(HashSet::new()),
             ready: AtomicBool::new(false),
         }
     }
@@ -1979,6 +1986,234 @@ fn show_social_log(app: &tauri::AppHandle) -> Result<(), String> {
     social::open_social_log(app.clone())
 }
 
+fn speech_window_label(instance_id: &str) -> Result<String, String> {
+    if !is_safe_id(instance_id) {
+        return Err("invalid pet instance id".to_string());
+    }
+    Ok(format!("pet-speech-{instance_id}"))
+}
+
+/// Find a position for the speech window that does not intersect the pet
+/// window. Coordinates are calculated in physical pixels and converted only
+/// at the final API boundary; this avoids making a small pet's bubble inherit
+/// the pet's scale or get clipped by the pet webview.
+fn pet_speech_position(
+    pet_window: &tauri::WebviewWindow,
+) -> Result<LogicalPosition<f64>, String> {
+    let scale_factor = pet_window
+        .scale_factor()
+        .map_err(|error| error.to_string())?
+        .max(1.0);
+    let pet_position = pet_window
+        .outer_position()
+        .map_err(|error| error.to_string())?;
+    let pet_size = pet_window
+        .outer_size()
+        .map_err(|error| error.to_string())?;
+    let pet_x = f64::from(pet_position.x);
+    let pet_y = f64::from(pet_position.y);
+    let pet_width = f64::from(pet_size.width);
+    let pet_height = f64::from(pet_size.height);
+    let bubble_width = SPEECH_WINDOW_WIDTH * scale_factor;
+    let bubble_height = SPEECH_WINDOW_HEIGHT * scale_factor;
+    let gap = SPEECH_WINDOW_GAP * scale_factor;
+
+    let Some(monitor) = pet_window.current_monitor().ok().flatten() else {
+        return Ok(LogicalPosition::new(
+            (pet_x + (pet_width - bubble_width) / 2.0) / scale_factor,
+            (pet_y - bubble_height - gap) / scale_factor,
+        ));
+    };
+    let work_area = monitor.work_area();
+    let work_left = f64::from(work_area.position.x);
+    let work_top = f64::from(work_area.position.y);
+    let work_right = work_left + f64::from(work_area.size.width);
+    let work_bottom = work_top + f64::from(work_area.size.height);
+
+    let (mut x, mut y) = if pet_y - bubble_height - gap >= work_top {
+        // Prefer the familiar speech-bubble position above the character.
+        (
+            pet_x + (pet_width - bubble_width) / 2.0,
+            pet_y - bubble_height - gap,
+        )
+    } else if pet_x - bubble_width - gap >= work_left {
+        // A pet at the top edge still gets a bubble without covering it.
+        (
+            pet_x - bubble_width - gap,
+            pet_y + (pet_height - bubble_height) / 2.0,
+        )
+    } else if pet_x + pet_width + bubble_width + gap <= work_right {
+        (
+            pet_x + pet_width + gap,
+            pet_y + (pet_height - bubble_height) / 2.0,
+        )
+    } else {
+        (
+            pet_x + (pet_width - bubble_width) / 2.0,
+            pet_y + pet_height + gap,
+        )
+    };
+
+    // Keep the whole bubble on the current monitor. The branch choice above
+    // guarantees a gap from the pet unless the work area is smaller than the
+    // bubble itself, in which case clamping is the least surprising result.
+    let max_x = (work_right - bubble_width).max(work_left);
+    let max_y = (work_bottom - bubble_height).max(work_top);
+    x = x.clamp(work_left, max_x);
+    y = y.clamp(work_top, max_y);
+    Ok(LogicalPosition::new(x / scale_factor, y / scale_factor))
+}
+
+fn reposition_pet_speech(
+    app: &tauri::AppHandle,
+    instance_id: &str,
+) -> Result<(), String> {
+    let Some(speech_window) = app.get_webview_window(&speech_window_label(instance_id)?) else {
+        return Ok(());
+    };
+    let Some(pet_window) = app.get_webview_window(&instance_label(instance_id)?) else {
+        return Ok(());
+    };
+    speech_window
+        .set_position(pet_speech_position(&pet_window)?)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PetSpeechPayload {
+    instance_id: String,
+    pet_id: String,
+    text: String,
+    duration: u64,
+}
+
+#[tauri::command]
+fn pet_speech_ready(app: tauri::AppHandle, instance_id: String) -> Result<(), String> {
+    let label = speech_window_label(&instance_id)?;
+    if app.get_webview_window(&label).is_none() {
+        return Err("speech window is not available".to_string());
+    }
+    app.state::<AppState>()
+        .speech_ready
+        .lock()
+        .map_err(|_| "speech state lock is poisoned".to_string())?
+        .insert(instance_id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn show_pet_speech(
+    app: tauri::AppHandle,
+    instance_id: String,
+    pet_id: String,
+    text: String,
+    duration: u64,
+) -> Result<(), String> {
+    let instance_label = instance_label(&instance_id)?;
+    let speech_label = speech_window_label(&instance_id)?;
+    if !is_safe_id(&pet_id) || !pet_exists(&app, &pet_id) {
+        return Err("宠物资源不存在或校验失败".to_string());
+    }
+    let config = config_snapshot(&app)?;
+    if !config.instances.iter().any(|instance| {
+        instance.id == instance_id && instance.pet_id == pet_id && instance.visible
+    }) {
+        return Err("宠物实例不可见或不存在".to_string());
+    }
+    let Some(pet_window) = app.get_webview_window(&instance_label) else {
+        return Err("pet window is not available".to_string());
+    };
+    let text: String = text.trim().chars().take(100).collect();
+    if text.is_empty() {
+        return Ok(());
+    }
+    let position = pet_speech_position(&pet_window)?;
+    let speech_window = if let Some(window) = app.get_webview_window(&speech_label) {
+        window
+    } else {
+        if let Ok(mut ready) = app.state::<AppState>().speech_ready.lock() {
+            ready.remove(&instance_id);
+        }
+        WebviewWindowBuilder::new(
+            &app,
+            &speech_label,
+            WebviewUrl::App(
+                format!("speech.html?instance={instance_id}&petId={pet_id}").into(),
+            ),
+        )
+        .title("")
+        .inner_size(SPEECH_WINDOW_WIDTH, SPEECH_WINDOW_HEIGHT)
+        .position(position.x, position.y)
+        .transparent(true)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .shadow(false)
+        .resizable(false)
+        .focused(false)
+        .visible(false)
+        .additional_browser_args(BROWSER_ARGS)
+        .build()
+        .map_err(|error| format!("failed to create speech window: {error}"))?
+    };
+    speech_window
+        .set_position(position)
+        .map_err(|error| error.to_string())?;
+    speech_window
+        .set_size(LogicalSize::new(SPEECH_WINDOW_WIDTH, SPEECH_WINDOW_HEIGHT))
+        .map_err(|error| error.to_string())?;
+    apply_fullscreen_visibility(
+        &speech_window,
+        settings_for_pet(&config, &pet_id).show_in_fullscreen,
+    )?;
+    speech_window
+        .show()
+        .map_err(|error| format!("failed to show speech window: {error}"))?;
+
+    let payload = PetSpeechPayload {
+        instance_id: instance_id.clone(),
+        pet_id,
+        text,
+        duration: duration.clamp(900, 12_000),
+    };
+    // A newly created WebView may not have registered its listener when the
+    // Rust command returns. Wait for the page's explicit ready signal instead
+    // of dropping the first line or replaying it on a timer.
+    let app_for_event = app.clone();
+    tauri::async_runtime::spawn(async move {
+        for _ in 0..40 {
+            let ready = app_for_event
+                .state::<AppState>()
+                .speech_ready
+                .lock()
+                .map(|ready| ready.contains(&instance_id))
+                .unwrap_or(false);
+            if ready {
+                if let Some(window) = app_for_event.get_webview_window(&speech_label) {
+                    let _ = window.emit("speech://show", &payload);
+                }
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        eprintln!("speech window did not become ready in time");
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn hide_pet_speech(app: tauri::AppHandle, instance_id: String) -> Result<(), String> {
+    let label = speech_window_label(&instance_id)?;
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.emit("speech://hide", ());
+        window
+            .hide()
+            .map_err(|error| format!("failed to hide speech window: {error}"))?;
+    }
+    Ok(())
+}
+
 fn chat_window_label(pet_id: &str) -> Result<String, String> {
     if !is_safe_id(pet_id) {
         return Err("invalid pet id".to_string());
@@ -2180,6 +2415,7 @@ fn get_visible_pets(app: tauri::AppHandle) -> Result<Vec<PetInstanceInfo>, Strin
 struct PetOccupancy {
     instance_id: String,
     pet_id: String,
+    monitor_key: String,
     x: f64,
     y: f64,
     width: f64,
@@ -2198,10 +2434,23 @@ fn get_pet_occupancies(
         return Ok(Vec::new());
     }
     let config = config_snapshot(&app)?;
+    let source_label = instance_label(&instance_id)?;
+    let Some(source_window) = app.get_webview_window(&source_label) else {
+        return Ok(Vec::new());
+    };
+    let source_monitor_key = source_window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| format!("{}:{}", monitor.position().x, monitor.position().y));
     let mut result = Vec::new();
     for instance in config.instances.iter().filter(|instance| {
         instance.id != instance_id
             && instance.visible
+            && {
+                let settings = settings_for_pet(&config, &instance.pet_id);
+                settings.social_enabled && !settings.paused && !settings.quiet_mode
+            }
             && !config
                 .disabled_pet_ids
                 .iter()
@@ -2219,11 +2468,23 @@ fn get_pet_occupancies(
         else {
             continue;
         };
+        let Some(monitor_key) = window
+            .current_monitor()
+            .ok()
+            .flatten()
+            .map(|monitor| format!("{}:{}", monitor.position().x, monitor.position().y))
+        else {
+            continue;
+        };
+        if source_monitor_key.as_deref() != Some(monitor_key.as_str()) {
+            continue;
+        }
         let logical_position = position.to_logical(scale_factor);
         let logical_size = size.to_logical(scale_factor);
         result.push(PetOccupancy {
             instance_id: instance.id.clone(),
             pet_id: instance.pet_id.clone(),
+            monitor_key,
             x: logical_position.x,
             y: logical_position.y,
             width: logical_size.width,
@@ -2231,6 +2492,137 @@ fn get_pet_occupancies(
         });
     }
     Ok(result)
+}
+
+const PET_COLLISION_GAP: f64 = 12.0;
+
+fn pet_rect_overlaps(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    other: &PetOccupancy,
+) -> bool {
+    x < other.x + other.width + PET_COLLISION_GAP
+        && x + width + PET_COLLISION_GAP > other.x
+        && y < other.y + other.height + PET_COLLISION_GAP
+        && y + height + PET_COLLISION_GAP > other.y
+}
+
+fn pet_position_is_clear(
+    position: &PetPosition,
+    width: f64,
+    height: f64,
+    occupancies: &[PetOccupancy],
+) -> bool {
+    occupancies
+        .iter()
+        .all(|other| !pet_rect_overlaps(position.x, position.y, width, height, other))
+}
+
+/// Move a dragged pet to the closest non-overlapping position. The frontend
+/// still owns pointer tracking, but final placement is arbitrated in Rust so
+/// transparent pet windows cannot be dragged through one another by accident.
+#[tauri::command]
+fn set_pet_position_safely(
+    app: tauri::AppHandle,
+    instance_id: String,
+    x: f64,
+    y: f64,
+) -> Result<PetPosition, String> {
+    if !is_safe_id(&instance_id) {
+        return Err("invalid pet instance id".to_string());
+    }
+    let label = instance_label(&instance_id)?;
+    let window = app
+        .get_webview_window(&label)
+        .ok_or_else(|| "pet window is not available".to_string())?;
+    let scale_factor = window
+        .scale_factor()
+        .map_err(|error| error.to_string())?
+        .max(1.0);
+    let size = window
+        .outer_size()
+        .map_err(|error| error.to_string())?
+        .to_logical(scale_factor);
+    let current_position = window
+        .outer_position()
+        .map_err(|error| error.to_string())?
+        .to_logical(scale_factor);
+    let occupancies = get_pet_occupancies(app.clone(), instance_id.clone())?;
+    let requested = PetPosition { x, y };
+    let mut candidates = vec![requested.clone()];
+    for other in &occupancies {
+        candidates.extend([
+            PetPosition {
+                x: other.x - size.width - PET_COLLISION_GAP,
+                y,
+            },
+            PetPosition {
+                x: other.x + other.width + PET_COLLISION_GAP,
+                y,
+            },
+            PetPosition {
+                x,
+                y: other.y - size.height - PET_COLLISION_GAP,
+            },
+            PetPosition {
+                x,
+                y: other.y + other.height + PET_COLLISION_GAP,
+            },
+            PetPosition {
+                x: other.x - size.width - PET_COLLISION_GAP,
+                y: other.y - size.height - PET_COLLISION_GAP,
+            },
+            PetPosition {
+                x: other.x + other.width + PET_COLLISION_GAP,
+                y: other.y - size.height - PET_COLLISION_GAP,
+            },
+            PetPosition {
+                x: other.x - size.width - PET_COLLISION_GAP,
+                y: other.y + other.height + PET_COLLISION_GAP,
+            },
+            PetPosition {
+                x: other.x + other.width + PET_COLLISION_GAP,
+                y: other.y + other.height + PET_COLLISION_GAP,
+            },
+        ]);
+    }
+    // If several pets form a small cluster, a side candidate for one window
+    // can still be blocked by the next window. Search a few concentric rings
+    // so the drag/step remains safe without ever teleporting across a screen.
+    for radius in [32.0, 64.0, 96.0, 128.0, 192.0, 256.0, 384.0, 512.0] {
+        for index in 0..16 {
+            let angle = f64::from(index) * std::f64::consts::TAU / 16.0;
+            candidates.push(PetPosition {
+                x: requested.x + angle.cos() * radius,
+                y: requested.y + angle.sin() * radius,
+            });
+        }
+    }
+    candidates.sort_by(|left, right| {
+        let left_distance = (left.x - requested.x).hypot(left.y - requested.y);
+        let right_distance = (right.x - requested.x).hypot(right.y - requested.y);
+        left_distance
+            .partial_cmp(&right_distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let safe = candidates
+        .into_iter()
+        .find(|candidate| pet_position_is_clear(candidate, size.width, size.height, &occupancies))
+        .or_else(|| {
+            let current = PetPosition {
+                x: current_position.x,
+                y: current_position.y,
+            };
+            pet_position_is_clear(&current, size.width, size.height, &occupancies).then_some(current)
+        })
+        .unwrap_or(requested);
+    window
+        .set_position(LogicalPosition::new(safe.x, safe.y))
+        .map_err(|error| error.to_string())?;
+    let _ = reposition_pet_speech(&app, &instance_id);
+    Ok(safe)
 }
 
 #[tauri::command]
@@ -2300,6 +2692,7 @@ fn set_instance_visible_internal(
         .ok_or_else(|| "pet instance is not configured".to_string())?;
     if !visible {
         social::cancel_scenes_for_pet(app, &instance.pet_id);
+        let _ = hide_pet_speech(app.clone(), instance_id.to_string());
     }
     let window = app
         .get_webview_window(&instance_label(instance_id)?)
@@ -2408,6 +2801,11 @@ fn remove_pet_instance(
     if let Some(window) = app.get_webview_window(&instance_label(&instance_id)?) {
         window.close().map_err(|error| error.to_string())?;
     }
+    if let Some(window) = app.get_webview_window(&speech_window_label(&instance_id)?) {
+        window
+            .destroy()
+            .map_err(|error| format!("failed to close speech window: {error}"))?;
+    }
     if let Some(pet_id) = removed_pet_id {
         social::cancel_scenes_for_pet(&app, &pet_id);
         let pet_still_has_instance = config
@@ -2456,16 +2854,23 @@ fn broadcast_settings(
 ) -> Result<(), String> {
     let config = config_snapshot(app)?;
     for (label, window) in app.webview_windows() {
-        let Some(instance_id) = instance_id_from_label(&label) else {
-            continue;
-        };
-        if is_pet_window_label(&label)
-            && config
-                .instances
-                .iter()
-                .any(|instance| instance.id == instance_id && instance.pet_id == pet_id)
-        {
-            apply_window_settings(&window, settings)?;
+        if let Some(instance_id) = instance_id_from_label(&label) {
+            if is_pet_window_label(&label)
+                && config
+                    .instances
+                    .iter()
+                    .any(|instance| instance.id == instance_id && instance.pet_id == pet_id)
+            {
+                apply_window_settings(&window, settings)?;
+            }
+        }
+        if let Some(speech_instance_id) = label.strip_prefix("pet-speech-") {
+            if config.instances.iter().any(|instance| {
+                instance.id == speech_instance_id && instance.pet_id == pet_id
+            }) {
+                let _ = reposition_pet_speech(app, speech_instance_id);
+                apply_fullscreen_visibility(&window, settings.show_in_fullscreen)?;
+            }
         }
     }
     app.emit(
@@ -2802,6 +3207,11 @@ fn remove_imported_pet(app: tauri::AppHandle, pet_id: String) -> Result<Vec<Inst
             window
                 .close()
                 .map_err(|error| format!("宠物资源已删除，但关闭显示窗口失败: {error}"))?;
+        }
+        if let Some(window) = app.get_webview_window(&speech_window_label(&instance_id)?) {
+            window
+                .destroy()
+                .map_err(|error| format!("宠物资源已删除，但关闭气泡窗口失败: {error}"))?;
         }
     }
     if let Some(window) = app.get_webview_window(&chat_window_label(&pet_id)?) {
@@ -3376,6 +3786,74 @@ fn restore_windows(app: &tauri::AppHandle, config: &AppConfig) -> Result<(), Str
     Ok(())
 }
 
+const UPDATE_API_URL: &str = "https://api.github.com/repos/RuomuAnshi/codexlikePet/releases/latest";
+const UPDATE_RELEASE_URL: &str = "https://github.com/RuomuAnshi/codexlikePet/releases/latest";
+
+fn version_parts(version: &str) -> Vec<u32> {
+    version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .filter_map(|part| part.parse::<u32>().ok())
+        .collect()
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCheck {
+    current: String,
+    latest: String,
+    url: String,
+    update_available: bool,
+}
+
+/// Queries the GitHub latest release and reports whether the installed build
+/// is behind it. Checking is advisory only; installing still goes through the
+/// release page so nothing is applied without a signed build.
+#[tauri::command]
+async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateCheck, String> {
+    let current = app.package_info().version.to_string();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|error| format!("无法创建更新检查连接: {error}"))?;
+    let response = client
+        .get(UPDATE_API_URL)
+        .header("User-Agent", "sakipet-updater")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|error| format!("检查更新失败（网络错误）: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("检查更新失败（GitHub 返回 HTTP {}）", status.as_u16()));
+    }
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("解析更新信息失败: {error}"))?;
+    let tag = value
+        .get("tag_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim_start_matches('v')
+        .to_string();
+    let url = value
+        .get("html_url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(UPDATE_RELEASE_URL)
+        .to_string();
+    let update_available = !tag.is_empty()
+        && version_parts(&tag).cmp(&version_parts(&current)) == std::cmp::Ordering::Greater;
+    Ok(UpdateCheck {
+        current,
+        latest: tag,
+        url,
+        update_available,
+    })
+}
+
 #[tauri::command]
 fn look_direction(app: tauri::AppHandle, window_label: String) -> Option<u8> {
     let cursor = app.cursor_position().ok()?;
@@ -3424,6 +3902,8 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         // Register state before the runtime creates configured WebViews. A
         // page can execute JavaScript before the setup hook is entered.
         .manage(AppState::new())
@@ -3441,6 +3921,12 @@ pub fn run() {
                         || label == "social-log"
                         || label == "social-settings"
                         || label.starts_with("pet-chat-") =>
+                {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+                WindowEvent::CloseRequested { api, .. }
+                    if label.starts_with("pet-speech-") =>
                 {
                     api.prevent_close();
                     let _ = window.hide();
@@ -3511,9 +3997,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             is_app_ready,
             look_direction,
+            check_for_updates,
             open_pet_manager,
             open_ai_settings,
             open_environment_settings,
+            pet_speech_ready,
+            show_pet_speech,
+            hide_pet_speech,
             social::open_social_log,
             social::open_social_settings,
             get_environment_settings,
@@ -3528,6 +4018,7 @@ pub fn run() {
             get_pet_instances,
             get_visible_pets,
             get_pet_occupancies,
+            set_pet_position_safely,
             get_runtime_config,
             set_pet_instance_visible,
             add_pet_instance,
@@ -3543,6 +4034,7 @@ pub fn run() {
             ai::set_ai_secret,
             ai::delete_ai_secret,
             ai::test_ai_provider,
+            ai::list_models,
             ai::capture_desktop,
             ai::get_pet_state,
             ai::record_pet_interaction,

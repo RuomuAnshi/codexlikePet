@@ -14,6 +14,7 @@ export default defineConfig(async () => ({
     rollupOptions: {
       input: {
         main: "index.html",
+        speech: "speech.html",
         manager: "manager.html",
         "ai-settings": "ai-settings.html",
         chat: "chat.html",

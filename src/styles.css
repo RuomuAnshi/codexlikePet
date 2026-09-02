@@ -98,54 +98,7 @@ body {
   to { opacity: 0; transform: translateY(-38px) scale(1.15); }
 }
 
-.speech {
-  position: absolute;
-  top: 4px;
-  left: 5px;
-  right: 5px;
-  z-index: 2;
-  padding: 7px 9px;
-  border: 2px solid #ff67ad;
-  border-radius: 10px;
-  background: rgba(255, 247, 252, 0.97);
-  box-shadow: 2px 2px 0 rgba(181, 19, 98, 0.8);
-  color: #351126;
-  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1.35;
-  opacity: 0;
-  cursor: pointer;
-  pointer-events: auto;
-  text-align: center;
-  transform: translateY(-4px) scale(0.98);
-  transition: opacity 180ms ease, transform 180ms ease;
-}
-
-.speech::after {
-  position: absolute;
-  right: 32px;
-  bottom: -8px;
-  width: 12px;
-  height: 12px;
-  border-right: 2px solid #ff67ad;
-  border-bottom: 2px solid #ff67ad;
-  background: rgba(255, 247, 252, 0.97);
-  content: "";
-  transform: rotate(45deg);
-}
-
-.speech-visible {
-  opacity: 1;
-  transform: translateY(0) scale(1);
-}
-
-.speech[hidden] {
-  display: none;
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .speech,
   .emotion-icon {
     transition: none;
   }

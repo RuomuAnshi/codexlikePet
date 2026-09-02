@@ -66,8 +66,6 @@ async function boot(): Promise<void> {
   let settings: PetSettings = runtime.settings;
   const stage = document.querySelector<HTMLCanvasElement>("#stage")!;
   const petEl = document.querySelector<HTMLElement>("#pet")!;
-  const speech = document.querySelector<HTMLElement>("#speech")!;
-  const speechText = document.querySelector<HTMLElement>("#speech-text")!;
   const effects = document.querySelector<HTMLElement>("#effects")!;
   const emotion = document.querySelector<HTMLElement>("#emotion")!;
   const setStageSize = (scale: number): void => {
@@ -106,7 +104,6 @@ async function boot(): Promise<void> {
     reunion: 0,
     milestone: 0,
   };
-  let speechTimer: number | undefined;
   let idleSpeechTimer: number | undefined;
   let clickTimer: number | undefined;
   let dragDialogueShown = false;
@@ -127,16 +124,16 @@ async function boot(): Promise<void> {
   const showSpeech = (text: string, duration: number): void => {
     const preview = speechPreview(text);
     if (!preview) return;
-    speechText.textContent = preview;
-    speech.hidden = false;
-    speech.classList.add("speech-visible");
-    if (speechTimer !== undefined) globalThis.clearTimeout(speechTimer);
-    speechTimer = globalThis.setTimeout(() => {
-      speech.classList.remove("speech-visible");
-      speechTimer = globalThis.setTimeout(() => {
-        speech.hidden = true;
-      }, 180);
-    }, duration);
+    // Speech uses a separate transparent window. The pet canvas can therefore
+    // remain exactly its configured size, even when the pet is scaled down.
+    void invoke("show_pet_speech", {
+      instanceId: runtime.instanceId,
+      petId: runtime.petId,
+      text: preview,
+      duration: Math.max(900, Math.min(12_000, Math.round(duration))),
+    }).catch((error) => {
+      console.warn("failed to show pet speech:", error);
+    });
   };
 
   const recordPetInteraction = (kind: string): void => {
@@ -193,7 +190,7 @@ async function boot(): Promise<void> {
     }, IDLE_SPEECH_DELAY_MS);
   };
 
-  const walker = new PetWalker((isWalking, direction) => {
+  const walker = new PetWalker(runtime.instanceId, (isWalking, direction) => {
     if (isWalking && dragging) return;
     const startedWalking = isWalking && !walking;
     walking = isWalking;
@@ -209,6 +206,10 @@ async function boot(): Promise<void> {
     if (!isWalking) {
       settlePetActivity();
       void savePosition();
+      // Social snapshots may temporarily use the runtime position for
+      // proximity decisions. Refresh it after autonomous movement so the
+      // coordinator does not plan from the walk's old starting point.
+      void reportRuntimeState(false);
     }
   });
 
@@ -246,7 +247,7 @@ async function boot(): Promise<void> {
     }
   };
 
-  const reportRuntimeState = async (isDragging: boolean): Promise<void> => {
+  async function reportRuntimeState(isDragging: boolean): Promise<void> {
     try {
       const [position, scaleFactor] = await Promise.all([window.outerPosition(), window.scaleFactor()]);
       const logical = position.toLogical(scaleFactor);
@@ -260,7 +261,7 @@ async function boot(): Promise<void> {
     } catch (error) {
       console.warn("failed to report social runtime state:", error);
     }
-  };
+  }
 
   const applySettings = (next: PetSettings): void => {
     settings = next;
@@ -285,18 +286,6 @@ async function boot(): Promise<void> {
     }
   };
 
-  const openPetChat = async (): Promise<void> => {
-    try {
-      if (socialSceneId) {
-        await invoke("cancel_social_scene", { sceneId: socialSceneId });
-      }
-      await invoke("open_pet_chat", { petId: runtime.petId });
-    } catch (error) {
-      console.error("failed to open pet chat:", error);
-      sayLine("doubleClick");
-    }
-  };
-
   const togglePetChat = async (): Promise<void> => {
     try {
       if (socialSceneId) {
@@ -309,8 +298,6 @@ async function boot(): Promise<void> {
       sayLine("doubleClick");
     }
   };
-
-  speech.addEventListener("click", () => void openPetChat());
 
   const playAction = (action: PetAction): void => {
     stopFrameClip();
@@ -412,8 +399,12 @@ async function boot(): Promise<void> {
 
   attachDrag(
     petEl,
+    runtime.instanceId,
     (enabled, direction: DragDirection | null, carried) => {
       dragging = enabled;
+      if (enabled) {
+        void invoke("hide_pet_speech", { instanceId: runtime.instanceId }).catch(() => undefined);
+      }
       if (enabled) walker.stop();
       if (enabled && stateMachine.hasAction()) {
         stateMachine.finishAction();

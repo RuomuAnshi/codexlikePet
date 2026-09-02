@@ -37,13 +37,15 @@
             <p class="field-helper">用于宠物对话、heartbeat 台词、摘要和记忆提取。</p>
             <div class="ai-form-grid">
               <label><span>接口适配器</span><select id="chat-provider" data-provider-select></select></label>
-              <label><span>模型名称</span><input id="chat-model" autocomplete="off" placeholder="例如 gpt-4.1-mini、claude-3-5-sonnet" /></label>
+              <label><span>模型名称</span><input id="chat-model" autocomplete="off" list="chat-model-suggestions" placeholder="例如 gpt-4.1-mini、claude-3-5-sonnet" /></label>
               <label class="wide-field"><span>Base URL</span><input id="chat-base-url" autocomplete="url" placeholder="例如 https://api.openai.com/v1" /></label>
               <label class="credential-field wide-field"><span>API Key</span><div><input id="chat-key" type="password" autocomplete="new-password" placeholder="留空保持已保存的 Key" /><button id="clear-chat-key" class="small-button" type="button">删除已保存 Key</button></div></label>
             </div>
             <div class="ai-actions">
               <button id="test-chat-provider" class="secondary-button" type="button">测试聊天模型</button>
+              <button id="list-chat-models" class="secondary-button" type="button">拉取模型列表</button>
             </div>
+            <datalist id="chat-model-suggestions"></datalist>
           </fieldset>
 
           <fieldset class="model-card vision-card">

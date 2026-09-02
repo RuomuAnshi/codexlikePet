@@ -1,4 +1,5 @@
 import { LogicalPosition } from "@tauri-apps/api/dpi";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 /** Shared pointer state used by hover/look logic and the gesture arbiter. */
@@ -20,6 +21,7 @@ type DragChange = (dragging: boolean, direction: DragDirection | null, carried: 
 /** Starts a window drag only after the pointer has moved more than 8px. */
 export function attachDrag(
   element: HTMLElement,
+  instanceId: string,
   onDragChange?: DragChange,
   canDrag: () => boolean = () => true,
 ): void {
@@ -44,9 +46,22 @@ export function attachDrag(
         const next = pendingPosition;
         pendingPosition = null;
         try {
-          await win.setPosition(new LogicalPosition(next.x, next.y));
+          await invoke<{ x: number; y: number }>("set_pet_position_safely", {
+            // Window labels are not instance ids for secondary pets
+            // (`pet-instance-…`). Pass the runtime id explicitly so the
+            // backend can arbitrate every pet against the right siblings.
+            instanceId,
+            x: next.x,
+            y: next.y,
+          });
         } catch {
-          // The window may disappear while the pointer is still captured.
+          // Fall back to direct movement if the backend is shutting down or
+          // this is an older dev binary without the collision command.
+          try {
+            await win.setPosition(new LogicalPosition(next.x, next.y));
+          } catch {
+            // The window may disappear while the pointer is still captured.
+          }
         }
       }
     } finally {

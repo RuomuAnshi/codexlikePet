@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the pet and pet manager windows",
-  "windows": ["main", "pet-manager", "ai-settings", "environment-settings", "social-log", "social-settings", "pet-*", "pet-chat-*", "social-prop-*"],
+  "windows": ["main", "pet-manager", "ai-settings", "environment-settings", "social-log", "social-settings", "pet-*", "pet-chat-*", "pet-speech-*", "social-prop-*"],
   "permissions": [
     "core:default",
     "core:window:allow-set-position",
