@@ -36,7 +36,8 @@ const LOOK_MARGIN_LOGICAL: f64 = 72.0;
 const LOOK_DEADZONE_LOGICAL: f64 = 60.0;
 const PET_WIDTH: f64 = 192.0;
 const PET_HEIGHT: f64 = 208.0;
-const SPEECH_WINDOW_WIDTH: f64 = 260.0;
+const SPEECH_WINDOW_MIN_WIDTH: f64 = 150.0;
+const SPEECH_WINDOW_MAX_WIDTH: f64 = 260.0;
 const SPEECH_WINDOW_HEIGHT: f64 = 82.0;
 const SPEECH_WINDOW_GAP: f64 = 10.0;
 const CONTEXT_MENU_ESTIMATED_WIDTH: f64 = 180.0;
@@ -824,6 +825,7 @@ struct AppState {
     environment: environment::EnvironmentRuntime,
     social: social::SocialRuntime,
     speech_ready: Mutex<HashSet<String>>,
+    speech_layout: Mutex<()>,
     ready: AtomicBool,
 }
 
@@ -835,6 +837,7 @@ impl AppState {
             environment: environment::EnvironmentRuntime::default(),
             social: social::SocialRuntime::default(),
             speech_ready: Mutex::new(HashSet::new()),
+            speech_layout: Mutex::new(()),
             ready: AtomicBool::new(false),
         }
     }
@@ -1993,12 +1996,45 @@ fn speech_window_label(instance_id: &str) -> Result<String, String> {
     Ok(format!("pet-speech-{instance_id}"))
 }
 
-/// Find a position for the speech window that does not intersect the pet
-/// window. Coordinates are calculated in physical pixels and converted only
-/// at the final API boundary; this avoids making a small pet's bubble inherit
-/// the pet's scale or get clipped by the pet webview.
+/// Keep short lines compact while retaining enough width for longer replies.
+/// The old fixed 260px window made even a one-line response cover nearby
+/// pets' bubbles.
+fn speech_window_size(text: &str) -> (f64, f64) {
+    let visual_units = text
+        .chars()
+        .map(|character| if character.is_ascii() { 0.58 } else { 1.0 })
+        .sum::<f64>();
+    let width = (visual_units * 13.0 + 38.0).clamp(
+        SPEECH_WINDOW_MIN_WIDTH,
+        SPEECH_WINDOW_MAX_WIDTH,
+    );
+    let units_per_line = ((width - 30.0) / 13.0).max(1.0);
+    let lines = (visual_units / units_per_line).ceil().clamp(1.0, 7.0);
+    let height = (30.0 + lines * 18.0).clamp(SPEECH_WINDOW_HEIGHT, 170.0);
+    (width, height)
+}
+
+fn speech_rect_overlaps(
+    first: (f64, f64, f64, f64),
+    second: (f64, f64, f64, f64),
+    gap: f64,
+) -> bool {
+    first.0 < second.2 + gap
+        && first.2 + gap > second.0
+        && first.1 < second.3 + gap
+        && first.3 + gap > second.1
+}
+
+/// Find a position for the speech window that does not intersect the pet or
+/// another visible speech window on the same monitor. Coordinates are
+/// calculated in physical pixels and converted only at the final API
+/// boundary; this keeps DPI scaling from making a small pet's bubble drift.
 fn pet_speech_position(
+    app: &tauri::AppHandle,
+    instance_id: &str,
     pet_window: &tauri::WebviewWindow,
+    requested_size: Option<(f64, f64)>,
+    blocked_speech_rects: Option<&[(f64, f64, f64, f64)]>,
 ) -> Result<LogicalPosition<f64>, String> {
     let scale_factor = pet_window
         .scale_factor()
@@ -2014,8 +2050,17 @@ fn pet_speech_position(
     let pet_y = f64::from(pet_position.y);
     let pet_width = f64::from(pet_size.width);
     let pet_height = f64::from(pet_size.height);
-    let bubble_width = SPEECH_WINDOW_WIDTH * scale_factor;
-    let bubble_height = SPEECH_WINDOW_HEIGHT * scale_factor;
+    let existing_size = app
+        .get_webview_window(&speech_window_label(instance_id)?)
+        .and_then(|window| window.outer_size().ok())
+        .map(|size| (f64::from(size.width), f64::from(size.height)));
+    let (bubble_width, bubble_height) = requested_size
+        .map(|(width, height)| (width * scale_factor, height * scale_factor))
+        .or(existing_size)
+        .unwrap_or((
+            SPEECH_WINDOW_MAX_WIDTH * scale_factor,
+            SPEECH_WINDOW_HEIGHT * scale_factor,
+        ));
     let gap = SPEECH_WINDOW_GAP * scale_factor;
 
     let Some(monitor) = pet_window.current_monitor().ok().flatten() else {
@@ -2029,8 +2074,52 @@ fn pet_speech_position(
     let work_top = f64::from(work_area.position.y);
     let work_right = work_left + f64::from(work_area.size.width);
     let work_bottom = work_top + f64::from(work_area.size.height);
+    let monitor_key = format!("{}:{}", monitor.position().x, monitor.position().y);
+    let speech_label = speech_window_label(instance_id)?;
+    let occupied_speech_rects = blocked_speech_rects
+        .map(|rects| rects.to_vec())
+        .unwrap_or_else(|| {
+            app.webview_windows()
+                .into_iter()
+                .filter_map(|(label, window)| {
+                    if label == speech_label
+                        || !label.starts_with("pet-speech-")
+                        || !window.is_visible().unwrap_or(false)
+                    {
+                        return None;
+                    }
+                    let other_monitor_key = window
+                        .current_monitor()
+                        .ok()
+                        .flatten()
+                        .map(|other_monitor| {
+                            format!(
+                                "{}:{}",
+                                other_monitor.position().x,
+                                other_monitor.position().y
+                            )
+                        });
+                    if other_monitor_key.as_deref() != Some(monitor_key.as_str()) {
+                        return None;
+                    }
+                    let (Ok(position), Ok(size)) =
+                        (window.outer_position(), window.outer_size())
+                    else {
+                        return None;
+                    };
+                    let left = f64::from(position.x);
+                    let top = f64::from(position.y);
+                    Some((
+                        left,
+                        top,
+                        left + f64::from(size.width),
+                        top + f64::from(size.height),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        });
 
-    let (mut x, mut y) = if pet_y - bubble_height - gap >= work_top {
+    let preferred = if pet_y - bubble_height - gap >= work_top {
         // Prefer the familiar speech-bubble position above the character.
         (
             pet_x + (pet_width - bubble_width) / 2.0,
@@ -2054,17 +2143,54 @@ fn pet_speech_position(
         )
     };
 
-    // Keep the whole bubble on the current monitor. The branch choice above
-    // guarantees a gap from the pet unless the work area is smaller than the
-    // bubble itself, in which case clamping is the least surprising result.
+    // Keep the whole bubble on the current monitor while trying the usual
+    // four sides first. If another bubble occupies the preferred side, the
+    // radial candidates below find the nearest free shelf around the pet.
     let max_x = (work_right - bubble_width).max(work_left);
     let max_y = (work_bottom - bubble_height).max(work_top);
-    x = x.clamp(work_left, max_x);
-    y = y.clamp(work_top, max_y);
+    let preferred_clamped = (
+        preferred.0.clamp(work_left, max_x),
+        preferred.1.clamp(work_top, max_y),
+    );
+    let mut candidates = Vec::with_capacity(40);
+    let mut add_candidate = |x: f64, y: f64| {
+        candidates.push((x.clamp(work_left, max_x), y.clamp(work_top, max_y)));
+    };
+    add_candidate(preferred.0, preferred.1);
+    add_candidate(
+        pet_x - bubble_width - gap,
+        pet_y + (pet_height - bubble_height) / 2.0,
+    );
+    add_candidate(
+        pet_x + pet_width + gap,
+        pet_y + (pet_height - bubble_height) / 2.0,
+    );
+    add_candidate(pet_x + (pet_width - bubble_width) / 2.0, pet_y + pet_height + gap);
+    let pet_center = (pet_x + pet_width / 2.0, pet_y + pet_height / 2.0);
+    for radius in [18.0, 42.0, 76.0, 120.0, 180.0, 260.0] {
+        for index in 0..8 {
+            let angle = f64::from(index) * std::f64::consts::TAU / 8.0;
+            add_candidate(
+                pet_center.0 + angle.cos() * radius - bubble_width / 2.0,
+                pet_center.1 + angle.sin() * radius - bubble_height / 2.0,
+            );
+        }
+    }
+    let pet_rect = (pet_x, pet_y, pet_x + pet_width, pet_y + pet_height);
+    let (x, y) = candidates
+        .into_iter()
+        .find(|(left, top)| {
+            let rect = (*left, *top, *left + bubble_width, *top + bubble_height);
+            !speech_rect_overlaps(rect, pet_rect, gap)
+                && occupied_speech_rects
+                    .iter()
+                    .all(|occupied| !speech_rect_overlaps(rect, *occupied, gap))
+        })
+        .unwrap_or(preferred_clamped);
     Ok(LogicalPosition::new(x / scale_factor, y / scale_factor))
 }
 
-fn reposition_pet_speech(
+fn reposition_pet_speech_unlocked(
     app: &tauri::AppHandle,
     instance_id: &str,
 ) -> Result<(), String> {
@@ -2075,8 +2201,91 @@ fn reposition_pet_speech(
         return Ok(());
     };
     speech_window
-        .set_position(pet_speech_position(&pet_window)?)
+        .set_position(pet_speech_position(
+            app,
+            instance_id,
+            &pet_window,
+            None,
+            None,
+        )?)
         .map_err(|error| error.to_string())
+}
+
+/// Reflow all currently visible speech windows in a stable order. This is
+/// needed because two independent WebViews can be shown in the same event
+/// turn before either one is observable through `is_visible()`.
+fn reflow_pet_speech_windows(app: &tauri::AppHandle) -> Result<(), String> {
+    let mut windows = app
+        .webview_windows()
+        .into_iter()
+        .filter(|(label, window)| {
+            label.starts_with("pet-speech-") && window.is_visible().unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    windows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut placed: Vec<(String, (f64, f64, f64, f64))> = Vec::new();
+
+    for (label, window) in windows {
+        let Some(instance_id) = label.strip_prefix("pet-speech-") else {
+            continue;
+        };
+        let Some(pet_window) = app.get_webview_window(&instance_label(instance_id)?) else {
+            continue;
+        };
+        let Some(monitor) = pet_window.current_monitor().ok().flatten() else {
+            continue;
+        };
+        let monitor_key = format!("{}:{}", monitor.position().x, monitor.position().y);
+        let blocked = placed
+            .iter()
+            .filter(|(key, _)| key == &monitor_key)
+            .map(|(_, rect)| *rect)
+            .collect::<Vec<_>>();
+        let position = pet_speech_position(
+            app,
+            instance_id,
+            &pet_window,
+            None,
+            Some(&blocked),
+        )?;
+        window
+            .set_position(position)
+            .map_err(|error| error.to_string())?;
+        let (Ok(actual_position), Ok(size)) = (window.outer_position(), window.outer_size())
+        else {
+            continue;
+        };
+        let left = f64::from(actual_position.x);
+        let top = f64::from(actual_position.y);
+        placed.push((
+            monitor_key,
+            (
+                left,
+                top,
+                left + f64::from(size.width),
+                top + f64::from(size.height),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn reposition_pet_speech(app: &tauri::AppHandle, instance_id: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let _layout = state
+        .speech_layout
+        .lock()
+        .map_err(|_| "speech layout lock is poisoned".to_string())?;
+    reposition_pet_speech_unlocked(app, instance_id)
+}
+
+/// Keep the fallback direct-movement paths in the frontend synchronized too.
+/// Normally movement goes through `set_pet_position_safely`; this command is
+/// deliberately small so an older/restarting backend cannot leave a visible
+/// speech window at the pet's previous position.
+#[tauri::command]
+fn sync_pet_speech_position(app: tauri::AppHandle, instance_id: String) -> Result<(), String> {
+    reposition_pet_speech(&app, &instance_id)
 }
 
 #[derive(Clone, Serialize)]
@@ -4047,6 +4256,7 @@ pub fn run() {
             pet_speech_ready,
             show_pet_speech,
             hide_pet_speech,
+            sync_pet_speech_position,
             social::open_social_log,
             social::open_social_settings,
             get_environment_settings,
@@ -4136,6 +4346,24 @@ mod tests {
             .expect("legacy card should parse");
         assert_eq!(card.dialogue.click, vec!["你好"]);
         assert!(!card.dialogue.idle.is_empty());
+    }
+
+    #[test]
+    fn speech_layout_compacts_short_lines_and_checks_overlap() {
+        let short = speech_window_size("去那边看看！");
+        let long = speech_window_size(&"这是一段需要换行的较长回复。".repeat(5));
+        assert!(short.0 < long.0);
+        assert_eq!(short.1, SPEECH_WINDOW_HEIGHT);
+        assert!(speech_rect_overlaps(
+            (0.0, 0.0, 100.0, 80.0),
+            (105.0, 0.0, 205.0, 80.0),
+            10.0,
+        ));
+        assert!(!speech_rect_overlaps(
+            (0.0, 0.0, 100.0, 80.0),
+            (115.0, 0.0, 215.0, 80.0),
+            10.0,
+        ));
     }
 
     #[test]
