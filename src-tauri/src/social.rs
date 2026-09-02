@@ -951,11 +951,43 @@ fn scene_prompt(app: &tauri::AppHandle, _config: &AppConfig, actors: &[Snapshot]
 
 fn extract_json(value: &str) -> Option<Value> {
     let trimmed = value.trim();
-    serde_json::from_str(trimmed).ok().or_else(|| {
-        let start = trimmed.find('{')?;
-        let end = trimmed.rfind('}')?;
-        serde_json::from_str(&trimmed[start..=end]).ok()
-    })
+    if let Ok(value) = serde_json::from_str(trimmed) {
+        return Some(value);
+    }
+    // Find the outermost balanced object, skipping braces inside string
+    // literals, so trailing prose or a closing brace in a say string cannot
+    // break extraction.
+    let start = trimmed.find('{')?;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut end = None;
+    for (index, character) in trimmed[start..].char_indices() {
+        let absolute = start + index;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(absolute);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    serde_json::from_str(&trimmed[start..=end?]).ok()
 }
 
 fn log_ai_fallback(message: &str) {

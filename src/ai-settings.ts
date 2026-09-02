@@ -114,7 +114,7 @@ function endpointFromForm(
     baseUrl: (baseUrl.value.trim() || fallbackBaseUrl.trim()).replace(/\/$/, ""),
     model: modelName,
     credentialRef: credentialRef || null,
-    maxOutputTokens: 300,
+    maxOutputTokens: 1024,
   };
 }
 

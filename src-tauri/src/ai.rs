@@ -57,7 +57,7 @@ impl Default for ModelEndpointConfig {
             base_url: "https://api.openai.com/v1".to_string(),
             model: String::new(),
             credential_ref: None,
-            max_output_tokens: 300,
+            max_output_tokens: 1_024,
         }
     }
 }
@@ -1672,7 +1672,13 @@ pub(crate) async fn request_social_director(
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| format!("无法创建模型连接: {error}"))?;
-    call_stream(&client, &model, prompt, &[], None, true, on_delta).await
+    // The director's JSON (scene + one say per participant + relationship
+    // signals) far exceeds the default 300-token chat budget and gets
+    // truncated mid-object, forcing every scene request down the local
+    // fallback. Give the director its own output allowance.
+    let mut director_model = model;
+    director_model.max_output_tokens = 1_000;
+    call_stream(&client, &director_model, prompt, &[], None, true, on_delta).await
 }
 
 fn card_for_pet(app: &tauri::AppHandle, pet_id: &str) -> Result<CharacterCard, String> {
