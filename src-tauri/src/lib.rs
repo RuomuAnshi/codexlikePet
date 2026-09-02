@@ -3576,6 +3576,7 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<Wry>> {
         app.autolaunch().is_enabled().unwrap_or(false),
         None::<&str>,
     )?;
+    let check_update = MenuItem::with_id(app, "check-update", "检查更新", true, None::<&str>)?;
     let config = config_snapshot(app).unwrap_or_default();
     let catalog = installed_pets(app, &config);
     let mut add_items = Vec::new();
@@ -3644,6 +3645,7 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<Wry>> {
         &social_log,
         &toggle_pause,
         &autostart,
+        &check_update,
         &add_submenu,
         &instance_submenu,
         &separator,
@@ -3709,6 +3711,47 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 if let Err(error) = rebuild_tray_menu(app) {
                     eprintln!("failed to refresh tray menu: {error}");
                 }
+            } else if id == "check-update" {
+                let app_for_check = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    match check_for_updates(app_for_check.clone()).await {
+                        Ok(check) if check.update_available => {
+                            let release_url = check.url.clone();
+                            app_for_check
+                                .dialog()
+                                .message(format!(
+                                    "发现新版本 {}（当前 {}）。前往 GitHub 查看发布说明并下载？",
+                                    check.latest, check.current
+                                ))
+                                .title("发现更新")
+                                .buttons(MessageDialogButtons::OkCancel)
+                                .show(move |open| {
+                                    if open {
+                                        let _ = app_for_check.opener().open_url(release_url, None::<&str>);
+                                    }
+                                });
+                        }
+                        Ok(check) => {
+                            app_for_check
+                                .dialog()
+                                .message(format!("已是最新版本（{}）。", check.current))
+                                .title("检查更新")
+                                .show(|_| {});
+                        }
+                        Err(error) => {
+                            app_for_check
+                                .dialog()
+                                .message(format!("{error}\n你可以手动前往 GitHub 查看最新发布。"))
+                                .title("检查更新")
+                                .buttons(MessageDialogButtons::OkCancel)
+                                .show(move |open| {
+                                    if open {
+                                        let _ = app_for_check.opener().open_url(UPDATE_RELEASE_URL, None::<&str>);
+                                    }
+                                });
+                        }
+                    }
+                });
             } else if let Some(pet_id) = id.strip_prefix("add-pet:") {
                 if let Err(error) = add_pet_instance_internal(app, pet_id) {
                     eprintln!("failed to add pet: {error}");
