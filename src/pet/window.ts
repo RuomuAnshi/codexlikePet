@@ -59,6 +59,7 @@ export function attachDrag(
           // this is an older dev binary without the collision command.
           try {
             await win.setPosition(new LogicalPosition(next.x, next.y));
+            void invoke("sync_pet_speech_position", { instanceId }).catch(() => undefined);
           } catch {
             // The window may disappear while the pointer is still captured.
           }

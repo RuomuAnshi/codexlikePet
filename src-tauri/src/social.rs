@@ -1601,6 +1601,10 @@ async fn move_actors(app: &tauri::AppHandle, plan: &ScenePlan, cancel: &AtomicBo
                         positions[move_index].x,
                         positions[move_index].y,
                     ));
+                    let _ = super::reposition_pet_speech(
+                        app,
+                        &actor.snapshot.instance_id,
+                    );
                 }
             }
         }
@@ -1785,6 +1789,10 @@ async fn run_chase_movement(
                         positions[chase_index].x,
                         positions[chase_index].y,
                     ));
+                    let _ = super::reposition_pet_speech(
+                        app,
+                        &actor.snapshot.instance_id,
+                    );
                 }
             }
         }

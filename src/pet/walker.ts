@@ -313,6 +313,7 @@ export class PetWalker {
           // Keep dev mode usable while the backend is restarting. The normal
           // path is always arbitrated by Rust before the window is moved.
           await this.window.setPosition(new LogicalPosition(candidate.x, candidate.y));
+          void invoke("sync_pet_speech_position", { instanceId: this.instanceId }).catch(() => undefined);
           startX = candidate.x;
           startY = candidate.y;
         }

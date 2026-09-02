@@ -111,6 +111,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "resources": {
       "../public/pets": "pets"
     },
@@ -121,5 +122,16 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY1QkU4QkIzN0RFODI0QzgKUldUSUpPaDlzNHUrWlNqYmVoZnBZdGtUL0FCeEx4SzQ3RVowSCt2OWVMek9IM0x5V3R2R0RsdVoK",
+      "endpoints": [
+        "https://github.com/RuomuAnshi/codexlikePet/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }
