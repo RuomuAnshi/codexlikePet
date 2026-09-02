@@ -1,0 +1,8 @@
+{
+  "id": "football",
+  "version": 1,
+  "name": "足球",
+  "asset": "sprite.svg",
+  "hitbox": { "type": "circle", "radius": 18 },
+  "behaviors": ["kick", "roll", "bounce", "chase", "pass", "steal"]
+}

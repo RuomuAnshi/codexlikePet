@@ -6,6 +6,7 @@ interface SocialLogEntry {
   participants: string[];
   interactionType: string;
   trigger: string;
+  prop?: string | null;
   dialogue: SocialLogDialogue[];
   milestones: string[];
 }
@@ -179,7 +180,9 @@ function renderLogs(): void {
     const header = document.createElement("header");
     const kind = document.createElement("span");
     kind.className = "log-kind";
-    kind.textContent = entry.interactionType;
+    kind.textContent = entry.prop
+      ? `${entry.interactionType} · ${entry.prop}`
+      : entry.interactionType;
     const time = document.createElement("span");
     time.className = "log-time";
     time.textContent = new Date(entry.timestamp).toLocaleString();

@@ -8,6 +8,7 @@ export interface PetAnimationClip {
   frames: number;
   durations: number[];
   loop: boolean;
+  loopStart?: number;
   type: PetClipType;
   returnTo?: AnimationState;
   fallback?: AnimationState;

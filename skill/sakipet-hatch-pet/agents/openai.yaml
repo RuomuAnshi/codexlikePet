@@ -1,0 +1,4 @@
+interface:
+  display_name: "SakiPet Hatch Pet"
+  short_description: "Create Codex V2 pets with frame-animation extensions"
+  default_prompt: "Use $sakipet-hatch-pet to create a Codex-compatible v2 pet with optional SakiPet frame-animation clips."

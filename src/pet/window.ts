@@ -36,7 +36,32 @@ export function attachDrag(
   let dragDirection: DragDirection | null = null;
   let carried = false;
   let pendingPosition: { x: number; y: number } | null = null;
+  let latestPosition: { x: number; y: number } | null = null;
   let flushingPosition = false;
+  let speechSyncTimer: number | undefined;
+  let speechSyncQueued = false;
+  let speechSyncInFlight = false;
+
+  /**
+   * Speech windows are separate native windows. Keep them following the pet,
+   * but never put their layout work on the high-frequency drag path.
+   */
+  const queueSpeechSync = (): void => {
+    speechSyncQueued = true;
+    if (speechSyncTimer !== undefined) return;
+    speechSyncTimer = globalThis.setTimeout(() => {
+      speechSyncTimer = undefined;
+      if (!speechSyncQueued || speechSyncInFlight) return;
+      speechSyncQueued = false;
+      speechSyncInFlight = true;
+      void invoke("sync_pet_speech_position", { instanceId })
+        .catch(() => undefined)
+        .finally(() => {
+          speechSyncInFlight = false;
+          if (speechSyncQueued) queueSpeechSync();
+        });
+    }, 60);
+  };
 
   const flushPosition = async (): Promise<void> => {
     if (flushingPosition) return;
@@ -46,23 +71,14 @@ export function attachDrag(
         const next = pendingPosition;
         pendingPosition = null;
         try {
-          await invoke<{ x: number; y: number }>("set_pet_position_safely", {
-            // Window labels are not instance ids for secondary pets
-            // (`pet-instance-…`). Pass the runtime id explicitly so the
-            // backend can arbitrate every pet against the right siblings.
-            instanceId,
-            x: next.x,
-            y: next.y,
-          });
+          // Moving the native window directly keeps pointer feedback smooth.
+          // Collision arbitration is performed once after release below;
+          // querying every sibling and speech window for every pointermove
+          // can stall a transparent WebView while it is being dragged.
+          await win.setPosition(new LogicalPosition(next.x, next.y));
+          queueSpeechSync();
         } catch {
-          // Fall back to direct movement if the backend is shutting down or
-          // this is an older dev binary without the collision command.
-          try {
-            await win.setPosition(new LogicalPosition(next.x, next.y));
-            void invoke("sync_pet_speech_position", { instanceId }).catch(() => undefined);
-          } catch {
-            // The window may disappear while the pointer is still captured.
-          }
+          // The window may disappear while the pointer is still captured.
         }
       }
     } finally {
@@ -99,6 +115,7 @@ export function attachDrag(
     }
 
     pendingPosition = { x: startWin.x + dx, y: startWin.y + dy };
+    latestPosition = pendingPosition;
     const nextDirection = directionFor(dx, dy);
     const nextCarried = dy < -24 && Math.abs(dy) > Math.abs(dx);
     if (dragDirection !== nextDirection || carried !== nextCarried) {
@@ -141,29 +158,52 @@ export function attachDrag(
     updateFromPointer(latestPointer.x, latestPointer.y);
   });
 
-  const endDrag = (event: PointerEvent): void => {
+  const endDrag = (event?: PointerEvent): void => {
     if (!active) return;
     const wasDragging = dragging;
+    const releasedPosition = latestPosition;
     active = false;
     dragging = false;
     dragToken += 1;
     pendingPosition = null;
+    latestPosition = null;
     startWin = null;
     dragDirection = null;
     carried = false;
-    if (wasDragging) {
+    if (wasDragging || dragState.current) {
       dragState.current = false;
       onDragChange?.(false, null, false);
     }
     try {
-      if (event.pointerId === pointerId) element.releasePointerCapture(event.pointerId);
+      if (event && event.pointerId === pointerId && element.hasPointerCapture(event.pointerId)) {
+        element.releasePointerCapture(event.pointerId);
+      }
     } catch {
       /* ignore */
+    }
+
+    if (wasDragging && releasedPosition) {
+      // Keep collision protection, but do it after pointer feedback has
+      // stopped. A slow layout query must never hold the drag loop hostage.
+      void invoke<{ x: number; y: number }>("set_pet_position_safely", {
+        instanceId,
+        x: releasedPosition.x,
+        y: releasedPosition.y,
+      })
+        .then(() => queueSpeechSync())
+        .catch(() => queueSpeechSync());
     }
   };
 
   element.addEventListener("pointerup", endDrag);
   element.addEventListener("pointercancel", endDrag);
+  element.addEventListener("lostpointercapture", (event) => {
+    endDrag(event);
+  });
+  window.addEventListener("blur", () => endDrag());
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) endDrag();
+  });
 }
 
 export type Gesture = "left" | "right" | "petting-start" | "petting-end";
@@ -201,8 +241,8 @@ export function attachGestures(element: HTMLElement, onGesture: (gesture: Gestur
     if (Math.hypot(event.screenX - start.x, event.screenY - start.y) > 8) clearHold();
   });
 
-  const end = (event: PointerEvent): void => {
-    if (event.pointerId !== pointerId) return;
+  const end = (event?: PointerEvent): void => {
+    if (event && event.pointerId !== pointerId) return;
     clearHold();
     if (petting) {
       petting = false;
@@ -210,13 +250,23 @@ export function attachGestures(element: HTMLElement, onGesture: (gesture: Gestur
       onGesture("petting-end");
       return;
     }
+    if (!event) {
+      pointerId = -1;
+      return;
+    }
     const dt = performance.now() - downAt;
     const moved = Math.hypot(event.screenX - start.x, event.screenY - start.y) > 8;
     if (!moved && dt < 350 && event.button === 0 && !dragState.current) onGesture("left");
+    pointerId = -1;
   };
 
   element.addEventListener("pointerup", end);
   element.addEventListener("pointercancel", end);
+  element.addEventListener("lostpointercapture", () => end());
+  window.addEventListener("blur", () => end());
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) end();
+  });
   element.addEventListener("contextmenu", (event) => {
     event.preventDefault();
     onGesture("right");

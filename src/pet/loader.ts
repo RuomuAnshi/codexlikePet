@@ -79,6 +79,12 @@ export async function loadAnimationPack(
         if (manifest.durations.length !== manifest.frames || manifest.durations.some((duration) => duration <= 0)) {
           throw new Error("invalid frame durations");
         }
+        if (
+          manifest.loopStart !== undefined
+          && (!Number.isInteger(manifest.loopStart) || manifest.loopStart < 0 || manifest.loopStart >= manifest.frames)
+        ) {
+          throw new Error("invalid loop start");
+        }
         const bitmap = await createImageBitmap(await (await fetch(manifest.dataUrl)).blob());
         if (bitmap.width !== CELL_WIDTH * manifest.frames || bitmap.height !== CELL_HEIGHT) {
           bitmap.close();

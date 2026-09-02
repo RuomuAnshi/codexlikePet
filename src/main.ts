@@ -35,6 +35,7 @@ const EMOTION_ICONS: Record<string, string> = {
   content: "🙂",
   calm: "🙂",
   low: "!",
+  hungry: "🍽️",
 };
 
 interface PetMeetupEvent {
@@ -126,6 +127,7 @@ async function boot(): Promise<void> {
   let pettingTimer: number | undefined;
   let autoQuiet = false;
   let socialSceneId: string | null = null;
+  let lifeSleeping = false;
 
   const speechPreview = (text: string): string => {
     const chars = [...text.trim()];
@@ -187,6 +189,16 @@ async function boot(): Promise<void> {
     emotion.hidden = false;
     emotion.classList.add("emotion-visible");
     globalThis.setTimeout(() => emotion.classList.remove("emotion-visible"), duration);
+  };
+
+  const spawnFoodVisual = (): void => {
+    if (globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    const food = document.createElement("img");
+    food.className = "food-drop";
+    food.src = `${import.meta.env.BASE_URL}props/snack/sprite.svg`;
+    food.alt = "";
+    effects.append(food);
+    food.addEventListener("animationend", () => food.remove(), { once: true });
   };
 
   const scheduleIdleSpeech = (): void => {
@@ -342,6 +354,69 @@ async function boot(): Promise<void> {
     return true;
   };
 
+  // Extra frame clips are optional per pet. Keep the standard atlas as the
+  // safe fallback, but use the richer lifecycle clips whenever this pet has
+  // them. This is deliberately resolved from the runtime clip map instead of
+  // assuming that every pet ships the same animation files.
+  const startSleepSequence = (preferredGesture?: string): boolean => {
+    setBaseMode("sleeping");
+    const leadClip = preferredGesture && preferredGesture !== "sleep"
+      ? preferredGesture
+      : "yawn";
+    if (engine.hasAnimationClip(leadClip)) {
+      return playFrameClip(leadClip, () => {
+        if (!playFrameClip("sleep")) syncAnimation();
+      });
+    }
+    if (!playFrameClip("sleep")) {
+      syncAnimation();
+      return false;
+    }
+    return true;
+  };
+
+  const startWalkingAfterWake = (): void => {
+    if (
+      !paused &&
+      !dragging &&
+      !dragState.petting &&
+      !settings.quietMode &&
+      !autoQuiet &&
+      settings.wanderEnabled
+    ) {
+      // Wake-up should lead back into the pet's normal life instead of
+      // leaving it parked forever after the sleep clip finishes.
+      walker.walkNow();
+    }
+  };
+
+  const startWakeSequence = (onComplete?: () => void): boolean => {
+    setBaseMode("idle");
+    const wakeClip = engine.hasAnimationClip("wake")
+      ? "wake"
+      : engine.hasAnimationClip("stretch")
+        ? "stretch"
+        : null;
+    if (!wakeClip) {
+      syncAnimation();
+      return false;
+    }
+    return playFrameClip(wakeClip, () => {
+      if (wakeClip !== "stretch" && engine.hasAnimationClip("stretch")) {
+        if (!playFrameClip("stretch", () => {
+          syncAnimation();
+          onComplete?.();
+        })) {
+          syncAnimation();
+          onComplete?.();
+        }
+      } else {
+        syncAnimation();
+        onComplete?.();
+      }
+    });
+  };
+
   const applyPetBehavior = (behavior: PetBehavior | null | undefined): void => {
     if (!behavior || paused || settings.quietMode) return;
     if (behaviorLookTimer !== undefined) globalThis.clearTimeout(behaviorLookTimer);
@@ -358,16 +433,7 @@ async function boot(): Promise<void> {
         walker.walkNow();
         break;
       case "sleep":
-        setBaseMode("sleeping");
-        if (behavior.gesture && behavior.gesture !== "sleep") {
-          const playedSleepGesture = playFrameClip(behavior.gesture, () => {
-            setBaseMode("sleeping");
-            if (!playFrameClip("sleep")) syncAnimation();
-          });
-          if (!playedSleepGesture && !playFrameClip("sleep")) syncAnimation();
-        } else if (!playFrameClip("sleep")) {
-          syncAnimation();
-        }
+        startSleepSequence(behavior.gesture ?? undefined);
         break;
       case "running":
         setBaseMode("working");
@@ -404,10 +470,14 @@ async function boot(): Promise<void> {
     }
   };
 
-  watchCursorDirection((direction) => {
-    lastDirection = direction === null ? null : (direction as LookDirection);
-    if (!dragging && !walking && !dragState.petting && !socialSceneId) engine.setLook(lastDirection);
-  });
+  watchCursorDirection(
+    (direction) => {
+      lastDirection = direction === null ? null : (direction as LookDirection);
+      if (!dragging && !walking && !dragState.petting && !socialSceneId) engine.setLook(lastDirection);
+    },
+    100,
+    () => !paused,
+  );
 
   attachDrag(
     petEl,
@@ -586,19 +656,36 @@ async function boot(): Promise<void> {
     syncAnimation();
     void savePosition();
   });
-  await listen<{ petId: string; state: { activity: string; mood: string; energy: number } }>(
-    "pet://life-state",
+  await listen<{
+    petId: string;
+    state: { activity: string; mood: string; energy: number; food?: number };
+  }>("pet://life-state",
     ({ payload }) => {
       if (payload.petId !== runtime.petId) return;
+      const wasSleeping = lifeSleeping;
+      lifeSleeping = payload.state.activity === "sleeping";
       if (payload.state.activity === "sleeping") {
         walker.stop();
         stateMachine.setBaseState("waiting");
-        if (!engine.isPlayingClip()) playFrameClip("sleep");
+        if (!engine.isPlayingClip()) {
+          if (wasSleeping) {
+            if (!playFrameClip("sleep")) syncAnimation();
+          } else {
+            startSleepSequence();
+          }
+        }
         if (!engine.isPlayingClip()) syncAnimation();
       } else if (!dragging && !dragState.petting) {
         stopFrameClip();
         stateMachine.setBaseState("idle");
-        syncAnimation();
+        if (wasSleeping) {
+          if (!startWakeSequence(startWalkingAfterWake)) {
+            syncAnimation();
+            startWalkingAfterWake();
+          }
+        } else {
+          syncAnimation();
+        }
       }
       showEmotion(
         payload.state.activity === "sleeping"
@@ -608,10 +695,27 @@ async function boot(): Promise<void> {
             : payload.state.mood,
         2_400,
       );
+      if (
+        payload.state.food === 0 &&
+        payload.state.activity !== "sleeping" &&
+        payload.state.energy >= 20
+      ) {
+        showEmotion("hungry", 2_400);
+      }
     },
   );
   await listen<{ petId: string; trigger: DialogueTrigger }>("pet://life-dialogue", ({ payload }) => {
     if (payload.petId === runtime.petId) sayLine(payload.trigger);
+  });
+  await listen<{ petId: string; toy: string }>("pet://toy-play", ({ payload }) => {
+    if (payload.petId !== runtime.petId) return;
+    showEffect("star");
+    showEmotion("happy");
+    playAction("jumping");
+  });
+  await listen<{ petId: string; message: string }>("pet://context-error", ({ payload }) => {
+    if (payload.petId !== runtime.petId) return;
+    showSpeech(payload.message, 3_200);
   });
   await listen<{ petId: string; instanceId: string; action: string }>(
     "pet://context-action",
@@ -620,18 +724,25 @@ async function boot(): Promise<void> {
       const action = payload.action as DialogueTrigger;
       if (action === "feed" || action === "play" || action === "petting") {
         sayLine(action);
-        showEffect(action === "feed" ? "food" : action === "play" ? "star" : "heart");
+        if (action === "feed") {
+          spawnFoodVisual();
+          showEffect("food");
+        } else {
+          showEffect(action === "play" ? "star" : "heart");
+        }
       } else if (action === "sleep" || action === "wake") {
         sayLine(action);
         showEmotion(action === "sleep" ? "sleeping" : "happy");
         if (action === "sleep") {
+          lifeSleeping = true;
           walker.stop();
           stateMachine.setBaseState("waiting");
-          if (!playFrameClip("sleep")) syncAnimation();
+          startSleepSequence();
         } else if (!dragging) {
+          lifeSleeping = false;
           stopFrameClip();
           stateMachine.setBaseState("idle");
-          syncAnimation();
+          if (!startWakeSequence(startWalkingAfterWake)) startWalkingAfterWake();
         }
       }
       if (action === "play") playAction("jumping");

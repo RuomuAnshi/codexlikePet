@@ -9,7 +9,7 @@ use objc2_app_kit::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -24,7 +24,8 @@ use tauri::{
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_opener::OpenerExt;
-use zip::ZipArchive;
+use tauri_plugin_updater::UpdaterExt;
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 mod ai;
 mod environment;
@@ -458,6 +459,7 @@ struct AnimationClipManifest {
     durations: Vec<u64>,
     #[serde(rename = "loop")]
     looped: bool,
+    loop_start: Option<u16>,
     #[serde(rename = "type")]
     clip_type: String,
     return_to: Option<String>,
@@ -482,6 +484,7 @@ struct AnimationClipRuntime {
     durations: Vec<u64>,
     #[serde(rename = "loop")]
     looped: bool,
+    loop_start: Option<u16>,
     #[serde(rename = "type")]
     clip_type: String,
     return_to: Option<String>,
@@ -975,6 +978,9 @@ fn validate_animation_clip(
     {
         return Err(format!("动画 clip {id} 的 duration 数量或范围无效"));
     }
+    if clip.loop_start.is_some_and(|start| start >= clip.frames) {
+        return Err(format!("动画 clip {id} 的 loopStart 必须小于帧数"));
+    }
     if !matches!(clip.clip_type.as_str(), "mode" | "gesture") {
         return Err(format!("动画 clip {id} 的 type 必须为 mode 或 gesture"));
     }
@@ -1020,6 +1026,7 @@ fn build_animation_pack_runtime(
                 frames: clip.frames,
                 durations: clip.durations.clone(),
                 looped: clip.looped,
+                loop_start: clip.loop_start,
                 clip_type: clip.clip_type.clone(),
                 return_to: clip.return_to.clone(),
                 fallback: clip.fallback.clone(),
@@ -1075,6 +1082,16 @@ fn animation_pack_for_pet(app: &tauri::AppHandle, pet_id: &str) -> Option<Animat
         .map(|root| root.join(&bundled.path))
         .find(|root| root.join("pet.json").is_file())
         .and_then(|root| animation_pack_from_root(&root))
+}
+
+/// Return only the safe clip ids for prompt construction. The AI layer uses
+/// this to avoid suggesting gestures that are not installed for this pet.
+pub(crate) fn animation_clip_ids(app: &tauri::AppHandle, pet_id: &str) -> Vec<String> {
+    let mut ids = animation_pack_for_pet(app, pet_id)
+        .map(|pack| pack.clips.into_keys().collect::<Vec<_>>())
+        .unwrap_or_default();
+    ids.sort();
+    ids
 }
 
 fn animation_pack_from_archive(
@@ -2272,10 +2289,10 @@ fn reflow_pet_speech_windows(app: &tauri::AppHandle) -> Result<(), String> {
 
 fn reposition_pet_speech(app: &tauri::AppHandle, instance_id: &str) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let _layout = state
-        .speech_layout
-        .lock()
-        .map_err(|_| "speech layout lock is poisoned".to_string())?;
+    // Native window queries synchronously marshal to the macOS event loop.
+    // Never wait for this lock from an IPC command: the other side may be
+    // holding it while it is waiting for that same event loop.
+    let _layout = state.speech_layout.try_lock().ok();
     reposition_pet_speech_unlocked(app, instance_id)
 }
 
@@ -2337,48 +2354,71 @@ async fn show_pet_speech(
     if text.is_empty() {
         return Ok(());
     }
-    let position = pet_speech_position(&pet_window)?;
-    let speech_window = if let Some(window) = app.get_webview_window(&speech_label) {
-        window
-    } else {
-        if let Ok(mut ready) = app.state::<AppState>().speech_ready.lock() {
-            ready.remove(&instance_id);
-        }
-        WebviewWindowBuilder::new(
+    let speech_size = speech_window_size(&text);
+    {
+        // Layout is best-effort serialized when the lock is immediately
+        // available. Window APIs below may synchronously marshal to the
+        // platform event loop, so waiting for this lock can deadlock the main
+        // event loop while another command is reflowing speech windows.
+        let state = app.state::<AppState>();
+        let _layout = state.speech_layout.try_lock().ok();
+        let speech_window = if let Some(window) = app.get_webview_window(&speech_label) {
+            window
+        } else {
+            if let Ok(mut ready) = app.state::<AppState>().speech_ready.lock() {
+                ready.remove(&instance_id);
+            }
+            let position = pet_speech_position(
+                &app,
+                &instance_id,
+                &pet_window,
+                Some(speech_size),
+                None,
+            )?;
+            WebviewWindowBuilder::new(
+                &app,
+                &speech_label,
+                WebviewUrl::App(
+                    format!("speech.html?instance={instance_id}&petId={pet_id}").into(),
+                ),
+            )
+            .title("")
+            .inner_size(speech_size.0, speech_size.1)
+            .position(position.x, position.y)
+            .transparent(true)
+            .decorations(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .shadow(false)
+            .resizable(false)
+            .focused(false)
+            .visible(false)
+            .additional_browser_args(BROWSER_ARGS)
+            .build()
+            .map_err(|error| format!("failed to create speech window: {error}"))?
+        };
+        speech_window
+            .set_size(LogicalSize::new(speech_size.0, speech_size.1))
+            .map_err(|error| error.to_string())?;
+        let position = pet_speech_position(
             &app,
-            &speech_label,
-            WebviewUrl::App(
-                format!("speech.html?instance={instance_id}&petId={pet_id}").into(),
-            ),
-        )
-        .title("")
-        .inner_size(SPEECH_WINDOW_WIDTH, SPEECH_WINDOW_HEIGHT)
-        .position(position.x, position.y)
-        .transparent(true)
-        .decorations(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .shadow(false)
-        .resizable(false)
-        .focused(false)
-        .visible(false)
-        .additional_browser_args(BROWSER_ARGS)
-        .build()
-        .map_err(|error| format!("failed to create speech window: {error}"))?
-    };
-    speech_window
-        .set_position(position)
-        .map_err(|error| error.to_string())?;
-    speech_window
-        .set_size(LogicalSize::new(SPEECH_WINDOW_WIDTH, SPEECH_WINDOW_HEIGHT))
-        .map_err(|error| error.to_string())?;
-    apply_fullscreen_visibility(
-        &speech_window,
-        settings_for_pet(&config, &pet_id).show_in_fullscreen,
-    )?;
-    speech_window
-        .show()
-        .map_err(|error| format!("failed to show speech window: {error}"))?;
+            &instance_id,
+            &pet_window,
+            Some(speech_size),
+            None,
+        )?;
+        speech_window
+            .set_position(position)
+            .map_err(|error| error.to_string())?;
+        apply_fullscreen_visibility(
+            &speech_window,
+            settings_for_pet(&config, &pet_id).show_in_fullscreen,
+        )?;
+        speech_window
+            .show()
+            .map_err(|error| format!("failed to show speech window: {error}"))?;
+        reflow_pet_speech_windows(&app)?;
+    }
 
     let payload = PetSpeechPayload {
         instance_id: instance_id.clone(),
@@ -3248,6 +3288,157 @@ fn validate_imported_manifest(
     Ok(())
 }
 
+fn pet_root_for_export(app: &tauri::AppHandle, pet_id: &str) -> Result<PathBuf, String> {
+    if !is_safe_id(pet_id) {
+        return Err("宠物 id 不合法".to_string());
+    }
+
+    // Imported resources take precedence here, just like they do when the
+    // runtime loads animation packs. This also means exporting a user's
+    // imported pet never accidentally reads a bundled resource with the same
+    // id.
+    let imported_root = imported_pets_path(app)?.join(pet_id);
+    if imported_root.join("pet.json").is_file() {
+        return Ok(imported_root);
+    }
+
+    let bundled = pet_is_bundled(app, pet_id)
+        .ok_or_else(|| format!("找不到宠物资源: {pet_id}"))?;
+    bundled_pet_roots(app)
+        .into_iter()
+        .map(|root| root.join(&bundled.path))
+        .find(|root| root.join("pet.json").is_file())
+        .ok_or_else(|| format!("找不到宠物资源目录: {pet_id}"))
+}
+
+fn collect_pet_export_entries(
+    root: &Path,
+    pet_id: &str,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let manifest_bytes = fs::read(root.join("pet.json"))
+        .map_err(|error| format!("无法读取 pet.json: {error}"))?;
+    let manifest = serde_json::from_slice::<PetManifest>(&manifest_bytes)
+        .map_err(|error| format!("pet.json 格式错误: {error}"))?;
+    let sprite_path = manifest.spritesheet_path.clone();
+    let sprite = fs::read(root.join(&sprite_path))
+        .map_err(|error| format!("无法读取 spritesheet {}: {error}", sprite_path))?;
+    validate_imported_manifest(&manifest, pet_id, &sprite_path, &sprite)?;
+
+    let mut entries = Vec::new();
+    let mut names = HashSet::new();
+    let mut add_entry = |relative_path: &str, bytes: Vec<u8>| -> Result<(), String> {
+        if !is_safe_relative_path(relative_path) || !names.insert(relative_path.to_string()) {
+            return Err(format!("宠物包内出现重复或不安全的路径: {relative_path}"));
+        }
+        entries.push((relative_path.to_string(), bytes));
+        Ok(())
+    };
+
+    add_entry("pet.json", manifest_bytes)?;
+    add_entry(&sprite_path, sprite)?;
+
+    // character.json is part of the shareable identity, but no application
+    // state is. Validate it before exporting so the resulting package can be
+    // imported again without silently losing its character card.
+    let character_path = root.join("character.json");
+    if character_path.is_file() {
+        let bytes = fs::read(&character_path)
+            .map_err(|error| format!("无法读取 character.json: {error}"))?;
+        decode_character(&bytes)?;
+        add_entry("character.json", bytes)?;
+    }
+
+    // The animation manifest is the authoritative list of action assets.
+    // Export only those referenced clips rather than copying arbitrary files
+    // from the pet directory, which keeps memories, chat history, state and
+    // future private files out of the package by construction.
+    let animation_path = root.join(ANIMATION_PACK_FILE_NAME);
+    if animation_path.is_file() {
+        let animation_manifest_bytes = fs::read(&animation_path)
+            .map_err(|error| format!("无法读取 animations.json: {error}"))?;
+        let manifest = parse_animation_pack(&animation_manifest_bytes)?;
+        add_entry(ANIMATION_PACK_FILE_NAME, animation_manifest_bytes)?;
+
+        let mut clips: Vec<(&String, &AnimationClipManifest)> = manifest.clips.iter().collect();
+        clips.sort_by(|left, right| left.0.cmp(right.0));
+        for (id, clip) in clips {
+            let bytes = fs::read(root.join(&clip.path))
+                .map_err(|error| format!("无法读取动画 clip {}: {error}", clip.path))?;
+            validate_animation_clip(id, clip, &bytes)?;
+            add_entry(&clip.path, bytes)?;
+        }
+    }
+
+    Ok(entries)
+}
+
+fn write_pet_archive(
+    mut output_path: PathBuf,
+    pet_id: &str,
+    entries: Vec<(String, Vec<u8>)>,
+) -> Result<String, String> {
+    if output_path.extension().and_then(|extension| extension.to_str()) != Some("zip") {
+        output_path.set_extension("zip");
+    }
+
+    let output = fs::File::create(&output_path)
+        .map_err(|error| format!("无法创建导出文件: {error}"))?;
+    let mut archive = ZipWriter::new(output);
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+    for (relative_path, bytes) in entries {
+        archive
+            .start_file(format!("{pet_id}/{relative_path}"), options)
+            .map_err(|error| format!("无法写入宠物包: {error}"))?;
+        archive
+            .write_all(&bytes)
+            .map_err(|error| format!("无法写入宠物资源 {relative_path}: {error}"))?;
+    }
+    archive
+        .finish()
+        .map_err(|error| format!("无法完成宠物包: {error}"))?;
+    Ok(output_path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn export_pet_package(app: tauri::AppHandle, pet_id: String) -> Result<(), String> {
+    let root = pet_root_for_export(&app, &pet_id)?;
+    let entries = collect_pet_export_entries(&root, &pet_id)?;
+    let event_pet_id = pet_id.clone();
+    app.dialog()
+        .file()
+        .set_title("导出宠物包")
+        .set_file_name(format!("{pet_id}.zip"))
+        .add_filter("SakiPet 宠物包", &["zip"])
+        .save_file(move |file_path| {
+            let payload = match file_path {
+                None => serde_json::json!({
+                    "petId": event_pet_id,
+                    "cancelled": true,
+                }),
+                Some(file_path) => match file_path
+                    .into_path()
+                    .map_err(|error| format!("无法读取导出路径: {error}"))
+                    .and_then(|path| write_pet_archive(path, &event_pet_id, entries))
+                {
+                    Ok(path) => serde_json::json!({
+                        "petId": event_pet_id,
+                        "cancelled": false,
+                        "path": path,
+                    }),
+                    Err(error) => serde_json::json!({
+                        "petId": event_pet_id,
+                        "cancelled": false,
+                        "error": error,
+                    }),
+                },
+            };
+            let _ = app.emit("pet://pet-export-finished", payload);
+        });
+    Ok(())
+}
+
 #[tauri::command]
 fn import_pet_package(
     app: tauri::AppHandle,
@@ -3520,7 +3711,7 @@ fn show_pet_context_menu(app: tauri::AppHandle, window_label: String) -> Result<
         .get_webview_window(&window_label)
         .ok_or_else(|| "宠物窗口不可用".to_string())?;
     let pet_id = &instance.pet_id;
-    let item = |action: &str, title: &str| -> Result<MenuItem<Wry>, String> {
+    let item = |action: &str, title: String| -> Result<MenuItem<Wry>, String> {
         MenuItem::with_id(
             &app,
             format!("pet-context:{action}:{instance_id}:{pet_id}"),
@@ -3530,9 +3721,38 @@ fn show_pet_context_menu(app: tauri::AppHandle, window_label: String) -> Result<
         )
         .map_err(|error| error.to_string())
     };
-    let feed = item("feed", "喂食")?;
-    let play = item("play", "玩耍")?;
-    let pet = item("petting", "抚摸提示")?;
+    let life = ai::get_pet_state(app.clone(), pet_id.to_string()).ok();
+    let food_left = life.as_ref().map(|state| state.food).unwrap_or(0);
+    let feed = item("feed", format!("喂食（剩 {food_left}）"))?;
+    let play = item("play", "玩耍".to_string())?;
+    let mut toy_items: Vec<MenuItem<Wry>> = Vec::new();
+    let toy_label = |toy: &str| match toy {
+        "football" => "踢足球",
+        "ribbon" => "玩彩带",
+        "plush" => "抱毛绒玩具",
+        _ => "玩玩具",
+    };
+    if let Some(state) = life.as_ref() {
+        for toy in &state.toy_ids {
+            if toy == "snack" {
+                continue;
+            }
+            toy_items.push(item(&format!("toy-{toy}"), toy_label(toy).to_string())?);
+        }
+    }
+    let toy_refs: Vec<&dyn tauri::menu::IsMenuItem<Wry>> = toy_items
+        .iter()
+        .map(|item| item as &dyn tauri::menu::IsMenuItem<Wry>)
+        .collect();
+    let toys = Submenu::with_id_and_items(
+        &app,
+        format!("pet-toys-menu-{instance_id}"),
+        "一起玩",
+        !toy_refs.is_empty(),
+        &toy_refs,
+    )
+    .map_err(|error| error.to_string())?;
+    let pet = item("petting", "抚摸提示".to_string())?;
     let sleep = item(
         if ai::is_pet_sleeping(&app, pet_id) {
             "wake"
@@ -3540,15 +3760,15 @@ fn show_pet_context_menu(app: tauri::AppHandle, window_label: String) -> Result<
             "sleep"
         },
         if ai::is_pet_sleeping(&app, pet_id) {
-            "叫醒它"
+            "叫醒它".to_string()
         } else {
-            "让它睡觉"
+            "让它睡觉".to_string()
         },
     )?;
-    let chat = item("chat", "和它说话")?;
-    let settings = item("settings", "独立设置")?;
-    let hide = item("hide", "隐藏")?;
-    let friends = item("find-friends", "找朋友")?;
+    let chat = item("chat", "和它说话".to_string())?;
+    let settings = item("settings", "独立设置".to_string())?;
+    let hide = item("hide", "隐藏".to_string())?;
+    let friends = item("find-friends", "找朋友".to_string())?;
     let source_monitor = window
         .current_monitor()
         .ok()
@@ -3621,6 +3841,7 @@ fn show_pet_context_menu(app: tauri::AppHandle, window_label: String) -> Result<
         &[
             &feed,
             &play,
+            &toys,
             &pet,
             &sleep,
             &friends,
@@ -3691,9 +3912,24 @@ fn handle_pet_context_action(app: &tauri::AppHandle, id: &str) -> Result<(), Str
         return Err("宠物实例已不存在".to_string());
     }
     match action {
-        "feed" | "play" | "sleep" | "wake" => {
+        "feed" | "play" => {
+            let state = match ai::perform_pet_action_internal(app, pet_id, action) {
+                Ok(state) => state,
+                Err(error) => {
+                    let _ = app.emit(
+                        "pet://context-error",
+                        serde_json::json!({"petId": pet_id, "message": error}),
+                    );
+                    return Ok(());
+                }
+            };
+            let _ = app.emit(
+                "pet://context-action",
+                serde_json::json!({"petId": pet_id, "instanceId": instance_id, "action": action, "state": state}),
+            );
+        }
+        "sleep" | "wake" => {
             let state = match action {
-                "feed" | "play" => ai::perform_pet_action_internal(app, pet_id, action)?,
                 "sleep" => ai::sleep_pet(app.clone(), pet_id.to_string())?,
                 "wake" => ai::wake_pet(app.clone(), pet_id.to_string())?,
                 _ => unreachable!(),
@@ -3702,6 +3938,14 @@ fn handle_pet_context_action(app: &tauri::AppHandle, id: &str) -> Result<(), Str
                 "pet://context-action",
                 serde_json::json!({"petId": pet_id, "instanceId": instance_id, "action": action, "state": state}),
             );
+        }
+        action if let Some(toy) = action.strip_prefix("toy-") => {
+            if let Err(error) = social::play_single_toy(&app, &instance_id, pet_id, toy) {
+                let _ = app.emit(
+                    "pet://context-error",
+                    serde_json::json!({"petId": pet_id, "message": error}),
+                );
+            }
         }
         "petting" => {
             let _ = ai::record_petting_internal(app, pet_id)?;
@@ -3923,42 +4167,76 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             } else if id == "check-update" {
                 let app_for_check = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    match check_for_updates(app_for_check.clone()).await {
-                        Ok(check) if check.update_available => {
-                            let release_url = check.url.clone();
-                            app_for_check
-                                .dialog()
-                                .message(format!(
-                                    "发现新版本 {}（当前 {}）。前往 GitHub 查看发布说明并下载？",
-                                    check.latest, check.current
-                                ))
-                                .title("发现更新")
-                                .buttons(MessageDialogButtons::OkCancel)
-                                .show(move |open| {
-                                    if open {
-                                        let _ = app_for_check.opener().open_url(release_url, None::<&str>);
-                                    }
-                                });
+                    let installed = app_for_check.package_info().version.to_string();
+                    let update_result = match app_for_check.updater() {
+                        Ok(updater) => updater.check().await,
+                        Err(error) => Err(error),
+                    };
+                    match update_result {
+                        Ok(Some(update)) => {
+                            let latest = update.version.clone();
+                            #[cfg(target_os = "windows")]
+                            {
+                                let app_for_install = app_for_check.clone();
+                                app_for_install
+                                    .dialog()
+                                    .message(format!(
+                                        "发现新版本 {}（当前 {}）。立即下载并安装？",
+                                        latest, installed
+                                    ))
+                                    .title("发现更新")
+                                    .buttons(MessageDialogButtons::OkCancel)
+                                    .show(move |install| {
+                                        if install {
+                                            let updater_app = app_for_install.clone();
+                                            tauri::async_runtime::spawn(async move {
+                                                match update
+                                                    .download_and_install(|_| {}, |_, _| {})
+                                                    .await
+                                                {
+                                                    Ok(()) => updater_app.restart(),
+                                                    Err(error) => {
+                                                        updater_app
+                                                            .dialog()
+                                                            .message(format!(
+                                                                "更新下载失败：{error}。\n你可以前往 GitHub 手动下载。"
+                                                            ))
+                                                            .title("更新失败")
+                                                            .show(|_| {});
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    });
+                            }
+                            #[cfg(not(target_os = "windows"))]
+                            {
+                                let release_url = UPDATE_RELEASE_URL;
+                                app_for_check
+                                    .dialog()
+                                    .message(format!(
+                                        "发现新版本 {}（当前 {}）。前往 GitHub 下载？",
+                                        latest, installed
+                                    ))
+                                    .title("发现更新")
+                                    .buttons(MessageDialogButtons::OkCancel)
+                                    .show(move |open| {
+                                        if open {
+                                            let _ = app_for_check
+                                                .opener()
+                                                .open_url(release_url, None::<&str>);
+                                        }
+                                    });
+                            }
                         }
-                        Ok(check) => {
+                        Ok(None) => {
                             app_for_check
                                 .dialog()
-                                .message(format!("已是最新版本（{}）。", check.current))
+                                .message(format!("已是最新版本（{installed}）。"))
                                 .title("检查更新")
                                 .show(|_| {});
                         }
-                        Err(error) => {
-                            app_for_check
-                                .dialog()
-                                .message(format!("{error}\n你可以手动前往 GitHub 查看最新发布。"))
-                                .title("检查更新")
-                                .buttons(MessageDialogButtons::OkCancel)
-                                .show(move |open| {
-                                    if open {
-                                        let _ = app_for_check.opener().open_url(UPDATE_RELEASE_URL, None::<&str>);
-                                    }
-                                });
-                        }
+                        Err(_) => show_github_update_flow(&app_for_check).await,
                     }
                 });
             } else if let Some(pet_id) = id.strip_prefix("add-pet:") {
@@ -4106,6 +4384,47 @@ async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateCheck, String>
     })
 }
 
+/// Advisory "check update" flow used where the updater plugin is unavailable
+/// (dev builds without updater artifacts) or on platforms that do not
+/// auto-install (macOS / Linux): notify and offer the release page.
+async fn show_github_update_flow(app: &tauri::AppHandle) {
+    let app = app.clone();
+    match check_for_updates(app.clone()).await {
+        Ok(check) if check.update_available => {
+            let release_url = check.url.clone();
+            app.dialog()
+                .message(format!(
+                    "发现新版本 {}（当前 {}）。前往 GitHub 查看发布说明并下载？",
+                    check.latest, check.current
+                ))
+                .title("发现更新")
+                .buttons(MessageDialogButtons::OkCancel)
+                .show(move |open| {
+                    if open {
+                        let _ = app.opener().open_url(release_url, None::<&str>);
+                    }
+                });
+        }
+        Ok(check) => {
+            app.dialog()
+                .message(format!("已是最新版本（{}）。", check.current))
+                .title("检查更新")
+                .show(|_| {});
+        }
+        Err(error) => {
+            app.dialog()
+                .message(format!("{error}\n你可以手动前往 GitHub 查看最新发布。"))
+                .title("检查更新")
+                .buttons(MessageDialogButtons::OkCancel)
+                .show(move |open| {
+                    if open {
+                        let _ = app.opener().open_url(UPDATE_RELEASE_URL, None::<&str>);
+                    }
+                });
+        }
+    }
+}
+
 #[tauri::command]
 fn look_direction(app: tauri::AppHandle, window_label: String) -> Option<u8> {
     let cursor = app.cursor_position().ok()?;
@@ -4156,6 +4475,7 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // Register state before the runtime creates configured WebViews. A
         // page can execute JavaScript before the setup hook is entered.
         .manage(AppState::new())
@@ -4281,6 +4601,7 @@ pub fn run() {
             toggle_pet_pause,
             set_pet_enabled,
             import_pet_package,
+            export_pet_package,
             remove_imported_pet,
             ai::get_ai_settings,
             ai::update_ai_settings,
@@ -4468,5 +4789,25 @@ mod tests {
         .expect("manifest parsing is independent from path validation");
         let clip = &manifest.clips["escape"];
         assert!(validate_animation_clip("escape", clip, &[0u8; 1]).is_err());
+    }
+
+    #[test]
+    fn pet_export_contains_identity_and_actions_but_not_app_state() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../public/pets/sakimiao");
+        let entries = collect_pet_export_entries(&root, "sakimiao")
+            .expect("the bundled starter pet should be exportable");
+        let names: HashSet<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert!(names.contains("pet.json"));
+        assert!(names.contains("spritesheet.webp"));
+        assert!(names.contains("character.json"));
+        assert!(names.contains("animations.json"));
+        assert!(names.contains("animations/sleep.webp"));
+        assert!(!names.iter().any(|name| {
+            name.contains("memory")
+                || name.contains("messages")
+                || name.contains("state")
+                || name.contains("config")
+        }));
     }
 }

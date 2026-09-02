@@ -198,7 +198,7 @@ export class PetEngine {
       if (next < clip.manifest.frames) {
         this.clipFrame = next;
       } else if (clip.manifest.loop) {
-        this.clipFrame = 0;
+        this.clipFrame = clip.manifest.loopStart ?? 0;
       } else {
         this.activeClip = null;
         this.clipFrame = 0;
@@ -211,7 +211,10 @@ export class PetEngine {
   }
 
   private readonly tick = (now: number): void => {
-    const dt = now - this.lastTick;
+    // A stalled render loop (IPC burst, compositor pressure) can hand the next
+    // frame a huge delta. Capping it prevents the animation from fast-forwarding
+    // several frames at once, which reads as a stutter.
+    const dt = Math.min(now - this.lastTick, 120);
     this.lastTick = now;
 
     if (this.activeClip) {

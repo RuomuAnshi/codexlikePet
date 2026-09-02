@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { waitForAppReady } from "./appReady";
 import { confirmDialog } from "./ui/confirm";
 import { CELL_HEIGHT, CELL_WIDTH, type PetManifest } from "./pet/atlas";
@@ -543,6 +544,24 @@ function render(): void {
     });
     actions.append(enable);
 
+    const exportButton = document.createElement("button");
+    exportButton.type = "button";
+    exportButton.className = "secondary-button";
+    exportButton.textContent = "导出宠物";
+    exportButton.title = "导出不包含记忆、聊天记录和应用配置的宠物包";
+    exportButton.addEventListener("click", async () => {
+      setBusy(exportButton, true);
+      try {
+        await invoke("export_pet_package", { petId: pet.info.id });
+        setStatus("请选择保存位置导出宠物包…");
+      } catch (error) {
+        setStatus(errorMessage(error), "error");
+      } finally {
+        setBusy(exportButton, false);
+      }
+    });
+    actions.append(exportButton);
+
     if (pet.info.source === "imported") {
       const remove = document.createElement("button");
       remove.type = "button";
@@ -643,6 +662,21 @@ function toBase64(bytes: Uint8Array): string {
 }
 
 refreshButton.addEventListener("click", () => void reloadAll());
+void listen<{
+  petId: string;
+  cancelled?: boolean;
+  path?: string;
+  error?: string;
+}>("pet://pet-export-finished", ({ payload }) => {
+  if (payload.error) {
+    setStatus(payload.error, "error");
+  } else if (payload.cancelled) {
+    setStatus("已取消导出宠物包");
+  } else if (payload.path) {
+    const fileName = payload.path.split(/[\\/]/).pop() || `${payload.petId}.zip`;
+    setStatus(`已导出 ${fileName}（不含记忆和聊天记录）`);
+  }
+}).catch((error) => setStatus(errorMessage(error), "error"));
 openAiSettingsButton.addEventListener("click", async () => {
   setBusy(openAiSettingsButton, true);
   try {

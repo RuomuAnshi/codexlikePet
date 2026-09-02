@@ -1,0 +1,8 @@
+{
+  "id": "plush",
+  "version": 1,
+  "name": "毛绒玩具",
+  "asset": "sprite.svg",
+  "hitbox": { "type": "circle", "radius": 20 },
+  "behaviors": ["carry", "tug", "steal", "pass", "comfort", "share"]
+}

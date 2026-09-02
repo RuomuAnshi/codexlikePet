@@ -140,6 +140,9 @@ pub(crate) struct PetLifeState {
     pub pet_interaction_count: u64,
     pub next_action_at: u64,
     pub unlocked_milestones: Vec<String>,
+    pub food: u8,
+    pub food_progress_ms: u64,
+    pub toy_ids: Vec<String>,
 }
 
 impl Default for PetLifeState {
@@ -172,6 +175,9 @@ impl Default for PetLifeState {
             pet_interaction_count: 0,
             next_action_at: 0,
             unlocked_milestones: Vec::new(),
+            food: 3,
+            food_progress_ms: 0,
+            toy_ids: vec!["plush".to_string()],
         }
     }
 }
@@ -726,6 +732,15 @@ fn advance_pet_life_state_with_settings(
             .saturating_sub(attention_periods.min(100) as u8);
     }
 
+    // Snacks regenerate passively (one every 8h, capped at 5) so feeding is a
+    // consumable rather than an endless button.
+    let food_elapsed = state.food_progress_ms.saturating_add(elapsed);
+    let food_ticks = food_elapsed / (8 * 3_600_000);
+    state.food_progress_ms = food_elapsed % (8 * 3_600_000);
+    if food_ticks > 0 {
+        state.food = state.food.saturating_add(food_ticks.min(5) as u8).min(5);
+    }
+
     if state.last_interaction_at > 0 {
         let decay_start = state.last_interaction_at.saturating_add(3 * 24 * 3_600_000);
         let decay_cursor = state.last_bond_decay_at.max(decay_start);
@@ -753,6 +768,16 @@ fn advance_pet_life_state_with_settings(
 
     state.relationship_level = relationship_level(state.bond);
     state.peak_bond = state.peak_bond.max(state.bond);
+    // Toy ownership grows with the bond: friends share more toys.
+    let mut toys = vec!["plush".to_string()];
+    if state.relationship_level >= 2 {
+        toys.push("football".to_string());
+    }
+    if state.relationship_level >= 3 {
+        toys.push("ribbon".to_string());
+    }
+    toys.sort();
+    state.toy_ids = toys;
     refresh_mood_label(state);
 }
 
@@ -930,6 +955,8 @@ fn emit_interaction_feedback(
             "moodValue": state.mood_value,
             "energy": state.energy,
             "attention": state.attention,
+            "food": state.food,
+            "toys": state.toy_ids,
         }),
     );
 }
@@ -957,6 +984,9 @@ pub(crate) fn perform_pet_action_internal(
         "feed" | "play" | "sleep" | "wake" => {}
         _ => return Err("不支持的宠物动作".to_string()),
     }
+    if action == "feed" && current.food == 0 {
+        return Err("零食盒空了，陪它玩一会儿，它会自己找回一些零食。".to_string());
+    }
     if action == "sleep" {
         super::social::cancel_scenes_for_pet(app, pet_id);
     }
@@ -969,6 +999,8 @@ pub(crate) fn perform_pet_action_internal(
         state.last_bond_decay_at = now;
         match action.as_str() {
             "feed" => {
+                state.food = state.food.saturating_sub(1);
+                state.food_progress_ms = 0;
                 state.energy = state.energy.saturating_add(15).min(100);
                 state.attention = state.attention.saturating_add(4).min(100);
                 state.bond = state.bond.saturating_add(1).min(100);
@@ -1216,6 +1248,7 @@ fn prompt_for(
     summary: &str,
     state: &PetLifeState,
     query: &str,
+    animation_clips: &[String],
 ) -> String {
     let mut prompt = String::from(
         "你是 SakiPet 桌面宠物。你只能进行聊天和陪伴，不执行文件、Shell、系统控制或网络工具。\n\n",
@@ -1269,9 +1302,14 @@ fn prompt_for(
         state.chat_count,
         state.pet_interaction_count,
     ));
-    prompt.push_str(
-        "回复要求：使用自然简短的中文，保持角色语气。只返回 JSON，不要 Markdown 或解释，格式为 {\"say\":\"要说的话\",\"action\":\"idle|waving|jumping|failed|waiting|running|review|walk|sleep\",\"mode\":\"idle|working|waiting|sleeping|null\",\"gesture\":\"yawn|wake|ear-twitch|tail-swish|groom|celebrate|startled|null\",\"mood\":\"当前心情\",\"look\":\"up|up-right|right|down-right|down|down-left|left|up-left|null\",\"duration\":5200,\"nextActionAfter\":1800}。mode 表示持续状态，gesture 表示一次性逐帧动作；只有资源存在时才使用 gesture。普通聊天优先使用 idle，只有确实适合时才选择动作；不要凭空描述用户没有提供或观察到的事实。",
-    );
+    let gesture_options = if animation_clips.is_empty() {
+        "null".to_string()
+    } else {
+        format!("{}|null", animation_clips.join("|"))
+    };
+    prompt.push_str(&format!(
+        "回复要求：使用自然简短的中文，保持角色语气。只返回 JSON，不要 Markdown 或解释，格式为 {{\"say\":\"要说的话\",\"action\":\"idle|waving|jumping|failed|waiting|running|review|walk|sleep\",\"mode\":\"idle|working|waiting|sleeping|null\",\"gesture\":\"{gesture_options}\",\"mood\":\"当前心情\",\"look\":\"up|up-right|right|down-right|down|down-left|left|up-left|null\",\"duration\":5200,\"nextActionAfter\":1800}}。mode 表示持续状态，gesture 表示一次性逐帧动作；只能从上面列出的本宠物已安装动作 ID 中选择 gesture。普通聊天优先使用 idle，只有确实适合时才选择动作；不要凭空描述用户没有提供或观察到的事实。"
+    ));
     if !card.post_history_instructions.is_empty() {
         prompt.push_str(&format!(
             "\n\n历史后指令：\n{}",
@@ -1312,6 +1350,8 @@ fn pet_conversation_prompt(
     second_card: &CharacterCard,
     second_memories: &[MemoryFact],
     second_state: &PetLifeState,
+    first_animation_clips: &[String],
+    second_animation_clips: &[String],
 ) -> String {
     let first_context = prompt_for(
         first_card,
@@ -1321,6 +1361,7 @@ fn pet_conversation_prompt(
         "",
         first_state,
         "和另一只桌面宠物交谈",
+        first_animation_clips,
     );
     let second_context = prompt_for(
         second_card,
@@ -1330,6 +1371,7 @@ fn pet_conversation_prompt(
         "",
         second_state,
         "和另一只桌面宠物交谈",
+        second_animation_clips,
     );
     let first_style = speech_style_directive(first_card);
     let second_style = speech_style_directive(second_card);
@@ -1340,7 +1382,7 @@ fn pet_conversation_prompt(
          宠物 A 的说话要求：{first_style}\n\n\
          宠物 B（{second_name}，id: {second_id}）的角色上下文：\n{second_context}\n\
          宠物 B 的说话要求：{second_style}\n\n\
-         只返回 JSON，不要 Markdown，格式为：{{\"first\":{{\"say\":\"A 的台词\",\"action\":\"idle|waving|jumping|failed|waiting|running|review|walk|sleep\",\"mode\":\"idle|working|waiting|sleeping|null\",\"gesture\":\"yawn|wake|ear-twitch|tail-swish|groom|celebrate|startled|null\",\"mood\":\"心情\",\"look\":\"up|up-right|right|down-right|down|down-left|left|up-left|null\",\"duration\":5200,\"nextActionAfter\":1800}},\"second\":{{\"say\":\"B 的台词\",\"action\":\"idle|waving|jumping|failed|waiting|running|review|walk|sleep\",\"mode\":\"idle|working|waiting|sleeping|null\",\"gesture\":\"yawn|wake|ear-twitch|tail-swish|groom|celebrate|startled|null\",\"mood\":\"心情\",\"look\":\"up|up-right|right|down-right|down|down-left|left|up-left|null\",\"duration\":5200,\"nextActionAfter\":1800}}}}。",
+         只返回 JSON，不要 Markdown，格式为：{{\"first\":{{\"say\":\"A 的台词\",\"action\":\"idle|waving|jumping|failed|waiting|running|review|walk|sleep\",\"mode\":\"idle|working|waiting|sleeping|null\",\"gesture\":\"各自已安装动作 ID|null\",\"mood\":\"心情\",\"look\":\"up|up-right|right|down-right|down|down-left|left|up-left|null\",\"duration\":5200,\"nextActionAfter\":1800}},\"second\":{{\"say\":\"B 的台词\",\"action\":\"idle|waving|jumping|failed|waiting|running|review|walk|sleep\",\"mode\":\"idle|working|waiting|sleeping|null\",\"gesture\":\"各自已安装动作 ID|null\",\"mood\":\"心情\",\"look\":\"up|up-right|right|down-right|down|down-left|left|up-left|null\",\"duration\":5200,\"nextActionAfter\":1800}}}}。A 只能选择动作 A 已安装的 ID，B 只能选择动作 B 已安装的 ID。",
     )
 }
 
@@ -2267,6 +2309,7 @@ async fn run_chat_task(
         .clone()
         .ok_or_else(|| "尚未配置聊天模型".to_string())?;
     let card = card_for_pet(&app, &pet_id)?;
+    let animation_clips = super::animation_clip_ids(&app, &pet_id);
     let mut messages = load_messages(&app, &pet_id)?;
     let user_message = ChatMessage {
         id: format!("message-{}", now_ms()),
@@ -2294,6 +2337,7 @@ async fn run_chat_task(
         &load_summary(&app, &pet_id),
         &state,
         &content,
+        &animation_clips,
     );
     prompt.push_str(&desktop_context_prompt(&app, &config, &pet_id));
     let recent = history_for_prompt(&messages, ai.max_recent_messages);
@@ -3115,6 +3159,7 @@ async fn run_heartbeat(app: tauri::AppHandle, pet_id: String) -> Result<(), Stri
         .clone()
         .ok_or_else(|| "尚未配置聊天模型".to_string())?;
     let card = card_for_pet(&app, &pet_id)?;
+    let animation_clips = super::animation_clip_ids(&app, &pet_id);
     let messages = load_messages(&app, &pet_id)?;
     if messages
         .last()
@@ -3139,6 +3184,7 @@ async fn run_heartbeat(app: tauri::AppHandle, pet_id: String) -> Result<(), Stri
         &load_summary(&app, &pet_id),
         &state,
         "heartbeat",
+        &animation_clips,
     );
     prompt.push_str(&desktop_context_prompt(&app, &config, &pet_id));
     prompt.push_str("\n\n这是一次安静的 heartbeat。只有在确实有自然、和当前关系有关的话可说时才回复；否则让 say 为空。回复最多 80 个中文字符，不要提及你是模型。");
@@ -3509,6 +3555,8 @@ async fn run_pet_conversation(
         .ok_or_else(|| "尚未配置聊天模型".to_string())?;
     let first_card = card_for_pet(&app, &first_id)?;
     let second_card = card_for_pet(&app, &second_id)?;
+    let first_animation_clips = super::animation_clip_ids(&app, &first_id);
+    let second_animation_clips = super::animation_clip_ids(&app, &second_id);
     let first_name = super::pet_display_name(&app, &first_id);
     let second_name = super::pet_display_name(&app, &second_id);
     let first_messages = load_messages(&app, &first_id)?;
@@ -3530,6 +3578,8 @@ async fn run_pet_conversation(
         &second_card,
         &second_memories,
         &second_state,
+        &first_animation_clips,
+        &second_animation_clips,
     );
     if let Ok(pair) = load_pair_relationship(&app, &first_id, &second_id) {
         prompt.push_str(&format!(
@@ -4134,9 +4184,34 @@ mod tests {
             creator_notes: "不应该发给模型".to_string(),
             ..CharacterCard::default()
         };
-        let prompt = prompt_for(&card, "saki", "", &[], "", &PetLifeState::default(), "");
+        let prompt = prompt_for(
+            &card,
+            "saki",
+            "",
+            &[],
+            "",
+            &PetLifeState::default(),
+            "",
+            &[],
+        );
         assert!(prompt.find("只能进行聊天").unwrap() < prompt.find("角色提示").unwrap());
         assert!(!prompt.contains("不应该发给模型"));
+    }
+
+    #[test]
+    fn prompt_lists_only_animation_clips_installed_for_this_pet() {
+        let prompt = prompt_for(
+            &CharacterCard::default(),
+            "anon",
+            "",
+            &[],
+            "",
+            &PetLifeState::default(),
+            "闲聊",
+            &["stretch".to_string(), "yawn".to_string()],
+        );
+        assert!(prompt.contains("\"gesture\":\"stretch|yawn|null\""));
+        assert!(!prompt.contains("ear-twitch"));
     }
 
     #[test]

@@ -270,14 +270,15 @@ impl From<&SocialRelationshipFile> for PublicRelationship {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
 pub(crate) struct SocialLogEntry {
     pub id: String,
     pub timestamp: u64,
     pub participants: Vec<String>,
     pub interaction_type: String,
     pub trigger: String,
+    pub prop: Option<String>,
     pub dialogue: Vec<SocialLogDialogue>,
     pub milestones: Vec<String>,
     pub outcome: String,
@@ -424,11 +425,7 @@ fn pair_key(first: &str, second: &str) -> Result<(String, String, String), Strin
     } else {
         (second.to_string(), first.to_string())
     };
-    Ok((
-        format!("{first}--{second}"),
-        first.clone(),
-        second.clone(),
-    ))
+    Ok((format!("{first}--{second}"), first.clone(), second.clone()))
 }
 
 fn social_root(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -535,11 +532,7 @@ fn save_relationship(
     app: &tauri::AppHandle,
     relationship: &SocialRelationshipFile,
 ) -> Result<(), String> {
-    let path = relationship_path(
-        app,
-        &relationship.first_pet_id,
-        &relationship.second_pet_id,
-    )?;
+    let path = relationship_path(app, &relationship.first_pet_id, &relationship.second_pet_id)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("无法创建关系目录: {error}"))?;
     }
@@ -624,6 +617,8 @@ fn scene_options(participant_count: usize) -> &'static [&'static str] {
             "group-cheer",
             "group-nap",
             "toy-scramble",
+            "pass",
+            "share-snack",
         ]
     } else {
         &[
@@ -643,6 +638,9 @@ fn scene_options(participant_count: usize) -> &'static [&'static str] {
             "comfort",
             "reconcile",
             "group-nap",
+            "kick-and-chase",
+            "pass",
+            "fetch",
         ]
     }
 }
@@ -656,12 +654,45 @@ fn valid_scene(value: &str, count: usize) -> Option<String> {
 }
 
 fn valid_prop(value: Option<&str>) -> Option<String> {
-    match value.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
-        "ball" | "ribbon" | "snack" | "toy" => {
-            Some(value.unwrap().trim().to_ascii_lowercase())
-        }
+    match value
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        // `ball` and `toy` were used by the first social prototype. Keep
+        // accepting them in character cards and model responses, but map
+        // them to the named built-in resources.
+        "ball" | "football" => Some("football".to_string()),
+        "snack" => Some("snack".to_string()),
+        "plush" | "toy" => Some("plush".to_string()),
+        "ribbon" => Some("ribbon".to_string()),
         _ => None,
     }
+}
+
+fn prop_radius(prop: &str) -> f64 {
+    match prop {
+        "football" => 18.0,
+        "snack" => 16.0,
+        "plush" => 20.0,
+        "ribbon" => 18.0,
+        _ => 18.0,
+    }
+}
+
+fn prop_scene(scene: &str) -> bool {
+    matches!(
+        scene,
+        "kick-and-chase"
+            | "pass"
+            | "fetch"
+            | "share-snack"
+            | "tug"
+            | "steal"
+            | "prank"
+            | "toy-scramble"
+    )
 }
 
 fn generic_line(scene: &str, role: &str) -> String {
@@ -688,6 +719,12 @@ fn generic_line(scene: &str, role: &str) -> String {
         ("steal", "thief") => &["这个玩具归我啦。"],
         ("steal", _) => &["还给我！那是我的。"],
         ("share-snack", _) => &["一人一半，公平吧？"],
+        ("kick-and-chase", "kicker") => &["接住！我踢过去了！", "快追上它！"],
+        ("kick-and-chase", _) => &["等等我！球滚远了！", "这次换我来！"],
+        ("pass", "passer") => &["传给你！", "准备好了吗？"],
+        ("pass", _) => &["接到了！再传回来！", "好球！"],
+        ("fetch", "thrower") => &["去把它捡回来！", "看我扔得多远！"],
+        ("fetch", _) => &["我马上回来！", "抓到啦！"],
         ("comfort", "comforter") => &["别难过，我陪着你。"],
         ("comfort", _) => &["嗯……谢谢你。"],
         ("reconcile", _) => &["刚才的事，就算和好啦。"],
@@ -705,70 +742,17 @@ fn generic_line(scene: &str, role: &str) -> String {
 
 fn role_for(scene: &str, index: usize) -> String {
     match scene {
-        "chase" | "tag" | "chain-chase" => {
-            if index == 0 {
-                "chaser"
-            } else {
-                "runner"
-            }
-            .to_string()
-        }
-        "stack" => {
-            if index == 0 {
-                "base"
-            } else {
-                "top"
-            }
-            .to_string()
-        }
-        "tug" => {
-            if index == 0 {
-                "winner"
-            } else {
-                "challenger"
-            }
-            .to_string()
-        }
-        "steal" => {
-            if index == 0 {
-                "thief"
-            } else {
-                "owner"
-            }
-            .to_string()
-        }
-        "prank" => {
-            if index == 0 {
-                "prankster"
-            } else {
-                "target"
-            }
-            .to_string()
-        }
-        "comfort" => {
-            if index == 0 {
-                "comforter"
-            } else {
-                "comforted"
-            }
-            .to_string()
-        }
-        "greet" | "parade" => {
-            if index == 0 {
-                "leader"
-            } else {
-                "friend"
-            }
-            .to_string()
-        }
-        _ => {
-            if index == 0 {
-                "leader"
-            } else {
-                "friend"
-            }
-            .to_string()
-        }
+        "chase" | "tag" | "chain-chase" => if index == 0 { "chaser" } else { "runner" }.to_string(),
+        "stack" => if index == 0 { "base" } else { "top" }.to_string(),
+        "tug" => if index == 0 { "winner" } else { "challenger" }.to_string(),
+        "steal" => if index == 0 { "thief" } else { "owner" }.to_string(),
+        "kick-and-chase" => if index == 0 { "kicker" } else { "chaser" }.to_string(),
+        "pass" => if index == 0 { "passer" } else { "receiver" }.to_string(),
+        "fetch" => if index == 0 { "thrower" } else { "fetcher" }.to_string(),
+        "prank" => if index == 0 { "prankster" } else { "target" }.to_string(),
+        "comfort" => if index == 0 { "comforter" } else { "comforted" }.to_string(),
+        "greet" | "parade" => if index == 0 { "leader" } else { "friend" }.to_string(),
+        _ => if index == 0 { "leader" } else { "friend" }.to_string(),
     }
 }
 
@@ -790,7 +774,11 @@ fn local_dialogue(
     }
     if let Some(partner) = partner {
         if let Some(relationship) = social.relationships.get(partner) {
-            if let Some(lines) = relationship.dialogue.get(key).filter(|lines| !lines.is_empty()) {
+            if let Some(lines) = relationship
+                .dialogue
+                .get(key)
+                .filter(|lines| !lines.is_empty())
+            {
                 return lines[rand::rng().random_range(0..lines.len())]
                     .chars()
                     .take(SOCIAL_EVENT_MAX_CHARS)
@@ -811,7 +799,10 @@ fn snapshots(app: &tauri::AppHandle, config: &AppConfig) -> Vec<Snapshot> {
             runtime
                 .iter()
                 .filter_map(|(instance_id, state)| {
-                    state.position.clone().map(|position| (instance_id.clone(), position))
+                    state
+                        .position
+                        .clone()
+                        .map(|position| (instance_id.clone(), position))
                 })
                 .collect::<HashMap<_, _>>()
         })
@@ -824,7 +815,10 @@ fn snapshots(app: &tauri::AppHandle, config: &AppConfig) -> Vec<Snapshot> {
                 && settings.social_enabled
                 && !settings.paused
                 && !settings.quiet_mode
-                && !config.disabled_pet_ids.iter().any(|id| id == &instance.pet_id)
+                && !config
+                    .disabled_pet_ids
+                    .iter()
+                    .any(|id| id == &instance.pet_id)
         })
         .filter_map(|instance| {
             let label = super::instance_label(&instance.id).ok()?;
@@ -864,7 +858,10 @@ fn choose_candidates(
     let available = snapshots(app, config);
     if !requested.is_empty() {
         let mut selected = Vec::new();
-        for pet_id in requested.iter().take(config.social.max_participants as usize) {
+        for pet_id in requested
+            .iter()
+            .take(config.social.max_participants as usize)
+        {
             if let Some(snapshot) = available.iter().find(|item| &item.pet_id == pet_id) {
                 if !selected
                     .iter()
@@ -930,7 +927,7 @@ fn choose_candidates(
 
 fn scene_prompt(app: &tauri::AppHandle, _config: &AppConfig, actors: &[Snapshot]) -> String {
     let mut prompt = String::from(
-        "你是桌面宠物社交导演。只返回 JSON，不要 Markdown。只能从给出的 petId、场景和道具中选择。不能返回坐标、动画名、工具或数值修改。每句 say 不超过 80 个中文字符。允许的格式：{\"scene\":\"chase\",\"participants\":[{\"petId\":\"...\",\"role\":\"...\",\"say\":\"...\"}],\"prop\":null,\"relationshipSignals\":[{\"from\":\"...\",\"to\":\"...\",\"change\":\"fondness|jealous|rivalry|trust|resentment|romance|breakup|reconcile\"}]}。恋爱只能用于角色卡明确允许的组合。",
+        "你是桌面宠物社交导演。只返回 JSON，不要 Markdown。只能从给出的 petId、场景和道具中选择。不能返回坐标、速度、动画名、工具或数值修改。每句 say 不超过 80 个中文字符。内置道具只有 football（足球）、snack（零食）、plush（毛绒玩具），也可以不使用道具。足球适合 kick-and-chase、pass、fetch；零食适合 share-snack；毛绒玩具适合 tug、steal、toy-scramble。允许的格式：{\"scene\":\"kick-and-chase\",\"participants\":[{\"petId\":\"...\",\"role\":\"...\",\"say\":\"...\"}],\"prop\":\"football\",\"relationshipSignals\":[{\"from\":\"...\",\"to\":\"...\",\"change\":\"fondness|jealous|rivalry|trust|resentment|romance|breakup|reconcile\"}]}。恋爱只能用于角色卡明确允许的组合。",
     );
     prompt.push_str("\n宠物：\n");
     for actor in actors {
@@ -1037,9 +1034,7 @@ async fn choose_scene_with_ai(
             return None;
         }
         Err(_) => {
-            log_ai_fallback(&format!(
-                "请求超过 {SOCIAL_DIRECTOR_TIMEOUT_SECS} 秒"
-            ));
+            log_ai_fallback(&format!("请求超过 {SOCIAL_DIRECTOR_TIMEOUT_SECS} 秒"));
             return None;
         }
     };
@@ -1056,11 +1051,7 @@ async fn choose_scene_with_ai(
     }
 }
 
-fn fallback_scene(
-    app: &tauri::AppHandle,
-    candidates: &[Snapshot],
-    trigger: &str,
-) -> String {
+fn fallback_scene(app: &tauri::AppHandle, candidates: &[Snapshot], trigger: &str) -> String {
     const PROXIMITY_SCENES: &[&str] = &["greet", "whisper", "nuzzle", "bump"];
     if trigger == "proximity" {
         let mut pair = candidates
@@ -1069,7 +1060,8 @@ fn fallback_scene(
             .collect::<Vec<_>>();
         pair.sort_unstable();
         let pair_key = pair.join("\u{1f}");
-        if let Ok(mut previous_scenes) = app.state::<AppState>().social.last_proximity_scenes.lock() {
+        if let Ok(mut previous_scenes) = app.state::<AppState>().social.last_proximity_scenes.lock()
+        {
             let previous = previous_scenes.get(&pair_key).map(String::as_str);
             let choices = PROXIMITY_SCENES
                 .iter()
@@ -1098,8 +1090,7 @@ fn compile_decision(
     Vec<ModelRelationshipSignal>,
     Vec<(String, String, String)>,
 ) {
-    let candidate_ids: HashSet<&str> =
-        candidates.iter().map(|item| item.pet_id.as_str()).collect();
+    let candidate_ids: HashSet<&str> = candidates.iter().map(|item| item.pet_id.as_str()).collect();
     if let Some(decision) = decision {
         let mut actors = Vec::new();
         for actor in decision.participants {
@@ -1111,11 +1102,7 @@ fn compile_decision(
                 continue;
             }
             let role = actor.role.trim();
-            let role = if role.is_empty() {
-                "friend"
-            } else {
-                role
-            };
+            let role = if role.is_empty() { "friend" } else { role };
             actors.push((
                 actor.pet_id,
                 role.chars().take(32).collect(),
@@ -1160,9 +1147,9 @@ fn compile_decision(
 
 fn default_prop(scene: &str) -> Option<String> {
     match scene {
-        "chase" | "tag" | "tug" | "steal" | "toy-scramble" => Some("toy".to_string()),
+        "kick-and-chase" | "pass" | "fetch" | "chase" => Some("football".to_string()),
         "share-snack" => Some("snack".to_string()),
-        "prank" => Some("ribbon".to_string()),
+        "tug" | "steal" | "toy-scramble" | "prank" => Some("plush".to_string()),
         _ => None,
     }
 }
@@ -1189,7 +1176,7 @@ fn target_positions(scene: &str, candidates: &[Snapshot]) -> Vec<PetPosition> {
         let first_height = candidates[0].bounds.height();
         let second_height = candidates[1].bounds.height();
         return match scene {
-            "chase" | "tag" => vec![
+            "chase" | "tag" | "kick-and-chase" | "pass" | "fetch" => vec![
                 PetPosition {
                     x: if direction > 0.0 {
                         center_x - (first_width + second_width + SOCIAL_COLLISION_GAP + 180.0) / 2.0
@@ -1307,8 +1294,10 @@ fn build_plan(
     let scene_id = next_scene_id();
     let (scene, model_prop, relationship_signals, dialogue) =
         compile_decision(app, &candidates, decision, &trigger);
-    let selected_ids: HashSet<&str> =
-        dialogue.iter().map(|(pet_id, _, _)| pet_id.as_str()).collect();
+    let selected_ids: HashSet<&str> = dialogue
+        .iter()
+        .map(|(pet_id, _, _)| pet_id.as_str())
+        .collect();
     let mut selected: Vec<Snapshot> = candidates
         .iter()
         .filter(|candidate| selected_ids.contains(candidate.pet_id.as_str()))
@@ -1344,13 +1333,7 @@ fn build_plan(
                         .map(|candidate| candidate.pet_id.as_str());
                     (
                         role.clone(),
-                        local_dialogue(
-                            app,
-                            &snapshot.pet_id,
-                            &scene,
-                            &role,
-                            partner,
-                        ),
+                        local_dialogue(app, &snapshot.pet_id, &scene, &role, partner),
                     )
                 });
             PlannedActor {
@@ -1374,7 +1357,14 @@ fn build_plan(
             })
             .max()
             .unwrap_or(900);
-    let prop = if settings.props_enabled { model_prop } else { None };
+    // A model may omit `prop` even when it picked a prop-oriented scene. The
+    // local template remains authoritative so built-in interactions never
+    // degrade into an empty scene because of a partial model response.
+    let prop = if settings.props_enabled {
+        model_prop.or_else(|| default_prop(&scene))
+    } else {
+        None
+    };
     ScenePlan {
         scene_id,
         scene,
@@ -1464,7 +1454,12 @@ fn actor_center(actor: &PlannedActor, position: &PetPosition) -> (f64, f64) {
 /// conversation partner. For a group, face the centre of the other actors.
 /// Dynamic positions are used by chase scenes; regular scenes use their
 /// collision-resolved targets.
-fn phase_look(plan: &ScenePlan, index: usize, phase: &str, positions: Option<&[PetPosition]>) -> String {
+fn phase_look(
+    plan: &ScenePlan,
+    index: usize,
+    phase: &str,
+    positions: Option<&[PetPosition]>,
+) -> String {
     let actor = &plan.actors[index];
     let current_position = if phase == "approach" {
         &actor.snapshot.position
@@ -1524,7 +1519,7 @@ fn phase_actors_at(
                 "approach" => "walking",
                 "face" => "idle",
                 "interaction" => match plan.scene.as_str() {
-                    "sync-jump" | "group-cheer" => "jumping",
+                    "sync-jump" | "group-cheer" | "kick-and-chase" | "pass" | "fetch" => "jumping",
                     "group-nap" => "waiting",
                     _ => "waving",
                 },
@@ -1540,7 +1535,9 @@ fn phase_actors_at(
                     match plan.scene.as_str() {
                         "nuzzle" | "comfort" | "reconcile" => "heart",
                         "sync-jump" | "group-cheer" => "star",
+                        "kick-and-chase" | "pass" | "fetch" => "star",
                         "chase" | "tag" | "toy-scramble" => "dust",
+                        "share-snack" => "food",
                         _ => "sparkle",
                     }
                     .to_string()
@@ -1564,10 +1561,7 @@ async fn sleep_or_cancel(duration: Duration, cancel: &AtomicBool) -> bool {
         if now >= deadline {
             return true;
         }
-        tokio::time::sleep(
-            (deadline - now).min(Duration::from_millis(SCENE_TICK_MS)),
-        )
-        .await;
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(SCENE_TICK_MS))).await;
     }
 }
 
@@ -1601,10 +1595,7 @@ async fn move_actors(app: &tauri::AppHandle, plan: &ScenePlan, cancel: &AtomicBo
                         positions[move_index].x,
                         positions[move_index].y,
                     ));
-                    let _ = super::reposition_pet_speech(
-                        app,
-                        &actor.snapshot.instance_id,
-                    );
+                    let _ = super::reposition_pet_speech(app, &actor.snapshot.instance_id);
                 }
             }
         }
@@ -1639,12 +1630,10 @@ fn separate_snapshot_positions(positions: &mut [PetPosition], snapshots: &[Snaps
                     right: positions[second].x + snapshots[second].bounds.width(),
                     bottom: positions[second].y + snapshots[second].bounds.height(),
                 };
-                let overlap_x =
-                    (first_rect.right.min(second_rect.right) + SOCIAL_COLLISION_GAP)
-                        - first_rect.left.max(second_rect.left);
-                let overlap_y =
-                    (first_rect.bottom.min(second_rect.bottom) + SOCIAL_COLLISION_GAP)
-                        - first_rect.top.max(second_rect.top);
+                let overlap_x = (first_rect.right.min(second_rect.right) + SOCIAL_COLLISION_GAP)
+                    - first_rect.left.max(second_rect.left);
+                let overlap_y = (first_rect.bottom.min(second_rect.bottom) + SOCIAL_COLLISION_GAP)
+                    - first_rect.top.max(second_rect.top);
                 if overlap_x <= 0.0 || overlap_y <= 0.0 {
                     continue;
                 }
@@ -1654,12 +1643,20 @@ fn separate_snapshot_positions(positions: &mut [PetPosition], snapshots: &[Snaps
                 let first_center_y = (first_rect.top + first_rect.bottom) / 2.0;
                 let second_center_y = (second_rect.top + second_rect.bottom) / 2.0;
                 if overlap_x <= overlap_y {
-                    let direction = if second_center_x >= first_center_x { 1.0 } else { -1.0 };
+                    let direction = if second_center_x >= first_center_x {
+                        1.0
+                    } else {
+                        -1.0
+                    };
                     let push = overlap_x / 2.0;
                     positions[first].x -= direction * push;
                     positions[second].x += direction * push;
                 } else {
-                    let direction = if second_center_y >= first_center_y { 1.0 } else { -1.0 };
+                    let direction = if second_center_y >= first_center_y {
+                        1.0
+                    } else {
+                        -1.0
+                    };
                     let push = overlap_y / 2.0;
                     positions[first].y -= direction * push;
                     positions[second].y += direction * push;
@@ -1676,12 +1673,14 @@ fn clamp_scene_positions(positions: &mut [PetPosition], plan: &ScenePlan) {
     for (position, actor) in positions.iter_mut().zip(plan.actors.iter()) {
         let width = actor.snapshot.bounds.width();
         let height = actor.snapshot.bounds.height();
-        position.x = position
-            .x
-            .clamp(plan.stage.left, (plan.stage.right - width).max(plan.stage.left));
-        position.y = position
-            .y
-            .clamp(plan.stage.top, (plan.stage.bottom - height).max(plan.stage.top));
+        position.x = position.x.clamp(
+            plan.stage.left,
+            (plan.stage.right - width).max(plan.stage.left),
+        );
+        position.y = position.y.clamp(
+            plan.stage.top,
+            (plan.stage.bottom - height).max(plan.stage.top),
+        );
     }
 }
 
@@ -1744,12 +1743,17 @@ async fn run_chase_movement(
     app: &tauri::AppHandle,
     plan: &ScenePlan,
     cancel: &AtomicBool,
+    prop_label: Option<&str>,
 ) -> bool {
     if plan.actors.len() != 2 {
         return move_actors(app, plan, cancel).await;
     }
     let bounds = chase_bounds(plan);
-    let mut chaser = if plan.actors[0].role == "runner" { 1 } else { 0 };
+    let mut chaser = if plan.actors[0].role == "runner" {
+        1
+    } else {
+        0
+    };
     let mut runner = 1 - chaser;
     let mut positions: Vec<PetPosition> = plan
         .actors
@@ -1789,10 +1793,7 @@ async fn run_chase_movement(
                         positions[chase_index].x,
                         positions[chase_index].y,
                     ));
-                    let _ = super::reposition_pet_speech(
-                        app,
-                        &actor.snapshot.instance_id,
-                    );
+                    let _ = super::reposition_pet_speech(app, &actor.snapshot.instance_id);
                 }
             }
         }
@@ -1806,8 +1807,24 @@ async fn run_chase_movement(
             positions[runner].x + runner_bounds.width() / 2.0,
             positions[runner].y + runner_bounds.height() / 2.0,
         );
-        let caught = (runner_center.0 - chaser_center.0)
-            .hypot(runner_center.1 - chaser_center.1)
+        if let Some(label) = prop_label {
+            // Keep the football between the two pets while they run. The
+            // small bob is intentionally local and deterministic; the prop
+            // window itself is still positioned by Rust, not CSS animation.
+            let prop_center = (
+                (chaser_center.0 + runner_center.0) / 2.0,
+                (chaser_center.1 + runner_center.1) / 2.0 - (elapsed as f64 / 180.0).sin() * 8.0,
+            );
+            set_prop_window_position(
+                app,
+                label,
+                PetPosition {
+                    x: prop_center.0 - 36.0,
+                    y: prop_center.1 - 36.0,
+                },
+            );
+        }
+        let caught = (runner_center.0 - chaser_center.0).hypot(runner_center.1 - chaser_center.1)
             < ((chaser_bounds.width() + runner_bounds.width()) / 2.0 + 24.0).max(36.0);
         if caught {
             if !voiced[chaser] {
@@ -1872,7 +1889,10 @@ fn update_runtime_positions(app: &tauri::AppHandle, plan: &ScenePlan, positions:
                 pet_id: actor.snapshot.pet_id.clone(),
                 ..RuntimePetState::default()
             });
-        entry.position = positions.get(index).cloned().or_else(|| Some(actor.target.clone()));
+        entry.position = positions
+            .get(index)
+            .cloned()
+            .or_else(|| Some(actor.target.clone()));
         entry.dragging = false;
         entry.busy = false;
     }
@@ -1915,6 +1935,344 @@ fn create_prop_window(
     Some(label)
 }
 
+fn set_prop_window_position(app: &tauri::AppHandle, label: &str, position: PetPosition) {
+    if let Some(window) = app.get_webview_window(label) {
+        let _ = window.set_position(LogicalPosition::new(position.x, position.y));
+    }
+}
+
+/// Single-pet toy play: the pet owns a toy (inventory), the stats/cooldown of
+/// "play" apply, and a toy prop window bounces in front of the pet before it
+/// catches it. Runs the tween off the main thread so the menu stays responsive.
+pub(super) fn play_single_toy(
+    app: &tauri::AppHandle,
+    instance_id: &str,
+    pet_id: &str,
+    toy: &str,
+) -> Result<(), String> {
+    if !matches!(toy, "football" | "ribbon" | "plush") {
+        return Err("这个玩具还不能玩".to_string());
+    }
+    let state = super::ai::get_pet_state(app.clone(), pet_id.to_string())?;
+    if !state.toy_ids.iter().any(|owned| owned == toy) {
+        return Err("还没有这个玩具，先多陪陪它吧".to_string());
+    }
+    if state.activity == "sleeping" {
+        return Err("它正在睡觉，别吵醒它".to_string());
+    }
+    super::ai::perform_pet_action_internal(app, pet_id, "play")?;
+    let app_for_task = app.clone();
+    let instance_for_task = instance_id.to_string();
+    let pet_for_task = pet_id.to_string();
+    let toy_for_task = toy.to_string();
+    tauri::async_runtime::spawn(async move {
+        run_single_toy_tween(&app_for_task, &instance_for_task, &pet_for_task, &toy_for_task)
+            .await;
+    });
+    Ok(())
+}
+
+async fn run_single_toy_tween(app: &tauri::AppHandle, instance_id: &str, pet_id: &str, toy: &str) {
+    let Some(window) = app
+        .get_webview_window(&super::instance_label(instance_id).unwrap_or_default())
+    else {
+        return;
+    };
+    let (Ok(position), Ok(scale_factor)) = (window.outer_position(), window.scale_factor()) else {
+        return;
+    };
+    let logical: LogicalPosition<f64> = position.to_logical(scale_factor);
+    let scene_id = format!("toy-{pet_id}");
+    // The pet faces left by default, so the toy starts and lands in front of
+    // it (screen-left) and bounces outward from there.
+    let base = PetPosition {
+        x: logical.x - 52.0,
+        y: logical.y + 10.0,
+    };
+    let far = PetPosition {
+        x: (logical.x - 168.0).max(0.0),
+        y: logical.y + 2.0,
+    };
+    let Some(prop_label) = create_prop_window(app, &scene_id, toy, base.clone()) else {
+        return;
+    };
+    let _ = app.emit(
+        "pet://toy-play",
+        serde_json::json!({"petId": pet_id, "toy": toy}),
+    );
+    for target in [far.clone(), base.clone(), far, base.clone()] {
+        tween_toy_window(app, &prop_label, &base, &target, 520).await;
+        if !app.get_webview_window(&prop_label).is_some() {
+            break;
+        }
+    }
+    if let Some(prop) = app.get_webview_window(&prop_label) {
+        let _ = prop.destroy();
+    }
+}
+
+async fn tween_toy_window(
+    app: &tauri::AppHandle,
+    label: &str,
+    from: &PetPosition,
+    to: &PetPosition,
+    duration_ms: u64,
+) {
+    let Some(_window) = app.get_webview_window(label) else {
+        return;
+    };
+    let started = tokio::time::Instant::now();
+    loop {
+        let progress =
+            (started.elapsed().as_secs_f64() / (duration_ms as f64 / 1000.0)).min(1.0);
+        let eased = progress * progress * (3.0 - 2.0 * progress);
+        set_prop_window_position(
+            app,
+            label,
+            PetPosition {
+                x: from.x + (to.x - from.x) * eased,
+                y: from.y + (to.y - from.y) * eased,
+            },
+        );
+        if progress >= 1.0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(SCENE_TICK_MS)).await;
+    }
+}
+
+fn prop_position_for_actor(
+    actor: &PlannedActor,
+    position: &PetPosition,
+    prop: &str,
+) -> PetPosition {
+    let center = actor_center(actor, position);
+    let size = 72.0;
+    let radius = prop_radius(prop);
+    PetPosition {
+        x: center.0 - size / 2.0,
+        y: center.1 - size / 2.0 - (radius - 18.0) * 0.15,
+    }
+}
+
+fn prop_stage_center(plan: &ScenePlan) -> PetPosition {
+    PetPosition {
+        x: (plan.stage.left + plan.stage.right) / 2.0 - 36.0,
+        y: (plan.stage.top + plan.stage.bottom) / 2.0 - 36.0,
+    }
+}
+
+async fn move_prop_window(
+    app: &tauri::AppHandle,
+    label: &str,
+    from: PetPosition,
+    to: PetPosition,
+    bounce_height: f64,
+    duration_ms: u64,
+    cancel: &AtomicBool,
+) -> bool {
+    let started = tokio::time::Instant::now();
+    let duration = Duration::from_millis(duration_ms.max(SCENE_TICK_MS));
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let progress = (started.elapsed().as_secs_f64() / duration.as_secs_f64()).min(1.0);
+        let eased = progress * progress * (3.0 - 2.0 * progress);
+        let lift = (std::f64::consts::PI * progress).sin() * bounce_height;
+        set_prop_window_position(
+            app,
+            label,
+            PetPosition {
+                x: from.x + (to.x - from.x) * eased,
+                y: from.y + (to.y - from.y) * eased - lift,
+            },
+        );
+        if progress >= 1.0 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(SCENE_TICK_MS)).await;
+    }
+}
+
+fn apply_scene_positions(app: &tauri::AppHandle, plan: &ScenePlan, positions: &[PetPosition]) {
+    for (index, actor) in plan.actors.iter().enumerate() {
+        if let (Some(position), Ok(label)) = (
+            positions.get(index),
+            super::instance_label(&actor.snapshot.instance_id),
+        ) {
+            if let Some(window) = app.get_webview_window(&label) {
+                let _ = window.set_position(LogicalPosition::new(position.x, position.y));
+                let _ = super::reposition_pet_speech(app, &actor.snapshot.instance_id);
+            }
+        }
+    }
+}
+
+/// Play a prop-led scene after the pets have run to their shared stage. The
+/// coordinator owns the prop's trajectory; the webview only draws its image.
+/// This keeps the interaction deterministic and makes the same scene work for
+/// two, three, or four pets without trusting model-supplied coordinates.
+async fn run_prop_play(
+    app: &tauri::AppHandle,
+    plan: &ScenePlan,
+    prop_label: &str,
+    cancel: &AtomicBool,
+) -> bool {
+    let Some(prop) = plan.prop.as_deref() else {
+        return true;
+    };
+    let positions = plan
+        .actors
+        .iter()
+        .map(|actor| actor.target.clone())
+        .collect::<Vec<_>>();
+    apply_scene_positions(app, plan, &positions);
+    let mut prop_position = prop_stage_center(plan);
+    set_prop_window_position(app, prop_label, prop_position.clone());
+    emit_phase(app, &plan.scene_id, "face", &phase_actors(plan, "face"));
+    if !sleep_or_cancel(Duration::from_millis(300), cancel).await {
+        return false;
+    }
+
+    let actor_count = plan.actors.len().max(2);
+    match prop {
+        "football" => {
+            let rounds = if plan.scene == "fetch" {
+                2
+            } else {
+                actor_count * 2
+            };
+            for round in 0..rounds {
+                let sender = if plan.scene == "fetch" {
+                    round % 2
+                } else {
+                    round % actor_count
+                };
+                let receiver = if sender + 1 < actor_count {
+                    sender + 1
+                } else {
+                    0
+                };
+                if sender >= plan.actors.len() || receiver >= plan.actors.len() {
+                    continue;
+                }
+                emit_phase(
+                    app,
+                    &plan.scene_id,
+                    "interaction",
+                    &phase_actors_at(plan, "interaction", Some(&positions), Some(sender)),
+                );
+                let from = if round == 0 {
+                    prop_position.clone()
+                } else {
+                    prop_position_for_actor(&plan.actors[sender], &positions[sender], prop)
+                };
+                let to =
+                    prop_position_for_actor(&plan.actors[receiver], &positions[receiver], prop);
+                if !move_prop_window(app, prop_label, from, to.clone(), 34.0, 720, cancel).await {
+                    return false;
+                }
+                prop_position = to;
+                emit_phase(
+                    app,
+                    &plan.scene_id,
+                    "interaction",
+                    &phase_actors_at(plan, "interaction", Some(&positions), Some(receiver)),
+                );
+                if !sleep_or_cancel(Duration::from_millis(360), cancel).await {
+                    return false;
+                }
+            }
+        }
+        "snack" => {
+            // The snack visits each participant in turn, which reads as
+            // sharing for groups and as a small tug-of-war for a pair.
+            for index in 0..plan.actors.len() {
+                emit_phase(
+                    app,
+                    &plan.scene_id,
+                    "interaction",
+                    &phase_actors_at(plan, "interaction", Some(&positions), Some(index)),
+                );
+                let to = prop_position_for_actor(&plan.actors[index], &positions[index], prop);
+                if !move_prop_window(
+                    app,
+                    prop_label,
+                    prop_position.clone(),
+                    to.clone(),
+                    12.0,
+                    420,
+                    cancel,
+                )
+                .await
+                {
+                    return false;
+                }
+                if !sleep_or_cancel(Duration::from_millis(260), cancel).await {
+                    return false;
+                }
+                prop_position = prop_stage_center(plan);
+                if !move_prop_window(app, prop_label, to, prop_position.clone(), 8.0, 320, cancel)
+                    .await
+                {
+                    return false;
+                }
+            }
+        }
+        "plush" | "ribbon" => {
+            let rounds = if plan.scene == "tug" {
+                6
+            } else {
+                actor_count * 2
+            };
+            for round in 0..rounds {
+                let first = round % actor_count;
+                let second = if first + 1 < actor_count {
+                    first + 1
+                } else {
+                    0
+                };
+                if first >= plan.actors.len() || second >= plan.actors.len() {
+                    continue;
+                }
+                let from = prop_position_for_actor(&plan.actors[first], &positions[first], prop);
+                let to = prop_position_for_actor(&plan.actors[second], &positions[second], prop);
+                emit_phase(
+                    app,
+                    &plan.scene_id,
+                    "interaction",
+                    &phase_actors_at(plan, "interaction", Some(&positions), Some(first)),
+                );
+                if !move_prop_window(
+                    app,
+                    prop_label,
+                    from,
+                    to.clone(),
+                    if plan.scene == "tug" { 8.0 } else { 20.0 },
+                    if plan.scene == "tug" { 300 } else { 520 },
+                    cancel,
+                )
+                .await
+                {
+                    return false;
+                }
+                emit_phase(
+                    app,
+                    &plan.scene_id,
+                    "interaction",
+                    &phase_actors_at(plan, "interaction", Some(&positions), Some(second)),
+                );
+                if !sleep_or_cancel(Duration::from_millis(300), cancel).await {
+                    return false;
+                }
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
 async fn run_scene(app: tauri::AppHandle, plan: ScenePlan, cancel: Arc<AtomicBool>) {
     let participants = plan
         .actors
@@ -1941,13 +2299,22 @@ async fn run_scene(app: tauri::AppHandle, plan: ScenePlan, cancel: Arc<AtomicBoo
             duration_ms: plan.duration_ms + 3_000,
         },
     );
-    emit_phase(&app, &plan.scene_id, "approach", &phase_actors(&plan, "approach"));
+    emit_phase(
+        &app,
+        &plan.scene_id,
+        "approach",
+        &phase_actors(&plan, "approach"),
+    );
+    let prop_label = plan
+        .prop
+        .as_deref()
+        .and_then(|kind| create_prop_window(&app, &plan.scene_id, kind, prop_stage_center(&plan)));
     let chased = matches!(
         plan.scene.as_str(),
-        "chase" | "tag" | "chain-chase" | "follow"
+        "chase" | "tag" | "chain-chase" | "follow" | "kick-and-chase"
     );
     let arrived = if chased {
-        run_chase_movement(&app, &plan, &cancel).await
+        run_chase_movement(&app, &plan, &cancel, prop_label.as_deref()).await
     } else {
         move_actors(&app, &plan, &cancel).await
     };
@@ -1955,24 +2322,35 @@ async fn run_scene(app: tauri::AppHandle, plan: ScenePlan, cancel: Arc<AtomicBoo
         if !chased {
             update_scene_runtime_positions(&app, &plan);
         }
-        let mut prop_label = None;
-        if let Some(kind) = plan.prop.as_deref() {
-            let center = plan.stage;
-            prop_label = create_prop_window(
-                &app,
-                &plan.scene_id,
-                kind,
-                PetPosition {
-                    x: (center.left + center.right) / 2.0,
-                    y: (center.top + center.bottom) / 2.0,
-                },
-            );
-        }
-        if chased {
+        let prop_played = if !chased && prop_scene(&plan.scene) {
+            if let Some(label) = prop_label.as_deref() {
+                run_prop_play(&app, &plan, label, &cancel).await
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if prop_played {
+            if !cancel.load(Ordering::Relaxed) {
+                emit_phase(
+                    &app,
+                    &plan.scene_id,
+                    "settle",
+                    &phase_actors(&plan, "settle"),
+                );
+                let _ = sleep_or_cancel(Duration::from_millis(600), &cancel).await;
+            }
+        } else if chased {
             // The chase already emitted its interactive lines while moving;
             // a short settle still leaves a readable beat before the end.
             if !cancel.load(Ordering::Relaxed) {
-                emit_phase(&app, &plan.scene_id, "settle", &phase_actors(&plan, "settle"));
+                emit_phase(
+                    &app,
+                    &plan.scene_id,
+                    "settle",
+                    &phase_actors(&plan, "settle"),
+                );
                 let _ = sleep_or_cancel(Duration::from_millis(900), &cancel).await;
             }
         } else {
@@ -1992,12 +2370,17 @@ async fn run_scene(app: tauri::AppHandle, plan: ScenePlan, cancel: Arc<AtomicBoo
                 let _ = sleep_or_cancel(Duration::from_millis(2_400), &cancel).await;
             }
             if !cancel.load(Ordering::Relaxed) {
-                emit_phase(&app, &plan.scene_id, "settle", &phase_actors(&plan, "settle"));
+                emit_phase(
+                    &app,
+                    &plan.scene_id,
+                    "settle",
+                    &phase_actors(&plan, "settle"),
+                );
                 let _ = sleep_or_cancel(Duration::from_millis(600), &cancel).await;
             }
         }
-        if let Some(label) = prop_label {
-            if let Some(window) = app.get_webview_window(&label) {
+        if let Some(label) = prop_label.as_deref() {
+            if let Some(window) = app.get_webview_window(label) {
                 let _ = window.destroy();
             }
         }
@@ -2044,6 +2427,7 @@ async fn run_scene(app: tauri::AppHandle, plan: ScenePlan, cancel: Arc<AtomicBoo
                     .collect(),
                 interaction_type: plan.scene.clone(),
                 trigger: plan.trigger.clone(),
+                prop: plan.prop.clone(),
                 dialogue,
                 milestones: milestones.clone(),
                 outcome: "completed".to_string(),
@@ -2055,6 +2439,13 @@ async fn run_scene(app: tauri::AppHandle, plan: ScenePlan, cancel: Arc<AtomicBoo
                     serde_json::json!({"participants": entry.participants, "milestones": milestones}),
                 );
             }
+        }
+    }
+    // Cancellation can happen while pets are still approaching. Always tear
+    // down the transparent prop window, including that early-exit path.
+    if let Some(label) = prop_label.as_deref() {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.destroy();
         }
     }
     let cancelled = cancel.load(Ordering::Relaxed) || !arrived;
@@ -2121,7 +2512,10 @@ fn record_relationship_event(
         (signal.from == first && signal.to == second)
             || (signal.from == second && signal.to == first)
     }) {
-        let feelings = relationship.directional.entry(signal.from.clone()).or_default();
+        let feelings = relationship
+            .directional
+            .entry(signal.from.clone())
+            .or_default();
         match signal.change.as_str() {
             "fondness" => {
                 feelings.fondness = (feelings.fondness + 3).clamp(-100, 100);
@@ -2163,7 +2557,9 @@ fn record_relationship_event(
             .saturating_add(affinity_delta as u8)
             .min(100)
     } else {
-        relationship.affinity.saturating_sub((-affinity_delta) as u8)
+        relationship
+            .affinity
+            .saturating_sub((-affinity_delta) as u8)
     };
     relationship.peak_affinity = relationship.peak_affinity.max(relationship.affinity);
     relationship.level = relationship_level(relationship.affinity);
@@ -2345,10 +2741,7 @@ pub(crate) async fn start_social_interaction(
 }
 
 #[tauri::command]
-pub(crate) fn cancel_social_scene(
-    app: tauri::AppHandle,
-    scene_id: String,
-) -> Result<(), String> {
+pub(crate) fn cancel_social_scene(app: tauri::AppHandle, scene_id: String) -> Result<(), String> {
     if let Some(scene) = app
         .state::<AppState>()
         .social
@@ -2428,9 +2821,7 @@ pub(crate) fn report_pet_runtime_state(
 }
 
 #[tauri::command]
-pub(crate) fn get_social_settings(
-    app: tauri::AppHandle,
-) -> Result<SocialSettings, String> {
+pub(crate) fn get_social_settings(app: tauri::AppHandle) -> Result<SocialSettings, String> {
     Ok(config_snapshot(&app)?.social)
 }
 
@@ -2485,12 +2876,8 @@ pub(crate) fn get_social_log(
     let second = second_pet_id.as_deref();
     Ok(read_logs(&app)?
         .into_iter()
-        .filter(|entry| {
-            first.is_none_or(|id| entry.participants.iter().any(|item| item == id))
-        })
-        .filter(|entry| {
-            second.is_none_or(|id| entry.participants.iter().any(|item| item == id))
-        })
+        .filter(|entry| first.is_none_or(|id| entry.participants.iter().any(|item| item == id)))
+        .filter(|entry| second.is_none_or(|id| entry.participants.iter().any(|item| item == id)))
         .filter(|entry| {
             interaction_type
                 .as_deref()
@@ -2590,8 +2977,29 @@ mod tests {
     #[test]
     fn scene_catalog_supports_pair_and_group_interactions() {
         assert!(scene_options(2).contains(&"chase"));
+        assert!(scene_options(2).contains(&"kick-and-chase"));
+        assert!(scene_options(2).contains(&"pass"));
         assert!(scene_options(4).contains(&"group-pile"));
+        assert!(scene_options(4).contains(&"share-snack"));
         assert!(!scene_options(2).contains(&"group-pile"));
+    }
+
+    #[test]
+    fn built_in_props_keep_legacy_aliases_but_use_named_resources() {
+        assert_eq!(valid_prop(Some("ball")), Some("football".to_string()));
+        assert_eq!(valid_prop(Some("football")), Some("football".to_string()));
+        assert_eq!(valid_prop(Some("toy")), Some("plush".to_string()));
+        assert_eq!(valid_prop(Some("snack")), Some("snack".to_string()));
+        assert_eq!(valid_prop(Some("unknown")), None);
+    }
+
+    #[test]
+    fn prop_scene_defaults_match_the_built_in_interactions() {
+        assert_eq!(default_prop("kick-and-chase"), Some("football".to_string()));
+        assert_eq!(default_prop("share-snack"), Some("snack".to_string()));
+        assert_eq!(default_prop("tug"), Some("plush".to_string()));
+        assert!(prop_scene("pass"));
+        assert!(!prop_scene("whisper"));
     }
 
     #[test]
@@ -2611,7 +3019,10 @@ mod tests {
         assert_eq!(look_direction_toward((0.0, 0.0), (40.0, 0.0)), "right");
         assert_eq!(look_direction_toward((40.0, 0.0), (0.0, 0.0)), "left");
         assert_eq!(look_direction_toward((0.0, 0.0), (0.0, -40.0)), "up");
-        assert_eq!(look_direction_toward((0.0, 0.0), (40.0, 40.0)), "down-right");
+        assert_eq!(
+            look_direction_toward((0.0, 0.0), (40.0, 40.0)),
+            "down-right"
+        );
     }
 
     fn test_snapshot(id: &str, x: f64, y: f64, width: f64, height: f64) -> Snapshot {
@@ -2629,7 +3040,12 @@ mod tests {
         }
     }
 
-    fn has_collision_gap(first: &Snapshot, first_position: &PetPosition, second: &Snapshot, second_position: &PetPosition) -> bool {
+    fn has_collision_gap(
+        first: &Snapshot,
+        first_position: &PetPosition,
+        second: &Snapshot,
+        second_position: &PetPosition,
+    ) -> bool {
         let first_right = first_position.x + first.bounds.width();
         let first_bottom = first_position.y + first.bounds.height();
         let second_right = second_position.x + second.bounds.width();

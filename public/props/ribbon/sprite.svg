@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 72" role="img" aria-label="彩带">
+  <ellipse cx="36" cy="59" rx="19" ry="4" fill="#243746" opacity=".16"/>
+  <path d="M22 12c17 3 29 11 28 24-1 14-14 16-22 25M46 16c-9 7-13 16-8 24 4 6 13 7 15 18" fill="none" stroke="#f08eaf" stroke-width="8" stroke-linecap="round"/>
+  <path d="M22 12c17 3 29 11 28 24-1 14-14 16-22 25M46 16c-9 7-13 16-8 24 4 6 13 7 15 18" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" opacity=".55"/>
+</svg>

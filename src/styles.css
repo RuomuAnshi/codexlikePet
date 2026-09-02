@@ -98,6 +98,25 @@ body {
   to { opacity: 0; transform: translateY(-38px) scale(1.15); }
 }
 
+.food-drop {
+  height: 34px;
+  left: 40%;
+  opacity: 0;
+  pointer-events: none;
+  position: absolute;
+  top: 8%;
+  width: 34px;
+  z-index: 3;
+  animation: food-fall 850ms ease-in forwards;
+}
+
+@keyframes food-fall {
+  0% { opacity: 0; transform: translate(0, 0) rotate(0deg) scale(0.8); }
+  15% { opacity: 1; }
+  85% { opacity: 1; }
+  100% { opacity: 0; transform: translate(-36px, 150px) rotate(200deg) scale(1); }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .emotion-icon {
     transition: none;
@@ -105,4 +124,5 @@ body {
 
   .particle { animation: none; opacity: 0; }
   .is-carried #stage { transform: none; }
+  .food-drop { display: none; }
 }

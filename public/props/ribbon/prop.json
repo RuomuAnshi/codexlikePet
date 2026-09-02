@@ -1,0 +1,8 @@
+{
+  "id": "ribbon",
+  "version": 1,
+  "name": "彩带",
+  "asset": "sprite.svg",
+  "hitbox": { "type": "rounded-rect", "width": 28, "height": 46 },
+  "behaviors": ["tug", "prank", "chase"]
+}

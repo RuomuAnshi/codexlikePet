@@ -1,0 +1,8 @@
+{
+  "id": "snack",
+  "version": 1,
+  "name": "小零食",
+  "asset": "sprite.svg",
+  "hitbox": { "type": "rounded-rect", "width": 38, "height": 26 },
+  "behaviors": ["discover", "share", "eat", "steal"]
+}
