@@ -4191,7 +4191,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                                             let updater_app = app_for_install.clone();
                                             tauri::async_runtime::spawn(async move {
                                                 match update
-                                                    .download_and_install(|_| {}, |_, _| {})
+                                                    .download_and_install(|_, _| {}, || {})
                                                     .await
                                                 {
                                                     Ok(()) => updater_app.restart(),
