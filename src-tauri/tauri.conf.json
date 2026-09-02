@@ -113,7 +113,7 @@
     "targets": "all",
     "createUpdaterArtifacts": true,
     "resources": {
-      "../public/pets": "pets"
+      "../public/pets/sakimiao": "pets/sakimiao"
     },
     "icon": [
       "icons/32x32.png",

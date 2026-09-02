@@ -14,6 +14,13 @@ dist-ssr
 
 # Local planning notes
 plan/
+skill/
+AGENTS.md
+
+# Scratch pet resources added by the co-authoring session
+public/pets/anon/
+public/pets/saki/
+public/pets/soyo/
 
 # Editor directories and files
 .vscode/*
