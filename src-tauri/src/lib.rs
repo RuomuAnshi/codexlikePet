@@ -1270,6 +1270,17 @@ fn load_config(app: &tauri::AppHandle) -> AppConfig {
     };
     let mut config = serde_json::from_slice::<AppConfig>(&bytes).unwrap_or_default();
     normalize_config(&mut config);
+    // Older saved endpoints used the 300-token default, which truncates
+    // large structured replies mid-object. Raise stored budgets to the
+    // current floor so re-saving is not required after the upgrade.
+    for model in [&mut config.ai.chat_model, &mut config.ai.vision_model]
+        .into_iter()
+        .flatten()
+    {
+        if model.max_output_tokens < 1_024 {
+            model.max_output_tokens = 1_024;
+        }
+    }
     // Drop instances whose pet resources no longer exist. Their windows were
     // never created, and leaving them in place makes aggregate operations such
     // as toggle_all_visibility fail halfway through.
