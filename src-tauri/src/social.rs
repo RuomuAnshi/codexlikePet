@@ -1431,39 +1431,112 @@ fn emit_phase(app: &tauri::AppHandle, scene_id: &str, phase: &str, actors: &[Sce
     );
 }
 
-fn phase_actors(plan: &ScenePlan, phase: &str) -> Vec<ScenePhaseActor> {
+/// Convert a screen-space vector into one of the named atlas directions.
+/// Screen Y grows downwards, so positive Y means "down" here.
+fn look_direction_toward(from: (f64, f64), to: (f64, f64)) -> String {
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    if dx.abs() < 1.0 && dy.abs() < 1.0 {
+        return "down".to_string();
+    }
+    let angle = dy.atan2(dx).to_degrees();
+    match angle {
+        angle if (-22.5..22.5).contains(&angle) => "right",
+        angle if (22.5..67.5).contains(&angle) => "down-right",
+        angle if (67.5..112.5).contains(&angle) => "down",
+        angle if (112.5..157.5).contains(&angle) => "down-left",
+        angle if angle >= 157.5 || angle < -157.5 => "left",
+        angle if (-157.5..-112.5).contains(&angle) => "up-left",
+        angle if (-112.5..-67.5).contains(&angle) => "up",
+        _ => "up-right",
+    }
+    .to_string()
+}
+
+fn actor_center(actor: &PlannedActor, position: &PetPosition) -> (f64, f64) {
+    (
+        position.x + actor.snapshot.bounds.width() / 2.0,
+        position.y + actor.snapshot.bounds.height() / 2.0,
+    )
+}
+
+/// Choose the direction from the actor's current phase position toward its
+/// conversation partner. For a group, face the centre of the other actors.
+/// Dynamic positions are used by chase scenes; regular scenes use their
+/// collision-resolved targets.
+fn phase_look(plan: &ScenePlan, index: usize, phase: &str, positions: Option<&[PetPosition]>) -> String {
+    let actor = &plan.actors[index];
+    let current_position = if phase == "approach" {
+        &actor.snapshot.position
+    } else {
+        positions
+            .and_then(|items| items.get(index))
+            .unwrap_or(&actor.target)
+    };
+    let from = actor_center(actor, current_position);
+    let destination = if phase == "approach" {
+        actor_center(actor, &actor.target)
+    } else if plan.actors.len() == 2 {
+        let partner_index = 1 - index;
+        let partner = &plan.actors[partner_index];
+        let partner_position = positions
+            .and_then(|items| items.get(partner_index))
+            .unwrap_or(&partner.target);
+        actor_center(partner, partner_position)
+    } else {
+        let mut count = 0.0;
+        let mut x = 0.0;
+        let mut y = 0.0;
+        for (other_index, other) in plan.actors.iter().enumerate() {
+            if other_index == index {
+                continue;
+            }
+            let other_position = positions
+                .and_then(|items| items.get(other_index))
+                .unwrap_or(&other.target);
+            let center = actor_center(other, other_position);
+            x += center.0;
+            y += center.1;
+            count += 1.0;
+        }
+        if count == 0.0 {
+            from
+        } else {
+            (x / count, y / count)
+        }
+    };
+    look_direction_toward(from, destination)
+}
+
+fn phase_actors_at(
+    plan: &ScenePlan,
+    phase: &str,
+    positions: Option<&[PetPosition]>,
+    speaker: Option<usize>,
+) -> Vec<ScenePhaseActor> {
     plan.actors
         .iter()
         .enumerate()
         .map(|(index, actor)| {
+            let is_speaker = speaker.map(|value| value == index).unwrap_or(true);
             let animation = match phase {
-                "approach" => {
-                    if plan.scene == "chase" || plan.scene == "tag" {
-                        "running"
-                    } else {
-                        "walking"
-                    }
-                }
+                "approach" if plan.actors.len() == 2 => "running",
+                "approach" => "walking",
+                "face" => "idle",
                 "interaction" => match plan.scene.as_str() {
                     "sync-jump" | "group-cheer" => "jumping",
                     "group-nap" => "waiting",
-                    "chase" | "tag" | "chain-chase" => "running",
                     _ => "waving",
                 },
                 _ => "idle",
-            };
-            let look = if index % 2 == 0 {
-                Some("right".to_string())
-            } else {
-                Some("left".to_string())
             };
             ScenePhaseActor {
                 instance_id: actor.snapshot.instance_id.clone(),
                 pet_id: actor.snapshot.pet_id.clone(),
                 animation: animation.to_string(),
-                look,
-                say: (phase == "interaction").then(|| actor.say.clone()),
-                effect: (phase == "interaction").then(|| {
+                look: Some(phase_look(plan, index, phase, positions)),
+                say: (phase == "interaction" && is_speaker).then(|| actor.say.clone()),
+                effect: (phase == "interaction" && is_speaker).then(|| {
                     match plan.scene.as_str() {
                         "nuzzle" | "comfort" | "reconcile" => "heart",
                         "sync-jump" | "group-cheer" => "star",
@@ -1475,6 +1548,10 @@ fn phase_actors(plan: &ScenePlan, phase: &str) -> Vec<ScenePhaseActor> {
             }
         })
         .collect()
+}
+
+fn phase_actors(plan: &ScenePlan, phase: &str) -> Vec<ScenePhaseActor> {
+    phase_actors_at(plan, phase, None, None)
 }
 
 async fn sleep_or_cancel(duration: Duration, cancel: &AtomicBool) -> bool {
@@ -1645,23 +1722,13 @@ fn chase_bounds(plan: &ScenePlan) -> Rect {
     rect
 }
 
-fn chase_phase_actors(plan: &ScenePlan, speaker: usize) -> Vec<ScenePhaseActor> {
-    plan.actors
-        .iter()
-        .enumerate()
-        .map(|(index, actor)| ScenePhaseActor {
-            instance_id: actor.snapshot.instance_id.clone(),
-            pet_id: actor.snapshot.pet_id.clone(),
-            animation: "running".to_string(),
-            look: Some(if index % 2 == 0 { "right" } else { "left" }.to_string()),
-            say: if index == speaker {
-                Some(actor.say.clone())
-            } else {
-                None
-            },
-            effect: Some("dust".to_string()),
-        })
-        .collect()
+fn chase_phase_actors(
+    plan: &ScenePlan,
+    phase: &str,
+    positions: &[PetPosition],
+    speaker: Option<usize>,
+) -> Vec<ScenePhaseActor> {
+    phase_actors_at(plan, phase, Some(positions), speaker)
 }
 
 /// Real pursuit for chase-like scenes: the chaser window genuinely moves
@@ -1739,8 +1806,17 @@ async fn run_chase_movement(
                 emit_phase(
                     app,
                     &plan.scene_id,
+                    "face",
+                    &chase_phase_actors(plan, "face", &positions, None),
+                );
+                if !sleep_or_cancel(Duration::from_millis(360), cancel).await {
+                    return false;
+                }
+                emit_phase(
+                    app,
+                    &plan.scene_id,
                     "interaction",
-                    &chase_phase_actors(plan, chaser),
+                    &chase_phase_actors(plan, "interaction", &positions, Some(chaser)),
                 );
                 voiced[chaser] = true;
             }
@@ -1887,18 +1963,30 @@ async fn run_scene(app: tauri::AppHandle, plan: ScenePlan, cancel: Arc<AtomicBoo
         if chased {
             // The chase already emitted its interactive lines while moving;
             // a short settle still leaves a readable beat before the end.
-            emit_phase(&app, &plan.scene_id, "settle", &phase_actors(&plan, "settle"));
-            let _ = sleep_or_cancel(Duration::from_millis(900), &cancel).await;
+            if !cancel.load(Ordering::Relaxed) {
+                emit_phase(&app, &plan.scene_id, "settle", &phase_actors(&plan, "settle"));
+                let _ = sleep_or_cancel(Duration::from_millis(900), &cancel).await;
+            }
         } else {
-            emit_phase(
-                &app,
-                &plan.scene_id,
-                "interaction",
-                &phase_actors(&plan, "interaction"),
-            );
-            let _ = sleep_or_cancel(Duration::from_millis(2_400), &cancel).await;
-            emit_phase(&app, &plan.scene_id, "settle", &phase_actors(&plan, "settle"));
-            let _ = sleep_or_cancel(Duration::from_millis(600), &cancel).await;
+            // Movement and speech are separate phases. The explicit face
+            // beat gives the browser a frame to render the new look before
+            // the speech windows are shown.
+            emit_phase(&app, &plan.scene_id, "face", &phase_actors(&plan, "face"));
+            if sleep_or_cancel(Duration::from_millis(360), &cancel).await
+                && !cancel.load(Ordering::Relaxed)
+            {
+                emit_phase(
+                    &app,
+                    &plan.scene_id,
+                    "interaction",
+                    &phase_actors(&plan, "interaction"),
+                );
+                let _ = sleep_or_cancel(Duration::from_millis(2_400), &cancel).await;
+            }
+            if !cancel.load(Ordering::Relaxed) {
+                emit_phase(&app, &plan.scene_id, "settle", &phase_actors(&plan, "settle"));
+                let _ = sleep_or_cancel(Duration::from_millis(600), &cancel).await;
+            }
         }
         if let Some(label) = prop_label {
             if let Some(window) = app.get_webview_window(&label) {
@@ -2508,6 +2596,14 @@ mod tests {
     fn model_json_is_extracted_from_fenced_output() {
         let value = extract_json("{\"scene\":\"greet\"}").unwrap();
         assert_eq!(value["scene"], "greet");
+    }
+
+    #[test]
+    fn look_direction_is_derived_from_relative_position() {
+        assert_eq!(look_direction_toward((0.0, 0.0), (40.0, 0.0)), "right");
+        assert_eq!(look_direction_toward((40.0, 0.0), (0.0, 0.0)), "left");
+        assert_eq!(look_direction_toward((0.0, 0.0), (0.0, -40.0)), "up");
+        assert_eq!(look_direction_toward((0.0, 0.0), (40.0, 40.0)), "down-right");
     }
 
     fn test_snapshot(id: &str, x: f64, y: f64, width: f64, height: f64) -> Snapshot {
