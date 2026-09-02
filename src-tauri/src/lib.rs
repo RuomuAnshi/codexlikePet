@@ -9,29 +9,54 @@ use objc2_app_kit::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Mutex,
 };
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{
     Emitter, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
     Wry,
 };
-use zip::ZipArchive;
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_updater::UpdaterExt;
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 mod ai;
+mod environment;
+mod social;
 use ai::{AiRuntime, AiSettings};
+use social::SocialSettings;
 
 const LOOK_MARGIN_LOGICAL: f64 = 72.0;
 const LOOK_DEADZONE_LOGICAL: f64 = 60.0;
 const PET_WIDTH: f64 = 192.0;
 const PET_HEIGHT: f64 = 208.0;
+const SPEECH_WINDOW_MIN_WIDTH: f64 = 150.0;
+const SPEECH_WINDOW_MAX_WIDTH: f64 = 260.0;
+const SPEECH_WINDOW_HEIGHT: f64 = 82.0;
+const SPEECH_WINDOW_GAP: f64 = 10.0;
+const CONTEXT_MENU_ESTIMATED_WIDTH: f64 = 180.0;
+const CONTEXT_MENU_GAP: f64 = 8.0;
 const SPRITESHEET_WIDTH: u32 = 1536;
 const SPRITESHEET_HEIGHT: u32 = 2288;
+const FRAME_CELL_WIDTH: u32 = 192;
+const FRAME_CELL_HEIGHT: u32 = 208;
+const ANIMATION_PACK_FILE_NAME: &str = "animations.json";
+const ANIMATION_PACK_FORMAT: &str = "sakipet-frame-pack";
+const ANIMATION_PACK_VERSION: u8 = 1;
+const ANIMATION_PACK_MAX_BYTES: usize = 2 * 1024 * 1024;
+const ANIMATION_CLIP_MAX_BYTES: usize = 20 * 1024 * 1024;
+const ANIMATION_CLIP_MAX_FRAMES: u16 = 32;
+// The starter pet is a product default, not part of resource discovery. New
+// pets are still discovered from their own manifests and can be imported at
+// runtime without changing this value.
+const DEFAULT_PET_ID: &str = "sakimiao";
 const CONFIG_FILE_NAME: &str = "config.json";
 // Transparent always-on-top webviews get misjudged as occluded by Chromium,
 // which freezes timers (walker), rAF (animation) and input handling. Keep the
@@ -426,6 +451,57 @@ struct PetManifest {
     spritesheet_path: String,
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct AnimationClipManifest {
+    path: String,
+    frames: u16,
+    durations: Vec<u64>,
+    #[serde(rename = "loop")]
+    looped: bool,
+    loop_start: Option<u16>,
+    #[serde(rename = "type")]
+    clip_type: String,
+    return_to: Option<String>,
+    fallback: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct AnimationPackManifest {
+    format: String,
+    version: u8,
+    cell_width: u32,
+    cell_height: u32,
+    clips: HashMap<String, AnimationClipManifest>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnimationClipRuntime {
+    path: String,
+    frames: u16,
+    durations: Vec<u64>,
+    #[serde(rename = "loop")]
+    looped: bool,
+    loop_start: Option<u16>,
+    #[serde(rename = "type")]
+    clip_type: String,
+    return_to: Option<String>,
+    fallback: Option<String>,
+    data_url: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnimationPackRuntime {
+    format: String,
+    version: u8,
+    cell_width: u32,
+    cell_height: u32,
+    clips: HashMap<String, AnimationClipRuntime>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
@@ -439,6 +515,10 @@ struct PetSettings {
     quiet_mode: bool,
     show_in_fullscreen: bool,
     paused: bool,
+    circadian_enabled: bool,
+    sleep_start_minutes: u16,
+    wake_minutes: u16,
+    social_enabled: bool,
 }
 
 impl Default for PetSettings {
@@ -453,6 +533,10 @@ impl Default for PetSettings {
             quiet_mode: false,
             show_in_fullscreen: false,
             paused: false,
+            circadian_enabled: true,
+            sleep_start_minutes: 1_410,
+            wake_minutes: 450,
+            social_enabled: true,
         }
     }
 }
@@ -467,6 +551,19 @@ struct PetDialogue {
     walk: Vec<String>,
     drag: Vec<String>,
     idle: Vec<String>,
+    morning: Vec<String>,
+    evening: Vec<String>,
+    sleep: Vec<String>,
+    wake: Vec<String>,
+    petting: Vec<String>,
+    feed: Vec<String>,
+    play: Vec<String>,
+    pickup: Vec<String>,
+    put_down: Vec<String>,
+    low_battery: Vec<String>,
+    break_reminder: Vec<String>,
+    reunion: Vec<String>,
+    milestone: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -609,6 +706,19 @@ impl Default for PetDialogue {
                 "这里待着也很舒服。".to_string(),
                 "要不要陪我说说话？".to_string(),
             ],
+            morning: vec!["早上好呀，今天也要一起度过。".to_string()],
+            evening: vec!["晚上啦，今天辛苦了。".to_string()],
+            sleep: vec!["我先睡一会儿，晚安。".to_string()],
+            wake: vec!["唔……醒来了。早上好！".to_string()],
+            petting: vec!["呼噜呼噜……再摸一会儿嘛。".to_string()],
+            feed: vec!["谢谢投喂！好好吃。".to_string()],
+            play: vec!["来玩一会儿吧！".to_string()],
+            pickup: vec!["诶、诶？我被拎起来啦！".to_string()],
+            put_down: vec!["呼……落地了。".to_string()],
+            low_battery: vec!["电量好低了，要不要休息一下？".to_string()],
+            break_reminder: vec!["已经忙很久啦，起来活动一下吧。".to_string()],
+            reunion: vec!["你回来啦……我有一点想你。".to_string()],
+            milestone: vec!["我们又一起走过一段时间了。".to_string()],
         }
     }
 }
@@ -617,6 +727,50 @@ impl Default for PetDialogue {
 struct PetPosition {
     x: f64,
     y: f64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct EnvironmentSettings {
+    /// Foreground application names are kept local and are only used for
+    /// timers/quiet rules. This is intentionally opt-in.
+    pub foreground_tracking_enabled: bool,
+    pub break_reminder_enabled: bool,
+    pub break_reminder_minutes: u32,
+    pub meeting_quiet_enabled: bool,
+    pub low_battery_enabled: bool,
+    pub low_battery_threshold: u8,
+    pub notification_events_enabled: bool,
+    pub coding_apps: Vec<String>,
+    pub meeting_apps: Vec<String>,
+}
+
+impl Default for EnvironmentSettings {
+    fn default() -> Self {
+        Self {
+            foreground_tracking_enabled: false,
+            break_reminder_enabled: true,
+            break_reminder_minutes: 180,
+            meeting_quiet_enabled: true,
+            low_battery_enabled: true,
+            low_battery_threshold: 20,
+            notification_events_enabled: false,
+            coding_apps: vec![
+                "Code".to_string(),
+                "codex".to_string(),
+                "Xcode".to_string(),
+                "Terminal".to_string(),
+                "iTerm2".to_string(),
+            ],
+            meeting_apps: vec![
+                "zoom.us".to_string(),
+                "Microsoft Teams".to_string(),
+                "Teams".to_string(),
+                "Webex".to_string(),
+                "腾讯会议".to_string(),
+            ],
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -641,6 +795,10 @@ struct AppConfig {
     ai: AiSettings,
     #[serde(default)]
     chat_positions: HashMap<String, PetPosition>,
+    #[serde(default)]
+    environment: EnvironmentSettings,
+    #[serde(default)]
+    social: SocialSettings,
 }
 
 impl Default for AppConfig {
@@ -650,7 +808,7 @@ impl Default for AppConfig {
             pet_settings: HashMap::new(),
             instances: vec![PetInstanceConfig {
                 id: "main".to_string(),
-                pet_id: "sakimiao".to_string(),
+                pet_id: DEFAULT_PET_ID.to_string(),
                 visible: true,
                 position: None,
             }],
@@ -658,6 +816,8 @@ impl Default for AppConfig {
             next_instance_id: 2,
             ai: AiSettings::default(),
             chat_positions: HashMap::new(),
+            environment: EnvironmentSettings::default(),
+            social: SocialSettings::default(),
         }
     }
 }
@@ -665,6 +825,10 @@ impl Default for AppConfig {
 struct AppState {
     config: Mutex<AppConfig>,
     ai: AiRuntime,
+    environment: environment::EnvironmentRuntime,
+    social: social::SocialRuntime,
+    speech_ready: Mutex<HashSet<String>>,
+    speech_layout: Mutex<()>,
     ready: AtomicBool,
 }
 
@@ -673,6 +837,10 @@ impl AppState {
         Self {
             config: Mutex::new(AppConfig::default()),
             ai: AiRuntime::default(),
+            environment: environment::EnvironmentRuntime::default(),
+            social: social::SocialRuntime::default(),
+            speech_ready: Mutex::new(HashSet::new()),
+            speech_layout: Mutex::new(()),
             ready: AtomicBool::new(false),
         }
     }
@@ -702,6 +870,16 @@ struct InstalledPet {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct PetPreview {
+    id: String,
+    display_name: String,
+    description: String,
+    sprite_version_number: u8,
+    spritesheet_data_url: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PetInstanceInfo {
     id: String,
     pet_id: String,
@@ -722,6 +900,7 @@ struct RuntimeConfig {
     settings: PetSettings,
     dialogue: PetDialogue,
     character: CharacterCard,
+    animation_pack: Option<AnimationPackRuntime>,
 }
 
 #[derive(Clone, Serialize)]
@@ -745,6 +924,210 @@ fn is_safe_relative_path(value: &str) -> bool {
         && !value
             .split('/')
             .any(|part| part.is_empty() || part == ".." || part == ".")
+}
+
+fn is_valid_animation_state(value: &str) -> bool {
+    matches!(
+        value,
+        "idle"
+            | "running-right"
+            | "running-left"
+            | "waving"
+            | "jumping"
+            | "failed"
+            | "waiting"
+            | "running"
+            | "review"
+    )
+}
+
+fn parse_animation_pack(bytes: &[u8]) -> Result<AnimationPackManifest, String> {
+    if bytes.is_empty() || bytes.len() > ANIMATION_PACK_MAX_BYTES {
+        return Err("animations.json 为空或超过 2 MB".to_string());
+    }
+    let manifest = serde_json::from_slice::<AnimationPackManifest>(bytes)
+        .map_err(|error| format!("animations.json 格式错误: {error}"))?;
+    if manifest.format != ANIMATION_PACK_FORMAT || manifest.version != ANIMATION_PACK_VERSION {
+        return Err("animations.json 不是受支持的 SakiPet 帧动画包".to_string());
+    }
+    if manifest.cell_width != FRAME_CELL_WIDTH || manifest.cell_height != FRAME_CELL_HEIGHT {
+        return Err("animations.json 的帧尺寸必须为 192x208".to_string());
+    }
+    if manifest.clips.is_empty() || manifest.clips.len() > 64 {
+        return Err("animations.json 的 clips 数量必须在 1 到 64 之间".to_string());
+    }
+    Ok(manifest)
+}
+
+fn validate_animation_clip(
+    id: &str,
+    clip: &AnimationClipManifest,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if !is_safe_id(id) {
+        return Err(format!("动画 clip id 不安全: {id}"));
+    }
+    if !clip.path.starts_with("animations/") || !is_safe_relative_path(&clip.path) {
+        return Err(format!("动画 clip 路径不安全: {}", clip.path));
+    }
+    if clip.frames == 0 || clip.frames > ANIMATION_CLIP_MAX_FRAMES {
+        return Err(format!("动画 clip {id} 的帧数必须在 1 到 {ANIMATION_CLIP_MAX_FRAMES} 之间"));
+    }
+    if clip.durations.len() != usize::from(clip.frames)
+        || clip.durations.iter().any(|duration| !(30..=5_000).contains(duration))
+    {
+        return Err(format!("动画 clip {id} 的 duration 数量或范围无效"));
+    }
+    if clip.loop_start.is_some_and(|start| start >= clip.frames) {
+        return Err(format!("动画 clip {id} 的 loopStart 必须小于帧数"));
+    }
+    if !matches!(clip.clip_type.as_str(), "mode" | "gesture") {
+        return Err(format!("动画 clip {id} 的 type 必须为 mode 或 gesture"));
+    }
+    for target in [clip.return_to.as_deref(), clip.fallback.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if !is_valid_animation_state(target) {
+            return Err(format!("动画 clip {id} 的状态回退目标无效: {target}"));
+        }
+    }
+    if bytes.is_empty() || bytes.len() > ANIMATION_CLIP_MAX_BYTES {
+        return Err(format!("动画 clip {id} 为空或超过 20 MB"));
+    }
+    let decoded = image::load_from_memory(bytes)
+        .map_err(|error| format!("无法解码动画 clip {id}: {error}"))?;
+    let expected_width = FRAME_CELL_WIDTH * u32::from(clip.frames);
+    if decoded.width() != expected_width || decoded.height() != FRAME_CELL_HEIGHT {
+        return Err(format!(
+            "动画 clip {id} 尺寸为 {}x{}，应为 {}x{}",
+            decoded.width(),
+            decoded.height(),
+            expected_width,
+            FRAME_CELL_HEIGHT
+        ));
+    }
+    Ok(())
+}
+
+fn build_animation_pack_runtime(
+    manifest: AnimationPackManifest,
+    root: &Path,
+) -> Result<AnimationPackRuntime, String> {
+    let mut clips = HashMap::new();
+    for (id, clip) in manifest.clips {
+        let bytes = fs::read(root.join(&clip.path))
+            .map_err(|error| format!("无法读取动画 clip {}: {error}", clip.path))?;
+        validate_animation_clip(&id, &clip, &bytes)?;
+        clips.insert(
+            id,
+            AnimationClipRuntime {
+                path: clip.path.clone(),
+                frames: clip.frames,
+                durations: clip.durations.clone(),
+                looped: clip.looped,
+                loop_start: clip.loop_start,
+                clip_type: clip.clip_type.clone(),
+                return_to: clip.return_to.clone(),
+                fallback: clip.fallback.clone(),
+                data_url: data_url(&clip.path, &bytes),
+            },
+        );
+    }
+    Ok(AnimationPackRuntime {
+        format: manifest.format,
+        version: manifest.version,
+        cell_width: manifest.cell_width,
+        cell_height: manifest.cell_height,
+        clips,
+    })
+}
+
+fn animation_pack_from_root(root: &Path) -> Option<AnimationPackRuntime> {
+    let manifest_path = root.join(ANIMATION_PACK_FILE_NAME);
+    let bytes = match fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            eprintln!("无法读取 {}: {error}", manifest_path.display());
+            return None;
+        }
+    };
+    let manifest = match parse_animation_pack(&bytes) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!("忽略无效的 {}: {error}", manifest_path.display());
+            return None;
+        }
+    };
+    match build_animation_pack_runtime(manifest, root) {
+        Ok(pack) => Some(pack),
+        Err(error) => {
+            eprintln!("忽略无效的 {}: {error}", manifest_path.display());
+            None
+        }
+    }
+}
+
+fn animation_pack_for_pet(app: &tauri::AppHandle, pet_id: &str) -> Option<AnimationPackRuntime> {
+    if let Ok(root) = imported_pets_path(app) {
+        let root = root.join(pet_id);
+        if root.join("pet.json").is_file() {
+            return animation_pack_from_root(&root);
+        }
+    }
+    let bundled = pet_is_bundled(app, pet_id)?;
+    bundled_pet_roots(app)
+        .into_iter()
+        .map(|root| root.join(&bundled.path))
+        .find(|root| root.join("pet.json").is_file())
+        .and_then(|root| animation_pack_from_root(&root))
+}
+
+/// Return only the safe clip ids for prompt construction. The AI layer uses
+/// this to avoid suggesting gestures that are not installed for this pet.
+pub(crate) fn animation_clip_ids(app: &tauri::AppHandle, pet_id: &str) -> Vec<String> {
+    let mut ids = animation_pack_for_pet(app, pet_id)
+        .map(|pack| pack.clips.into_keys().collect::<Vec<_>>())
+        .unwrap_or_default();
+    ids.sort();
+    ids
+}
+
+fn animation_pack_from_archive(
+    archive: &mut ZipArchive<Cursor<Vec<u8>>>,
+    root: &str,
+) -> Result<Option<(Vec<u8>, Vec<(String, Vec<u8>)>)>, String> {
+    let archive_manifest_path = format!("{root}{ANIMATION_PACK_FILE_NAME}");
+    if !archive
+        .file_names()
+        .any(|name| name == archive_manifest_path)
+    {
+        return Ok(None);
+    }
+    let mut manifest_bytes = Vec::new();
+    archive
+        .by_name(&archive_manifest_path)
+        .map_err(|error| format!("无法读取 animations.json: {error}"))?
+        .read_to_end(&mut manifest_bytes)
+        .map_err(|error| format!("无法读取 animations.json: {error}"))?;
+    let manifest = parse_animation_pack(&manifest_bytes)?;
+    let mut clip_files = Vec::with_capacity(manifest.clips.len());
+    for (id, clip) in &manifest.clips {
+        let archive_clip_path = format!("{root}{}", clip.path);
+        if !archive.file_names().any(|name| name == archive_clip_path) {
+            return Err(format!("宠物包内缺少动画 clip: {}", clip.path));
+        }
+        let mut bytes = Vec::new();
+        archive
+            .by_name(&archive_clip_path)
+            .map_err(|error| format!("无法读取动画 clip {}: {error}", clip.path))?
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("无法读取动画 clip {}: {error}", clip.path))?;
+        validate_animation_clip(id, clip, &bytes)?;
+        clip_files.push((clip.path.clone(), bytes));
+    }
+    Ok(Some((manifest_bytes, clip_files)))
 }
 
 /// Discover bundled pets from their own `pet.json` records. The frontend
@@ -914,6 +1297,23 @@ fn load_config(app: &tauri::AppHandle) -> AppConfig {
     };
     let mut config = serde_json::from_slice::<AppConfig>(&bytes).unwrap_or_default();
     normalize_config(&mut config);
+    // Older saved endpoints used the 300-token default, which truncates
+    // large structured replies mid-object. Raise stored budgets to the
+    // current floor so re-saving is not required after the upgrade.
+    for model in [&mut config.ai.chat_model, &mut config.ai.vision_model]
+        .into_iter()
+        .flatten()
+    {
+        if model.max_output_tokens < 1_024 {
+            model.max_output_tokens = 1_024;
+        }
+    }
+    // Drop instances whose pet resources no longer exist. Their windows were
+    // never created, and leaving them in place makes aggregate operations such
+    // as toggle_all_visibility fail halfway through.
+    config
+        .instances
+        .retain(|instance| instance.id == "main" || pet_exists(app, &instance.pet_id));
     config
 }
 
@@ -927,7 +1327,7 @@ fn normalize_config(config: &mut AppConfig) {
             0,
             PetInstanceConfig {
                 id: "main".to_string(),
-                pet_id: "sakimiao".to_string(),
+                pet_id: DEFAULT_PET_ID.to_string(),
                 visible: true,
                 position: None,
             },
@@ -942,6 +1342,8 @@ fn normalize_config(config: &mut AppConfig) {
         .retain(|instance| seen_pet_ids.insert(instance.pet_id.clone()));
     config.disabled_pet_ids.retain(|id| is_safe_id(id));
     config.settings = clamp_settings(config.settings.clone());
+    normalize_environment(&mut config.environment);
+    normalize_social(&mut config.social);
     config.pet_settings.retain(|id, _| is_safe_id(id));
     config
         .chat_positions
@@ -1015,7 +1417,36 @@ fn clamp_settings(mut settings: PetSettings) -> PetSettings {
     settings.scale = settings.scale.clamp(0.5, 2.5);
     settings.opacity = settings.opacity.clamp(0.2, 1.0);
     settings.speed = settings.speed.clamp(30.0, 240.0);
+    settings.sleep_start_minutes = settings.sleep_start_minutes.min(1_439);
+    settings.wake_minutes = settings.wake_minutes.min(1_439);
     settings
+}
+
+fn normalize_environment(settings: &mut EnvironmentSettings) {
+    settings.break_reminder_minutes = settings.break_reminder_minutes.clamp(30, 720);
+    settings.low_battery_threshold = settings.low_battery_threshold.clamp(5, 50);
+    settings.coding_apps = settings
+        .coding_apps
+        .iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .take(64)
+        .collect();
+    settings.meeting_apps = settings
+        .meeting_apps
+        .iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .take(64)
+        .collect();
+}
+
+fn normalize_social(settings: &mut SocialSettings) {
+    settings.min_interval_minutes = settings.min_interval_minutes.clamp(1, 120);
+    settings.max_interval_minutes = settings
+        .max_interval_minutes
+        .clamp(settings.min_interval_minutes, 240);
+    settings.max_participants = settings.max_participants.clamp(2, 4);
 }
 
 fn settings_for_pet(config: &AppConfig, pet_id: &str) -> PetSettings {
@@ -1101,6 +1532,19 @@ fn normalize_dialogue(mut dialogue: PetDialogue) -> PetDialogue {
     dialogue.walk = normalize_lines(dialogue.walk);
     dialogue.drag = normalize_lines(dialogue.drag);
     dialogue.idle = normalize_lines(dialogue.idle);
+    dialogue.morning = normalize_lines(dialogue.morning);
+    dialogue.evening = normalize_lines(dialogue.evening);
+    dialogue.sleep = normalize_lines(dialogue.sleep);
+    dialogue.wake = normalize_lines(dialogue.wake);
+    dialogue.petting = normalize_lines(dialogue.petting);
+    dialogue.feed = normalize_lines(dialogue.feed);
+    dialogue.play = normalize_lines(dialogue.play);
+    dialogue.pickup = normalize_lines(dialogue.pickup);
+    dialogue.put_down = normalize_lines(dialogue.put_down);
+    dialogue.low_battery = normalize_lines(dialogue.low_battery);
+    dialogue.break_reminder = normalize_lines(dialogue.break_reminder);
+    dialogue.reunion = normalize_lines(dialogue.reunion);
+    dialogue.milestone = normalize_lines(dialogue.milestone);
     if dialogue.double_click.is_empty() {
         dialogue.double_click = PetDialogue::default().double_click;
     }
@@ -1148,6 +1592,19 @@ fn decode_character(bytes: &[u8]) -> Result<CharacterCard, String> {
         &dialogue.walk,
         &dialogue.drag,
         &dialogue.idle,
+        &dialogue.morning,
+        &dialogue.evening,
+        &dialogue.sleep,
+        &dialogue.wake,
+        &dialogue.petting,
+        &dialogue.feed,
+        &dialogue.play,
+        &dialogue.pickup,
+        &dialogue.put_down,
+        &dialogue.low_battery,
+        &dialogue.break_reminder,
+        &dialogue.reunion,
+        &dialogue.milestone,
     ]
     .into_iter()
     .any(|lines| lines.iter().any(|line| line.chars().count() > 240));
@@ -1529,11 +1986,510 @@ fn show_ai_settings(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn show_environment_settings(app: &tauri::AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("environment-settings") else {
+        return Err("环境设置窗口不可用".to_string());
+    };
+    if window.is_minimized().unwrap_or(false) {
+        let _ = window.unminimize();
+    }
+    window
+        .show()
+        .map_err(|error| format!("failed to show environment settings: {error}"))?;
+    window
+        .set_focus()
+        .map_err(|error| format!("failed to focus environment settings: {error}"))?;
+    Ok(())
+}
+
+fn show_social_log(app: &tauri::AppHandle) -> Result<(), String> {
+    social::open_social_log(app.clone())
+}
+
+fn speech_window_label(instance_id: &str) -> Result<String, String> {
+    if !is_safe_id(instance_id) {
+        return Err("invalid pet instance id".to_string());
+    }
+    Ok(format!("pet-speech-{instance_id}"))
+}
+
+/// Keep short lines compact while retaining enough width for longer replies.
+/// The old fixed 260px window made even a one-line response cover nearby
+/// pets' bubbles.
+fn speech_window_size(text: &str) -> (f64, f64) {
+    let visual_units = text
+        .chars()
+        .map(|character| if character.is_ascii() { 0.58 } else { 1.0 })
+        .sum::<f64>();
+    let width = (visual_units * 13.0 + 38.0).clamp(
+        SPEECH_WINDOW_MIN_WIDTH,
+        SPEECH_WINDOW_MAX_WIDTH,
+    );
+    let units_per_line = ((width - 30.0) / 13.0).max(1.0);
+    let lines = (visual_units / units_per_line).ceil().clamp(1.0, 7.0);
+    let height = (30.0 + lines * 18.0).clamp(SPEECH_WINDOW_HEIGHT, 170.0);
+    (width, height)
+}
+
+fn speech_rect_overlaps(
+    first: (f64, f64, f64, f64),
+    second: (f64, f64, f64, f64),
+    gap: f64,
+) -> bool {
+    first.0 < second.2 + gap
+        && first.2 + gap > second.0
+        && first.1 < second.3 + gap
+        && first.3 + gap > second.1
+}
+
+/// Find a position for the speech window that does not intersect the pet or
+/// another visible speech window on the same monitor. Coordinates are
+/// calculated in physical pixels and converted only at the final API
+/// boundary; this keeps DPI scaling from making a small pet's bubble drift.
+fn pet_speech_position(
+    app: &tauri::AppHandle,
+    instance_id: &str,
+    pet_window: &tauri::WebviewWindow,
+    requested_size: Option<(f64, f64)>,
+    blocked_speech_rects: Option<&[(f64, f64, f64, f64)]>,
+) -> Result<LogicalPosition<f64>, String> {
+    let scale_factor = pet_window
+        .scale_factor()
+        .map_err(|error| error.to_string())?
+        .max(1.0);
+    let pet_position = pet_window
+        .outer_position()
+        .map_err(|error| error.to_string())?;
+    let pet_size = pet_window
+        .outer_size()
+        .map_err(|error| error.to_string())?;
+    let pet_x = f64::from(pet_position.x);
+    let pet_y = f64::from(pet_position.y);
+    let pet_width = f64::from(pet_size.width);
+    let pet_height = f64::from(pet_size.height);
+    let existing_size = app
+        .get_webview_window(&speech_window_label(instance_id)?)
+        .and_then(|window| window.outer_size().ok())
+        .map(|size| (f64::from(size.width), f64::from(size.height)));
+    let (bubble_width, bubble_height) = requested_size
+        .map(|(width, height)| (width * scale_factor, height * scale_factor))
+        .or(existing_size)
+        .unwrap_or((
+            SPEECH_WINDOW_MAX_WIDTH * scale_factor,
+            SPEECH_WINDOW_HEIGHT * scale_factor,
+        ));
+    let gap = SPEECH_WINDOW_GAP * scale_factor;
+
+    let Some(monitor) = pet_window.current_monitor().ok().flatten() else {
+        return Ok(LogicalPosition::new(
+            (pet_x + (pet_width - bubble_width) / 2.0) / scale_factor,
+            (pet_y - bubble_height - gap) / scale_factor,
+        ));
+    };
+    let work_area = monitor.work_area();
+    let work_left = f64::from(work_area.position.x);
+    let work_top = f64::from(work_area.position.y);
+    let work_right = work_left + f64::from(work_area.size.width);
+    let work_bottom = work_top + f64::from(work_area.size.height);
+    let monitor_key = format!("{}:{}", monitor.position().x, monitor.position().y);
+    let speech_label = speech_window_label(instance_id)?;
+    let occupied_speech_rects = blocked_speech_rects
+        .map(|rects| rects.to_vec())
+        .unwrap_or_else(|| {
+            app.webview_windows()
+                .into_iter()
+                .filter_map(|(label, window)| {
+                    if label == speech_label
+                        || !label.starts_with("pet-speech-")
+                        || !window.is_visible().unwrap_or(false)
+                    {
+                        return None;
+                    }
+                    let other_monitor_key = window
+                        .current_monitor()
+                        .ok()
+                        .flatten()
+                        .map(|other_monitor| {
+                            format!(
+                                "{}:{}",
+                                other_monitor.position().x,
+                                other_monitor.position().y
+                            )
+                        });
+                    if other_monitor_key.as_deref() != Some(monitor_key.as_str()) {
+                        return None;
+                    }
+                    let (Ok(position), Ok(size)) =
+                        (window.outer_position(), window.outer_size())
+                    else {
+                        return None;
+                    };
+                    let left = f64::from(position.x);
+                    let top = f64::from(position.y);
+                    Some((
+                        left,
+                        top,
+                        left + f64::from(size.width),
+                        top + f64::from(size.height),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        });
+
+    let preferred = if pet_y - bubble_height - gap >= work_top {
+        // Prefer the familiar speech-bubble position above the character.
+        (
+            pet_x + (pet_width - bubble_width) / 2.0,
+            pet_y - bubble_height - gap,
+        )
+    } else if pet_x - bubble_width - gap >= work_left {
+        // A pet at the top edge still gets a bubble without covering it.
+        (
+            pet_x - bubble_width - gap,
+            pet_y + (pet_height - bubble_height) / 2.0,
+        )
+    } else if pet_x + pet_width + bubble_width + gap <= work_right {
+        (
+            pet_x + pet_width + gap,
+            pet_y + (pet_height - bubble_height) / 2.0,
+        )
+    } else {
+        (
+            pet_x + (pet_width - bubble_width) / 2.0,
+            pet_y + pet_height + gap,
+        )
+    };
+
+    // Keep the whole bubble on the current monitor while trying the usual
+    // four sides first. If another bubble occupies the preferred side, the
+    // radial candidates below find the nearest free shelf around the pet.
+    let max_x = (work_right - bubble_width).max(work_left);
+    let max_y = (work_bottom - bubble_height).max(work_top);
+    let preferred_clamped = (
+        preferred.0.clamp(work_left, max_x),
+        preferred.1.clamp(work_top, max_y),
+    );
+    let mut candidates = Vec::with_capacity(40);
+    let mut add_candidate = |x: f64, y: f64| {
+        candidates.push((x.clamp(work_left, max_x), y.clamp(work_top, max_y)));
+    };
+    add_candidate(preferred.0, preferred.1);
+    add_candidate(
+        pet_x - bubble_width - gap,
+        pet_y + (pet_height - bubble_height) / 2.0,
+    );
+    add_candidate(
+        pet_x + pet_width + gap,
+        pet_y + (pet_height - bubble_height) / 2.0,
+    );
+    add_candidate(pet_x + (pet_width - bubble_width) / 2.0, pet_y + pet_height + gap);
+    let pet_center = (pet_x + pet_width / 2.0, pet_y + pet_height / 2.0);
+    for radius in [18.0, 42.0, 76.0, 120.0, 180.0, 260.0] {
+        for index in 0..8 {
+            let angle = f64::from(index) * std::f64::consts::TAU / 8.0;
+            add_candidate(
+                pet_center.0 + angle.cos() * radius - bubble_width / 2.0,
+                pet_center.1 + angle.sin() * radius - bubble_height / 2.0,
+            );
+        }
+    }
+    let pet_rect = (pet_x, pet_y, pet_x + pet_width, pet_y + pet_height);
+    let (x, y) = candidates
+        .into_iter()
+        .find(|(left, top)| {
+            let rect = (*left, *top, *left + bubble_width, *top + bubble_height);
+            !speech_rect_overlaps(rect, pet_rect, gap)
+                && occupied_speech_rects
+                    .iter()
+                    .all(|occupied| !speech_rect_overlaps(rect, *occupied, gap))
+        })
+        .unwrap_or(preferred_clamped);
+    Ok(LogicalPosition::new(x / scale_factor, y / scale_factor))
+}
+
+fn reposition_pet_speech_unlocked(
+    app: &tauri::AppHandle,
+    instance_id: &str,
+) -> Result<(), String> {
+    let Some(speech_window) = app.get_webview_window(&speech_window_label(instance_id)?) else {
+        return Ok(());
+    };
+    let Some(pet_window) = app.get_webview_window(&instance_label(instance_id)?) else {
+        return Ok(());
+    };
+    speech_window
+        .set_position(pet_speech_position(
+            app,
+            instance_id,
+            &pet_window,
+            None,
+            None,
+        )?)
+        .map_err(|error| error.to_string())
+}
+
+/// Reflow all currently visible speech windows in a stable order. This is
+/// needed because two independent WebViews can be shown in the same event
+/// turn before either one is observable through `is_visible()`.
+fn reflow_pet_speech_windows(app: &tauri::AppHandle) -> Result<(), String> {
+    let mut windows = app
+        .webview_windows()
+        .into_iter()
+        .filter(|(label, window)| {
+            label.starts_with("pet-speech-") && window.is_visible().unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    windows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut placed: Vec<(String, (f64, f64, f64, f64))> = Vec::new();
+
+    for (label, window) in windows {
+        let Some(instance_id) = label.strip_prefix("pet-speech-") else {
+            continue;
+        };
+        let Some(pet_window) = app.get_webview_window(&instance_label(instance_id)?) else {
+            continue;
+        };
+        let Some(monitor) = pet_window.current_monitor().ok().flatten() else {
+            continue;
+        };
+        let monitor_key = format!("{}:{}", monitor.position().x, monitor.position().y);
+        let blocked = placed
+            .iter()
+            .filter(|(key, _)| key == &monitor_key)
+            .map(|(_, rect)| *rect)
+            .collect::<Vec<_>>();
+        let position = pet_speech_position(
+            app,
+            instance_id,
+            &pet_window,
+            None,
+            Some(&blocked),
+        )?;
+        window
+            .set_position(position)
+            .map_err(|error| error.to_string())?;
+        let (Ok(actual_position), Ok(size)) = (window.outer_position(), window.outer_size())
+        else {
+            continue;
+        };
+        let left = f64::from(actual_position.x);
+        let top = f64::from(actual_position.y);
+        placed.push((
+            monitor_key,
+            (
+                left,
+                top,
+                left + f64::from(size.width),
+                top + f64::from(size.height),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn reposition_pet_speech(app: &tauri::AppHandle, instance_id: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    // Native window queries synchronously marshal to the macOS event loop.
+    // Never wait for this lock from an IPC command: the other side may be
+    // holding it while it is waiting for that same event loop.
+    let _layout = state.speech_layout.try_lock().ok();
+    reposition_pet_speech_unlocked(app, instance_id)
+}
+
+/// Keep the fallback direct-movement paths in the frontend synchronized too.
+/// Normally movement goes through `set_pet_position_safely`; this command is
+/// deliberately small so an older/restarting backend cannot leave a visible
+/// speech window at the pet's previous position.
+#[tauri::command]
+fn sync_pet_speech_position(app: tauri::AppHandle, instance_id: String) -> Result<(), String> {
+    reposition_pet_speech(&app, &instance_id)
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PetSpeechPayload {
+    instance_id: String,
+    pet_id: String,
+    text: String,
+    duration: u64,
+}
+
+#[tauri::command]
+fn pet_speech_ready(app: tauri::AppHandle, instance_id: String) -> Result<(), String> {
+    let label = speech_window_label(&instance_id)?;
+    if app.get_webview_window(&label).is_none() {
+        return Err("speech window is not available".to_string());
+    }
+    app.state::<AppState>()
+        .speech_ready
+        .lock()
+        .map_err(|_| "speech state lock is poisoned".to_string())?
+        .insert(instance_id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn show_pet_speech(
+    app: tauri::AppHandle,
+    instance_id: String,
+    pet_id: String,
+    text: String,
+    duration: u64,
+) -> Result<(), String> {
+    let instance_label = instance_label(&instance_id)?;
+    let speech_label = speech_window_label(&instance_id)?;
+    if !is_safe_id(&pet_id) || !pet_exists(&app, &pet_id) {
+        return Err("宠物资源不存在或校验失败".to_string());
+    }
+    let config = config_snapshot(&app)?;
+    if !config.instances.iter().any(|instance| {
+        instance.id == instance_id && instance.pet_id == pet_id && instance.visible
+    }) {
+        return Err("宠物实例不可见或不存在".to_string());
+    }
+    let Some(pet_window) = app.get_webview_window(&instance_label) else {
+        return Err("pet window is not available".to_string());
+    };
+    let text: String = text.trim().chars().take(100).collect();
+    if text.is_empty() {
+        return Ok(());
+    }
+    let speech_size = speech_window_size(&text);
+    {
+        // Layout is best-effort serialized when the lock is immediately
+        // available. Window APIs below may synchronously marshal to the
+        // platform event loop, so waiting for this lock can deadlock the main
+        // event loop while another command is reflowing speech windows.
+        let state = app.state::<AppState>();
+        let _layout = state.speech_layout.try_lock().ok();
+        let speech_window = if let Some(window) = app.get_webview_window(&speech_label) {
+            window
+        } else {
+            if let Ok(mut ready) = app.state::<AppState>().speech_ready.lock() {
+                ready.remove(&instance_id);
+            }
+            let position = pet_speech_position(
+                &app,
+                &instance_id,
+                &pet_window,
+                Some(speech_size),
+                None,
+            )?;
+            WebviewWindowBuilder::new(
+                &app,
+                &speech_label,
+                WebviewUrl::App(
+                    format!("speech.html?instance={instance_id}&petId={pet_id}").into(),
+                ),
+            )
+            .title("")
+            .inner_size(speech_size.0, speech_size.1)
+            .position(position.x, position.y)
+            .transparent(true)
+            .decorations(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .shadow(false)
+            .resizable(false)
+            .focused(false)
+            .visible(false)
+            .additional_browser_args(BROWSER_ARGS)
+            .build()
+            .map_err(|error| format!("failed to create speech window: {error}"))?
+        };
+        speech_window
+            .set_size(LogicalSize::new(speech_size.0, speech_size.1))
+            .map_err(|error| error.to_string())?;
+        let position = pet_speech_position(
+            &app,
+            &instance_id,
+            &pet_window,
+            Some(speech_size),
+            None,
+        )?;
+        speech_window
+            .set_position(position)
+            .map_err(|error| error.to_string())?;
+        apply_fullscreen_visibility(
+            &speech_window,
+            settings_for_pet(&config, &pet_id).show_in_fullscreen,
+        )?;
+        speech_window
+            .show()
+            .map_err(|error| format!("failed to show speech window: {error}"))?;
+        reflow_pet_speech_windows(&app)?;
+    }
+
+    let payload = PetSpeechPayload {
+        instance_id: instance_id.clone(),
+        pet_id,
+        text,
+        duration: duration.clamp(900, 12_000),
+    };
+    // A newly created WebView may not have registered its listener when the
+    // Rust command returns. Wait for the page's explicit ready signal instead
+    // of dropping the first line or replaying it on a timer.
+    let app_for_event = app.clone();
+    tauri::async_runtime::spawn(async move {
+        for _ in 0..40 {
+            let ready = app_for_event
+                .state::<AppState>()
+                .speech_ready
+                .lock()
+                .map(|ready| ready.contains(&instance_id))
+                .unwrap_or(false);
+            if ready {
+                if let Some(window) = app_for_event.get_webview_window(&speech_label) {
+                    let _ = window.emit("speech://show", &payload);
+                }
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        eprintln!("speech window did not become ready in time");
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn hide_pet_speech(app: tauri::AppHandle, instance_id: String) -> Result<(), String> {
+    let label = speech_window_label(&instance_id)?;
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.emit("speech://hide", ());
+        window
+            .hide()
+            .map_err(|error| format!("failed to hide speech window: {error}"))?;
+    }
+    Ok(())
+}
+
 fn chat_window_label(pet_id: &str) -> Result<String, String> {
     if !is_safe_id(pet_id) {
         return Err("invalid pet id".to_string());
     }
     Ok(format!("pet-chat-{pet_id}"))
+}
+
+#[tauri::command]
+async fn toggle_pet_chat(app: tauri::AppHandle, pet_id: String) -> Result<bool, String> {
+    if !pet_exists(&app, &pet_id) {
+        return Err("宠物资源不存在或校验失败".to_string());
+    }
+    let label = chat_window_label(&pet_id)?;
+    if let Some(window) = app.get_webview_window(&label) {
+        if window.is_visible().map_err(|error| error.to_string())? {
+            hide_pet_chat(app.clone(), pet_id)?;
+            return Ok(false);
+        }
+        if window.is_minimized().unwrap_or(false) {
+            let _ = window.unminimize();
+        }
+        window.show().map_err(|error| error.to_string())?;
+        window.set_focus().map_err(|error| error.to_string())?;
+        return Ok(true);
+    }
+    open_pet_chat(app, pet_id).await?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -1623,8 +2579,65 @@ fn open_ai_settings(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_environment_settings(app: tauri::AppHandle) -> Result<(), String> {
+    show_environment_settings(&app)
+}
+
+#[tauri::command]
+fn get_environment_settings(app: tauri::AppHandle) -> Result<EnvironmentSettings, String> {
+    Ok(config_snapshot(&app)?.environment)
+}
+
+#[tauri::command]
+fn update_environment_settings(
+    app: tauri::AppHandle,
+    settings: EnvironmentSettings,
+) -> Result<EnvironmentSettings, String> {
+    let config = update_config(&app, |config| {
+        config.environment = settings;
+        Ok(())
+    })?;
+    Ok(config.environment)
+}
+
+#[tauri::command]
 fn get_pet_catalog(app: tauri::AppHandle) -> Result<Vec<InstalledPet>, String> {
     Ok(installed_pets(&app, &config_snapshot(&app)?))
+}
+
+#[tauri::command]
+fn get_pet_preview(app: tauri::AppHandle, pet_id: String) -> Result<PetPreview, String> {
+    if !is_safe_id(&pet_id) {
+        return Err("invalid pet id".to_string());
+    }
+
+    if let Some((manifest, sprite)) = pet_is_imported(&app, &pet_id) {
+        return Ok(PetPreview {
+            id: manifest.id,
+            display_name: manifest.display_name,
+            description: manifest.description,
+            sprite_version_number: manifest.sprite_version_number,
+            spritesheet_data_url: data_url(&manifest.spritesheet_path, &sprite),
+        });
+    }
+
+    let bundled = pet_is_bundled(&app, &pet_id)
+        .ok_or_else(|| "pet resource is not installed".to_string())?;
+    let sprite_path = bundled_pet_roots(&app)
+        .into_iter()
+        .map(|root| root.join(&bundled.path).join(&bundled.manifest.spritesheet_path))
+        .find(|path| path.is_file())
+        .ok_or_else(|| "pet spritesheet is not installed".to_string())?;
+    let sprite = fs::read(&sprite_path)
+        .map_err(|error| format!("failed to read pet preview: {error}"))?;
+
+    Ok(PetPreview {
+        id: bundled.manifest.id,
+        display_name: bundled.manifest.display_name,
+        description: bundled.manifest.description,
+        sprite_version_number: bundled.manifest.sprite_version_number,
+        spritesheet_data_url: data_url(&bundled.manifest.spritesheet_path, &sprite),
+    })
 }
 
 #[tauri::command]
@@ -1644,6 +2657,221 @@ fn get_pet_instances(app: tauri::AppHandle) -> Result<Vec<PetInstanceInfo>, Stri
 fn get_visible_pets(app: tauri::AppHandle) -> Result<Vec<PetInstanceInfo>, String> {
     let config = config_snapshot(&app)?;
     Ok(visible_instances(&app, &config))
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PetOccupancy {
+    instance_id: String,
+    pet_id: String,
+    monitor_key: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// Logical rects of every other visible pet window, so a pet's autonomous
+/// walker can stop before running into a sibling instead of passing through
+/// it. Self is excluded by instance id.
+#[tauri::command]
+fn get_pet_occupancies(
+    app: tauri::AppHandle,
+    instance_id: String,
+) -> Result<Vec<PetOccupancy>, String> {
+    if !is_safe_id(&instance_id) {
+        return Ok(Vec::new());
+    }
+    let config = config_snapshot(&app)?;
+    let source_label = instance_label(&instance_id)?;
+    let Some(source_window) = app.get_webview_window(&source_label) else {
+        return Ok(Vec::new());
+    };
+    let source_monitor_key = source_window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| format!("{}:{}", monitor.position().x, monitor.position().y));
+    let mut result = Vec::new();
+    for instance in config.instances.iter().filter(|instance| {
+        instance.id != instance_id
+            && instance.visible
+            && {
+                let settings = settings_for_pet(&config, &instance.pet_id);
+                settings.social_enabled && !settings.paused && !settings.quiet_mode
+            }
+            && !config
+                .disabled_pet_ids
+                .iter()
+                .any(|id| id == &instance.pet_id)
+    }) {
+        let label = instance_label(&instance.id)?;
+        let Some(window) = app.get_webview_window(&label) else {
+            continue;
+        };
+        if !window.is_visible().unwrap_or(false) {
+            continue;
+        }
+        let (Ok(position), Ok(size), Ok(scale_factor)) =
+            (window.outer_position(), window.outer_size(), window.scale_factor())
+        else {
+            continue;
+        };
+        let Some(monitor_key) = window
+            .current_monitor()
+            .ok()
+            .flatten()
+            .map(|monitor| format!("{}:{}", monitor.position().x, monitor.position().y))
+        else {
+            continue;
+        };
+        if source_monitor_key.as_deref() != Some(monitor_key.as_str()) {
+            continue;
+        }
+        let logical_position = position.to_logical(scale_factor);
+        let logical_size = size.to_logical(scale_factor);
+        result.push(PetOccupancy {
+            instance_id: instance.id.clone(),
+            pet_id: instance.pet_id.clone(),
+            monitor_key,
+            x: logical_position.x,
+            y: logical_position.y,
+            width: logical_size.width,
+            height: logical_size.height,
+        });
+    }
+    Ok(result)
+}
+
+const PET_COLLISION_GAP: f64 = 12.0;
+
+fn pet_rect_overlaps(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    other: &PetOccupancy,
+) -> bool {
+    x < other.x + other.width + PET_COLLISION_GAP
+        && x + width + PET_COLLISION_GAP > other.x
+        && y < other.y + other.height + PET_COLLISION_GAP
+        && y + height + PET_COLLISION_GAP > other.y
+}
+
+fn pet_position_is_clear(
+    position: &PetPosition,
+    width: f64,
+    height: f64,
+    occupancies: &[PetOccupancy],
+) -> bool {
+    occupancies
+        .iter()
+        .all(|other| !pet_rect_overlaps(position.x, position.y, width, height, other))
+}
+
+/// Move a dragged pet to the closest non-overlapping position. The frontend
+/// still owns pointer tracking, but final placement is arbitrated in Rust so
+/// transparent pet windows cannot be dragged through one another by accident.
+#[tauri::command]
+fn set_pet_position_safely(
+    app: tauri::AppHandle,
+    instance_id: String,
+    x: f64,
+    y: f64,
+) -> Result<PetPosition, String> {
+    if !is_safe_id(&instance_id) {
+        return Err("invalid pet instance id".to_string());
+    }
+    let label = instance_label(&instance_id)?;
+    let window = app
+        .get_webview_window(&label)
+        .ok_or_else(|| "pet window is not available".to_string())?;
+    let scale_factor = window
+        .scale_factor()
+        .map_err(|error| error.to_string())?
+        .max(1.0);
+    let size = window
+        .outer_size()
+        .map_err(|error| error.to_string())?
+        .to_logical(scale_factor);
+    let current_position = window
+        .outer_position()
+        .map_err(|error| error.to_string())?
+        .to_logical(scale_factor);
+    let occupancies = get_pet_occupancies(app.clone(), instance_id.clone())?;
+    let requested = PetPosition { x, y };
+    let mut candidates = vec![requested.clone()];
+    for other in &occupancies {
+        candidates.extend([
+            PetPosition {
+                x: other.x - size.width - PET_COLLISION_GAP,
+                y,
+            },
+            PetPosition {
+                x: other.x + other.width + PET_COLLISION_GAP,
+                y,
+            },
+            PetPosition {
+                x,
+                y: other.y - size.height - PET_COLLISION_GAP,
+            },
+            PetPosition {
+                x,
+                y: other.y + other.height + PET_COLLISION_GAP,
+            },
+            PetPosition {
+                x: other.x - size.width - PET_COLLISION_GAP,
+                y: other.y - size.height - PET_COLLISION_GAP,
+            },
+            PetPosition {
+                x: other.x + other.width + PET_COLLISION_GAP,
+                y: other.y - size.height - PET_COLLISION_GAP,
+            },
+            PetPosition {
+                x: other.x - size.width - PET_COLLISION_GAP,
+                y: other.y + other.height + PET_COLLISION_GAP,
+            },
+            PetPosition {
+                x: other.x + other.width + PET_COLLISION_GAP,
+                y: other.y + other.height + PET_COLLISION_GAP,
+            },
+        ]);
+    }
+    // If several pets form a small cluster, a side candidate for one window
+    // can still be blocked by the next window. Search a few concentric rings
+    // so the drag/step remains safe without ever teleporting across a screen.
+    for radius in [32.0, 64.0, 96.0, 128.0, 192.0, 256.0, 384.0, 512.0] {
+        for index in 0..16 {
+            let angle = f64::from(index) * std::f64::consts::TAU / 16.0;
+            candidates.push(PetPosition {
+                x: requested.x + angle.cos() * radius,
+                y: requested.y + angle.sin() * radius,
+            });
+        }
+    }
+    candidates.sort_by(|left, right| {
+        let left_distance = (left.x - requested.x).hypot(left.y - requested.y);
+        let right_distance = (right.x - requested.x).hypot(right.y - requested.y);
+        left_distance
+            .partial_cmp(&right_distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let safe = candidates
+        .into_iter()
+        .find(|candidate| pet_position_is_clear(candidate, size.width, size.height, &occupancies))
+        .or_else(|| {
+            let current = PetPosition {
+                x: current_position.x,
+                y: current_position.y,
+            };
+            pet_position_is_clear(&current, size.width, size.height, &occupancies).then_some(current)
+        })
+        .unwrap_or(requested);
+    window
+        .set_position(LogicalPosition::new(safe.x, safe.y))
+        .map_err(|error| error.to_string())?;
+    let _ = reposition_pet_speech(&app, &instance_id);
+    Ok(safe)
 }
 
 #[tauri::command]
@@ -1671,6 +2899,7 @@ fn get_runtime_config(
             settings: settings_for_pet(&config, &instance.pet_id),
             dialogue: character.dialogue.clone(),
             character,
+            animation_pack: animation_pack_for_pet(&app, &instance.pet_id),
         });
     }
     let bundled = pet_is_bundled(&app, &instance.pet_id)
@@ -1686,6 +2915,7 @@ fn get_runtime_config(
         settings: settings_for_pet(&config, &instance.pet_id),
         dialogue: character.dialogue.clone(),
         character,
+        animation_pack: animation_pack_for_pet(&app, &instance.pet_id),
     })
 }
 
@@ -1709,6 +2939,10 @@ fn set_instance_visible_internal(
         .iter()
         .find(|instance| instance.id == instance_id)
         .ok_or_else(|| "pet instance is not configured".to_string())?;
+    if !visible {
+        social::cancel_scenes_for_pet(app, &instance.pet_id);
+        let _ = hide_pet_speech(app.clone(), instance_id.to_string());
+    }
     let window = app
         .get_webview_window(&instance_label(instance_id)?)
         .ok_or_else(|| "pet window is not available".to_string())?;
@@ -1816,7 +3050,13 @@ fn remove_pet_instance(
     if let Some(window) = app.get_webview_window(&instance_label(&instance_id)?) {
         window.close().map_err(|error| error.to_string())?;
     }
+    if let Some(window) = app.get_webview_window(&speech_window_label(&instance_id)?) {
+        window
+            .destroy()
+            .map_err(|error| format!("failed to close speech window: {error}"))?;
+    }
     if let Some(pet_id) = removed_pet_id {
+        social::cancel_scenes_for_pet(&app, &pet_id);
         let pet_still_has_instance = config
             .instances
             .iter()
@@ -1863,16 +3103,23 @@ fn broadcast_settings(
 ) -> Result<(), String> {
     let config = config_snapshot(app)?;
     for (label, window) in app.webview_windows() {
-        let Some(instance_id) = instance_id_from_label(&label) else {
-            continue;
-        };
-        if is_pet_window_label(&label)
-            && config
-                .instances
-                .iter()
-                .any(|instance| instance.id == instance_id && instance.pet_id == pet_id)
-        {
-            apply_window_settings(&window, settings)?;
+        if let Some(instance_id) = instance_id_from_label(&label) {
+            if is_pet_window_label(&label)
+                && config
+                    .instances
+                    .iter()
+                    .any(|instance| instance.id == instance_id && instance.pet_id == pet_id)
+            {
+                apply_window_settings(&window, settings)?;
+            }
+        }
+        if let Some(speech_instance_id) = label.strip_prefix("pet-speech-") {
+            if config.instances.iter().any(|instance| {
+                instance.id == speech_instance_id && instance.pet_id == pet_id
+            }) {
+                let _ = reposition_pet_speech(app, speech_instance_id);
+                apply_fullscreen_visibility(&window, settings.show_in_fullscreen)?;
+            }
         }
     }
     app.emit(
@@ -1901,6 +3148,9 @@ fn update_pet_settings(
     })?;
     sync_macos_activation_policy(&app, &config)?;
     let saved = settings_for_pet(&config, &pet_id);
+    if !saved.social_enabled || saved.paused || saved.quiet_mode {
+        social::cancel_scenes_for_pet(&app, &pet_id);
+    }
     broadcast_settings(&app, &pet_id, &saved)?;
     Ok(saved)
 }
@@ -1916,6 +3166,9 @@ fn toggle_pet_pause_internal(app: &tauri::AppHandle, pet_id: &str) -> Result<Pet
         Ok(())
     })?;
     let settings = settings_for_pet(&config, pet_id);
+    if settings.paused {
+        social::cancel_scenes_for_pet(app, pet_id);
+    }
     broadcast_settings(app, pet_id, &settings)?;
     Ok(settings)
 }
@@ -1960,6 +3213,9 @@ fn set_pet_enabled(
 ) -> Result<Vec<InstalledPet>, String> {
     if !pet_exists(&app, &pet_id) {
         return Err("宠物资源不存在或校验失败".to_string());
+    }
+    if !enabled {
+        social::cancel_scenes_for_pet(&app, &pet_id);
     }
     let config = update_config(&app, |config| {
         config.disabled_pet_ids.retain(|id| id != &pet_id);
@@ -2032,6 +3288,157 @@ fn validate_imported_manifest(
     Ok(())
 }
 
+fn pet_root_for_export(app: &tauri::AppHandle, pet_id: &str) -> Result<PathBuf, String> {
+    if !is_safe_id(pet_id) {
+        return Err("宠物 id 不合法".to_string());
+    }
+
+    // Imported resources take precedence here, just like they do when the
+    // runtime loads animation packs. This also means exporting a user's
+    // imported pet never accidentally reads a bundled resource with the same
+    // id.
+    let imported_root = imported_pets_path(app)?.join(pet_id);
+    if imported_root.join("pet.json").is_file() {
+        return Ok(imported_root);
+    }
+
+    let bundled = pet_is_bundled(app, pet_id)
+        .ok_or_else(|| format!("找不到宠物资源: {pet_id}"))?;
+    bundled_pet_roots(app)
+        .into_iter()
+        .map(|root| root.join(&bundled.path))
+        .find(|root| root.join("pet.json").is_file())
+        .ok_or_else(|| format!("找不到宠物资源目录: {pet_id}"))
+}
+
+fn collect_pet_export_entries(
+    root: &Path,
+    pet_id: &str,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let manifest_bytes = fs::read(root.join("pet.json"))
+        .map_err(|error| format!("无法读取 pet.json: {error}"))?;
+    let manifest = serde_json::from_slice::<PetManifest>(&manifest_bytes)
+        .map_err(|error| format!("pet.json 格式错误: {error}"))?;
+    let sprite_path = manifest.spritesheet_path.clone();
+    let sprite = fs::read(root.join(&sprite_path))
+        .map_err(|error| format!("无法读取 spritesheet {}: {error}", sprite_path))?;
+    validate_imported_manifest(&manifest, pet_id, &sprite_path, &sprite)?;
+
+    let mut entries = Vec::new();
+    let mut names = HashSet::new();
+    let mut add_entry = |relative_path: &str, bytes: Vec<u8>| -> Result<(), String> {
+        if !is_safe_relative_path(relative_path) || !names.insert(relative_path.to_string()) {
+            return Err(format!("宠物包内出现重复或不安全的路径: {relative_path}"));
+        }
+        entries.push((relative_path.to_string(), bytes));
+        Ok(())
+    };
+
+    add_entry("pet.json", manifest_bytes)?;
+    add_entry(&sprite_path, sprite)?;
+
+    // character.json is part of the shareable identity, but no application
+    // state is. Validate it before exporting so the resulting package can be
+    // imported again without silently losing its character card.
+    let character_path = root.join("character.json");
+    if character_path.is_file() {
+        let bytes = fs::read(&character_path)
+            .map_err(|error| format!("无法读取 character.json: {error}"))?;
+        decode_character(&bytes)?;
+        add_entry("character.json", bytes)?;
+    }
+
+    // The animation manifest is the authoritative list of action assets.
+    // Export only those referenced clips rather than copying arbitrary files
+    // from the pet directory, which keeps memories, chat history, state and
+    // future private files out of the package by construction.
+    let animation_path = root.join(ANIMATION_PACK_FILE_NAME);
+    if animation_path.is_file() {
+        let animation_manifest_bytes = fs::read(&animation_path)
+            .map_err(|error| format!("无法读取 animations.json: {error}"))?;
+        let manifest = parse_animation_pack(&animation_manifest_bytes)?;
+        add_entry(ANIMATION_PACK_FILE_NAME, animation_manifest_bytes)?;
+
+        let mut clips: Vec<(&String, &AnimationClipManifest)> = manifest.clips.iter().collect();
+        clips.sort_by(|left, right| left.0.cmp(right.0));
+        for (id, clip) in clips {
+            let bytes = fs::read(root.join(&clip.path))
+                .map_err(|error| format!("无法读取动画 clip {}: {error}", clip.path))?;
+            validate_animation_clip(id, clip, &bytes)?;
+            add_entry(&clip.path, bytes)?;
+        }
+    }
+
+    Ok(entries)
+}
+
+fn write_pet_archive(
+    mut output_path: PathBuf,
+    pet_id: &str,
+    entries: Vec<(String, Vec<u8>)>,
+) -> Result<String, String> {
+    if output_path.extension().and_then(|extension| extension.to_str()) != Some("zip") {
+        output_path.set_extension("zip");
+    }
+
+    let output = fs::File::create(&output_path)
+        .map_err(|error| format!("无法创建导出文件: {error}"))?;
+    let mut archive = ZipWriter::new(output);
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+    for (relative_path, bytes) in entries {
+        archive
+            .start_file(format!("{pet_id}/{relative_path}"), options)
+            .map_err(|error| format!("无法写入宠物包: {error}"))?;
+        archive
+            .write_all(&bytes)
+            .map_err(|error| format!("无法写入宠物资源 {relative_path}: {error}"))?;
+    }
+    archive
+        .finish()
+        .map_err(|error| format!("无法完成宠物包: {error}"))?;
+    Ok(output_path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn export_pet_package(app: tauri::AppHandle, pet_id: String) -> Result<(), String> {
+    let root = pet_root_for_export(&app, &pet_id)?;
+    let entries = collect_pet_export_entries(&root, &pet_id)?;
+    let event_pet_id = pet_id.clone();
+    app.dialog()
+        .file()
+        .set_title("导出宠物包")
+        .set_file_name(format!("{pet_id}.zip"))
+        .add_filter("SakiPet 宠物包", &["zip"])
+        .save_file(move |file_path| {
+            let payload = match file_path {
+                None => serde_json::json!({
+                    "petId": event_pet_id,
+                    "cancelled": true,
+                }),
+                Some(file_path) => match file_path
+                    .into_path()
+                    .map_err(|error| format!("无法读取导出路径: {error}"))
+                    .and_then(|path| write_pet_archive(path, &event_pet_id, entries))
+                {
+                    Ok(path) => serde_json::json!({
+                        "petId": event_pet_id,
+                        "cancelled": false,
+                        "path": path,
+                    }),
+                    Err(error) => serde_json::json!({
+                        "petId": event_pet_id,
+                        "cancelled": false,
+                        "error": error,
+                    }),
+                },
+            };
+            let _ = app.emit("pet://pet-export-finished", payload);
+        });
+    Ok(())
+}
+
 #[tauri::command]
 fn import_pet_package(
     app: tauri::AppHandle,
@@ -2092,6 +3499,13 @@ fn import_pet_package(
     } else {
         None
     };
+    let animation_pack = match animation_pack_from_archive(&mut archive, &root) {
+        Ok(pack) => pack,
+        Err(error) => {
+            eprintln!("忽略宠物包中的 animations.json: {error}");
+            None
+        }
+    };
     if pet_is_bundled(&app, &manifest.id).is_some() || pet_is_imported(&app, &manifest.id).is_some()
     {
         return Err(format!("宠物 id 已存在: {}", manifest.id));
@@ -2107,6 +3521,22 @@ fn import_pet_package(
     if let Some((character_bytes, _)) = &character {
         fs::write(pet_root.join("character.json"), character_bytes)
             .map_err(|error| format!("无法保存 character.json: {error}"))?;
+    }
+    if let Some((animation_manifest_bytes, clip_files)) = animation_pack {
+        fs::write(
+            pet_root.join(ANIMATION_PACK_FILE_NAME),
+            animation_manifest_bytes,
+        )
+        .map_err(|error| format!("无法保存 animations.json: {error}"))?;
+        for (clip_path, bytes) in clip_files {
+            let target = pet_root.join(&clip_path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("无法创建动画目录: {error}"))?;
+            }
+            fs::write(&target, bytes)
+                .map_err(|error| format!("无法保存动画 clip {}: {error}", clip_path))?;
+        }
     }
     rebuild_tray_menu(&app).map_err(|error| error.to_string())?;
     let config = config_snapshot(&app)?;
@@ -2178,6 +3608,11 @@ fn remove_imported_pet(app: tauri::AppHandle, pet_id: String) -> Result<Vec<Inst
                 .close()
                 .map_err(|error| format!("宠物资源已删除，但关闭显示窗口失败: {error}"))?;
         }
+        if let Some(window) = app.get_webview_window(&speech_window_label(&instance_id)?) {
+            window
+                .destroy()
+                .map_err(|error| format!("宠物资源已删除，但关闭气泡窗口失败: {error}"))?;
+        }
     }
     if let Some(window) = app.get_webview_window(&chat_window_label(&pet_id)?) {
         window
@@ -2198,7 +3633,9 @@ fn toggle_all_visibility(app: &tauri::AppHandle) -> Result<(), String> {
         .map(|instance| instance.id.clone())
         .collect();
     for id in ids {
-        set_instance_visible_internal(app, &id, target)?;
+        if let Err(error) = set_instance_visible_internal(app, &id, target) {
+            eprintln!("failed to toggle pet instance {id}: {error}");
+        }
     }
     rebuild_tray_menu(app).map_err(|error| error.to_string())
 }
@@ -2206,12 +3643,21 @@ fn toggle_all_visibility(app: &tauri::AppHandle) -> Result<(), String> {
 fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     let manage_pets = MenuItem::with_id(app, "app-manage-pets", "管理宠物", true, None::<&str>)?;
     let ai_settings = MenuItem::with_id(app, "app-ai-settings", "AI 设置", true, None::<&str>)?;
+    let environment_settings = MenuItem::with_id(
+        app,
+        "app-environment-settings",
+        "环境与权限",
+        true,
+        None::<&str>,
+    )?;
+    let social_settings = MenuItem::with_id(app, "app-social-settings", "社交设置", true, None::<&str>)?;
+    let social_log = MenuItem::with_id(app, "app-social-log", "宠物日志", true, None::<&str>)?;
     let app_submenu = Submenu::with_id_and_items(
         app,
         "sakipet-app-menu",
         "SakiPet",
         true,
-        &[&manage_pets, &ai_settings],
+        &[&manage_pets, &ai_settings, &environment_settings, &social_settings, &social_log],
     )?;
     let menu = Menu::with_items(app, &[&app_submenu])?;
     app.set_menu(menu)?;
@@ -2226,8 +3672,326 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
                 eprintln!("{error}");
             }
         }
+        "app-environment-settings" => {
+            if let Err(error) = show_environment_settings(app) {
+                eprintln!("{error}");
+            }
+        }
+        "app-social-log" => {
+            if let Err(error) = show_social_log(app) {
+                eprintln!("{error}");
+            }
+        }
+        "app-social-settings" => {
+            if let Err(error) = social::open_social_settings(app.clone()) {
+                eprintln!("{error}");
+            }
+        }
+        id if id.starts_with("pet-context:") => {
+            if let Err(error) = handle_pet_context_action(app, id) {
+                eprintln!("failed to handle pet context action: {error}");
+            }
+        }
         _ => {}
     });
+    Ok(())
+}
+
+#[tauri::command]
+fn show_pet_context_menu(app: tauri::AppHandle, window_label: String) -> Result<(), String> {
+    let instance_id =
+        instance_id_from_label(&window_label).ok_or_else(|| "无效的宠物窗口".to_string())?;
+    let config = config_snapshot(&app)?;
+    let instance = config
+        .instances
+        .iter()
+        .find(|instance| instance.id == instance_id)
+        .ok_or_else(|| "宠物实例不存在".to_string())?;
+    let window = app
+        .get_webview_window(&window_label)
+        .ok_or_else(|| "宠物窗口不可用".to_string())?;
+    let pet_id = &instance.pet_id;
+    let item = |action: &str, title: String| -> Result<MenuItem<Wry>, String> {
+        MenuItem::with_id(
+            &app,
+            format!("pet-context:{action}:{instance_id}:{pet_id}"),
+            title,
+            true,
+            None::<&str>,
+        )
+        .map_err(|error| error.to_string())
+    };
+    let life = ai::get_pet_state(app.clone(), pet_id.to_string()).ok();
+    let food_left = life.as_ref().map(|state| state.food).unwrap_or(0);
+    let feed = item("feed", format!("喂食（剩 {food_left}）"))?;
+    let play = item("play", "玩耍".to_string())?;
+    let mut toy_items: Vec<MenuItem<Wry>> = Vec::new();
+    let toy_label = |toy: &str| match toy {
+        "football" => "踢足球",
+        "ribbon" => "玩彩带",
+        "plush" => "抱毛绒玩具",
+        _ => "玩玩具",
+    };
+    if let Some(state) = life.as_ref() {
+        for toy in &state.toy_ids {
+            if toy == "snack" {
+                continue;
+            }
+            toy_items.push(item(&format!("toy-{toy}"), toy_label(toy).to_string())?);
+        }
+    }
+    let toy_refs: Vec<&dyn tauri::menu::IsMenuItem<Wry>> = toy_items
+        .iter()
+        .map(|item| item as &dyn tauri::menu::IsMenuItem<Wry>)
+        .collect();
+    let toys = Submenu::with_id_and_items(
+        &app,
+        format!("pet-toys-menu-{instance_id}"),
+        "一起玩",
+        !toy_refs.is_empty(),
+        &toy_refs,
+    )
+    .map_err(|error| error.to_string())?;
+    let pet = item("petting", "抚摸提示".to_string())?;
+    let sleep = item(
+        if ai::is_pet_sleeping(&app, pet_id) {
+            "wake"
+        } else {
+            "sleep"
+        },
+        if ai::is_pet_sleeping(&app, pet_id) {
+            "叫醒它".to_string()
+        } else {
+            "让它睡觉".to_string()
+        },
+    )?;
+    let chat = item("chat", "和它说话".to_string())?;
+    let settings = item("settings", "独立设置".to_string())?;
+    let hide = item("hide", "隐藏".to_string())?;
+    let friends = item("find-friends", "找朋友".to_string())?;
+    let source_monitor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| {
+            (
+                monitor.position().x,
+                monitor.position().y,
+                monitor.size().width,
+                monitor.size().height,
+            )
+        });
+    let mut friend_items = Vec::new();
+    for candidate in &config.instances {
+        if candidate.id == instance_id
+            || !candidate.visible
+            || !settings_for_pet(&config, &candidate.pet_id).social_enabled
+            || config
+                .disabled_pet_ids
+                .iter()
+                .any(|id| id == &candidate.pet_id)
+        {
+            continue;
+        }
+        let Some(candidate_window) = app.get_webview_window(&instance_label(&candidate.id)?)
+        else {
+            continue;
+        };
+        let candidate_monitor = candidate_window
+            .current_monitor()
+            .ok()
+            .flatten()
+            .map(|monitor| {
+                (
+                    monitor.position().x,
+                    monitor.position().y,
+                    monitor.size().width,
+                    monitor.size().height,
+                )
+            });
+        if source_monitor.is_some() && candidate_monitor != source_monitor {
+            continue;
+        }
+        let name = pet_display_name(&app, &candidate.pet_id);
+        friend_items.push(MenuItem::with_id(
+            &app,
+            format!(
+                "pet-context:find-friend-{}:{}:{}",
+                candidate.pet_id, instance_id, pet_id
+            ),
+            format!("和 {name} 互动"),
+            true,
+            None::<&str>,
+        ).map_err(|error| error.to_string())?);
+    }
+    let friend_refs: Vec<&dyn tauri::menu::IsMenuItem<Wry>> = friend_items
+        .iter()
+        .map(|item| item as &dyn tauri::menu::IsMenuItem<Wry>)
+        .collect();
+    let friend_submenu = Submenu::with_id_and_items(
+        &app,
+        format!("pet-friends-menu-{instance_id}"),
+        "同屏宠物",
+        !friend_refs.is_empty(),
+        &friend_refs,
+    )
+    .map_err(|error| error.to_string())?;
+    let menu = Menu::with_items(
+        &app,
+        &[
+            &feed,
+            &play,
+            &toys,
+            &pet,
+            &sleep,
+            &friends,
+            &friend_submenu,
+            &chat,
+            &settings,
+            &hide,
+        ],
+    )
+        .map_err(|error| error.to_string())?;
+    window
+        .popup_menu_at(&menu, pet_context_menu_position(&window))
+        .map_err(|error| format!("无法显示宠物菜单: {error}"))
+}
+
+/// Put the native context menu beside the pet instead of under the pointer.
+///
+/// The menu width is intentionally an estimate: the native menu calculates
+/// its final width after it is shown. We only need enough room to decide
+/// whether the menu should open on the right or the left side of the pet.
+fn pet_context_menu_position(window: &tauri::WebviewWindow) -> LogicalPosition<f64> {
+    let scale_factor = window.scale_factor().unwrap_or(1.0).max(1.0);
+    let window_width = window
+        .outer_size()
+        .map(|size| f64::from(size.width) / scale_factor)
+        .unwrap_or(PET_WIDTH);
+    let window_position = window.outer_position().ok();
+    let monitor = window.current_monitor().ok().flatten();
+
+    let can_open_right = match (window_position, monitor) {
+        (Some(position), Some(monitor)) => {
+            let pet_right = f64::from(position.x) + window_width * scale_factor;
+            let monitor_right = f64::from(monitor.position().x)
+                + f64::from(monitor.size().width);
+            let required_space =
+                (CONTEXT_MENU_ESTIMATED_WIDTH + CONTEXT_MENU_GAP) * scale_factor;
+            monitor_right - pet_right >= required_space
+        }
+        // If monitor geometry is temporarily unavailable while the window is
+        // being created, the right side is the least surprising default.
+        _ => true,
+    };
+
+    let x = if can_open_right {
+        window_width + CONTEXT_MENU_GAP
+    } else {
+        -(CONTEXT_MENU_ESTIMATED_WIDTH + CONTEXT_MENU_GAP)
+    };
+
+    // Keep the top of the menu near the top of the pet. The native menu may
+    // further clamp itself when the pet is close to the bottom of a display.
+    LogicalPosition::new(x, CONTEXT_MENU_GAP)
+}
+
+fn handle_pet_context_action(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
+    let mut parts = id.splitn(4, ':');
+    let _prefix = parts.next();
+    let action = parts.next().ok_or_else(|| "缺少菜单动作".to_string())?;
+    let instance_id = parts.next().ok_or_else(|| "缺少宠物实例".to_string())?;
+    let pet_id = parts.next().ok_or_else(|| "缺少宠物 id".to_string())?;
+    let label = instance_label(instance_id)?;
+    let config = config_snapshot(app)?;
+    if !config
+        .instances
+        .iter()
+        .any(|instance| instance.id == instance_id && instance.pet_id == pet_id)
+    {
+        return Err("宠物实例已不存在".to_string());
+    }
+    match action {
+        "feed" | "play" => {
+            let state = match ai::perform_pet_action_internal(app, pet_id, action) {
+                Ok(state) => state,
+                Err(error) => {
+                    let _ = app.emit(
+                        "pet://context-error",
+                        serde_json::json!({"petId": pet_id, "message": error}),
+                    );
+                    return Ok(());
+                }
+            };
+            let _ = app.emit(
+                "pet://context-action",
+                serde_json::json!({"petId": pet_id, "instanceId": instance_id, "action": action, "state": state}),
+            );
+        }
+        "sleep" | "wake" => {
+            let state = match action {
+                "sleep" => ai::sleep_pet(app.clone(), pet_id.to_string())?,
+                "wake" => ai::wake_pet(app.clone(), pet_id.to_string())?,
+                _ => unreachable!(),
+            };
+            let _ = app.emit(
+                "pet://context-action",
+                serde_json::json!({"petId": pet_id, "instanceId": instance_id, "action": action, "state": state}),
+            );
+        }
+        action if let Some(toy) = action.strip_prefix("toy-") => {
+            if let Err(error) = social::play_single_toy(&app, &instance_id, pet_id, toy) {
+                let _ = app.emit(
+                    "pet://context-error",
+                    serde_json::json!({"petId": pet_id, "message": error}),
+                );
+            }
+        }
+        "petting" => {
+            let _ = ai::record_petting_internal(app, pet_id)?;
+            let _ = app.emit(
+                "pet://context-action",
+                serde_json::json!({"petId": pet_id, "instanceId": instance_id, "action": action}),
+            );
+        }
+        "chat" => {
+            tauri::async_runtime::block_on(open_pet_chat(app.clone(), pet_id.to_string()))?;
+        }
+        "find-friends" => {
+            tauri::async_runtime::block_on(social::start_social_interaction(
+                app.clone(),
+                Some(pet_id.to_string()),
+                None,
+            ))?;
+        }
+        action if action.starts_with("find-friend-") => {
+            let target_pet_id = action
+                .strip_prefix("find-friend-")
+                .filter(|id| is_safe_id(id))
+                .ok_or_else(|| "无效的目标宠物".to_string())?;
+            tauri::async_runtime::block_on(social::start_social_interaction(
+                app.clone(),
+                Some(pet_id.to_string()),
+                Some(vec![target_pet_id.to_string()]),
+            ))?;
+        }
+        "settings" => {
+            show_pet_manager(app)?;
+            let _ = app.emit(
+                "manager://pet-settings",
+                serde_json::json!({"petId": pet_id}),
+            );
+        }
+        "hide" => {
+            set_instance_visible_internal(app, instance_id, false)?;
+            rebuild_tray_menu(app).map_err(|error| error.to_string())?;
+        }
+        _ => return Err("不支持的宠物菜单动作".to_string()),
+    }
+    let _ = app.emit(
+        "pet://context-action-dispatched",
+        serde_json::json!({"petId": pet_id, "instanceId": instance_id, "action": action, "windowLabel": label}),
+    );
     Ok(())
 }
 
@@ -2241,6 +4005,15 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<Wry>> {
     )?;
     let manage_pets = MenuItem::with_id(app, "manage-pets", "管理宠物", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "ai-settings", "AI 设置", true, None::<&str>)?;
+    let environment_settings = MenuItem::with_id(
+        app,
+        "environment-settings",
+        "环境与权限",
+        true,
+        None::<&str>,
+    )?;
+    let social_settings = MenuItem::with_id(app, "social-settings", "社交设置", true, None::<&str>)?;
+    let social_log = MenuItem::with_id(app, "social-log", "宠物日志", true, None::<&str>)?;
     let toggle_pause = MenuItem::with_id(
         app,
         "toggle-pause",
@@ -2248,6 +4021,15 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<Wry>> {
         true,
         None::<&str>,
     )?;
+    let autostart = CheckMenuItem::with_id(
+        app,
+        "toggle-autostart",
+        "开机自启动",
+        true,
+        app.autolaunch().is_enabled().unwrap_or(false),
+        None::<&str>,
+    )?;
+    let check_update = MenuItem::with_id(app, "check-update", "检查更新", true, None::<&str>)?;
     let config = config_snapshot(app).unwrap_or_default();
     let catalog = installed_pets(app, &config);
     let mut add_items = Vec::new();
@@ -2311,7 +4093,12 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<Wry>> {
         &show_hide,
         &manage_pets,
         &settings,
+        &environment_settings,
+        &social_settings,
+        &social_log,
         &toggle_pause,
+        &autostart,
+        &check_update,
         &add_submenu,
         &instance_submenu,
         &separator,
@@ -2348,10 +4135,110 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 if let Err(error) = show_ai_settings(app) {
                     eprintln!("{error}");
                 }
+            } else if id == "environment-settings" {
+                if let Err(error) = show_environment_settings(app) {
+                    eprintln!("{error}");
+                }
+            } else if id == "social-log" {
+                if let Err(error) = show_social_log(app) {
+                    eprintln!("{error}");
+                }
+            } else if id == "social-settings" {
+                if let Err(error) = social::open_social_settings(app.clone()) {
+                    eprintln!("{error}");
+                }
             } else if id == "toggle-pause" {
                 if let Err(error) = toggle_all_pause_internal(app) {
                     eprintln!("failed to toggle pet animation: {error}");
                 }
+            } else if id == "toggle-autostart" {
+                let next = !app.autolaunch().is_enabled().unwrap_or(false);
+                let result = if next {
+                    app.autolaunch().enable()
+                } else {
+                    app.autolaunch().disable()
+                };
+                if let Err(error) = result {
+                    eprintln!("failed to toggle autostart: {error}");
+                }
+                if let Err(error) = rebuild_tray_menu(app) {
+                    eprintln!("failed to refresh tray menu: {error}");
+                }
+            } else if id == "check-update" {
+                let app_for_check = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let installed = app_for_check.package_info().version.to_string();
+                    let update_result = match app_for_check.updater() {
+                        Ok(updater) => updater.check().await,
+                        Err(error) => Err(error),
+                    };
+                    match update_result {
+                        Ok(Some(update)) => {
+                            let latest = update.version.clone();
+                            #[cfg(target_os = "windows")]
+                            {
+                                let app_for_install = app_for_check.clone();
+                                app_for_install
+                                    .dialog()
+                                    .message(format!(
+                                        "发现新版本 {}（当前 {}）。立即下载并安装？",
+                                        latest, installed
+                                    ))
+                                    .title("发现更新")
+                                    .buttons(MessageDialogButtons::OkCancel)
+                                    .show(move |install| {
+                                        if install {
+                                            let updater_app = app_for_install.clone();
+                                            tauri::async_runtime::spawn(async move {
+                                                match update
+                                                    .download_and_install(|_| {}, |_, _| {})
+                                                    .await
+                                                {
+                                                    Ok(()) => updater_app.restart(),
+                                                    Err(error) => {
+                                                        updater_app
+                                                            .dialog()
+                                                            .message(format!(
+                                                                "更新下载失败：{error}。\n你可以前往 GitHub 手动下载。"
+                                                            ))
+                                                            .title("更新失败")
+                                                            .show(|_| {});
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    });
+                            }
+                            #[cfg(not(target_os = "windows"))]
+                            {
+                                let release_url = UPDATE_RELEASE_URL;
+                                app_for_check
+                                    .dialog()
+                                    .message(format!(
+                                        "发现新版本 {}（当前 {}）。前往 GitHub 下载？",
+                                        latest, installed
+                                    ))
+                                    .title("发现更新")
+                                    .buttons(MessageDialogButtons::OkCancel)
+                                    .show(move |open| {
+                                        if open {
+                                            let _ = app_for_check
+                                                .opener()
+                                                .open_url(release_url, None::<&str>);
+                                        }
+                                    });
+                            }
+                        }
+                        Ok(None) => {
+                            app_for_check
+                                .dialog()
+                                .message(format!("已是最新版本（{installed}）。"))
+                                .title("检查更新")
+                                .show(|_| {});
+                        }
+                        Err(_) => show_github_update_flow(&app_for_check).await,
+                    }
+                });
             } else if let Some(pet_id) = id.strip_prefix("add-pet:") {
                 if let Err(error) = add_pet_instance_internal(app, pet_id) {
                     eprintln!("failed to add pet: {error}");
@@ -2387,12 +4274,21 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 fn restore_windows(app: &tauri::AppHandle, config: &AppConfig) -> Result<(), String> {
     sync_macos_activation_policy(app, config)?;
     if let Some(main) = app.get_webview_window("main") {
-        let main_settings = config
+        let main_instance = config
             .instances
             .iter()
-            .find(|instance| instance.id == "main")
+            .find(|instance| instance.id == "main");
+        let main_settings = main_instance
             .map(|instance| settings_for_pet(config, &instance.pet_id))
             .unwrap_or_else(|| config.settings.clone());
+        let main_can_show = main_instance.is_some_and(|instance| {
+            instance.visible
+                && !config
+                    .disabled_pet_ids
+                    .iter()
+                    .any(|id| id == &instance.pet_id)
+                && pet_exists(app, &instance.pet_id)
+        });
         apply_window_settings(&main, &main_settings)?;
         if let Some(position) = config
             .instances
@@ -2403,13 +4299,7 @@ fn restore_windows(app: &tauri::AppHandle, config: &AppConfig) -> Result<(), Str
             main.set_position(LogicalPosition::new(position.x, position.y))
                 .map_err(|error| error.to_string())?;
         }
-        if config
-            .instances
-            .iter()
-            .find(|instance| instance.id == "main")
-            .map(|instance| instance.visible)
-            .unwrap_or(true)
-        {
+        if main_can_show {
             main.show().map_err(|error| error.to_string())?;
             apply_fullscreen_visibility(&main, main_settings.show_in_fullscreen)?;
         } else {
@@ -2424,6 +4314,115 @@ fn restore_windows(app: &tauri::AppHandle, config: &AppConfig) -> Result<(), Str
         create_pet_window(app, instance, config)?;
     }
     Ok(())
+}
+
+const UPDATE_API_URL: &str = "https://api.github.com/repos/RuomuAnshi/codexlikePet/releases/latest";
+const UPDATE_RELEASE_URL: &str = "https://github.com/RuomuAnshi/codexlikePet/releases/latest";
+
+fn version_parts(version: &str) -> Vec<u32> {
+    version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .filter_map(|part| part.parse::<u32>().ok())
+        .collect()
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCheck {
+    current: String,
+    latest: String,
+    url: String,
+    update_available: bool,
+}
+
+/// Queries the GitHub latest release and reports whether the installed build
+/// is behind it. Checking is advisory only; installing still goes through the
+/// release page so nothing is applied without a signed build.
+#[tauri::command]
+async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateCheck, String> {
+    let current = app.package_info().version.to_string();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|error| format!("无法创建更新检查连接: {error}"))?;
+    let response = client
+        .get(UPDATE_API_URL)
+        .header("User-Agent", "sakipet-updater")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|error| format!("检查更新失败（网络错误）: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("检查更新失败（GitHub 返回 HTTP {}）", status.as_u16()));
+    }
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("解析更新信息失败: {error}"))?;
+    let tag = value
+        .get("tag_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim_start_matches('v')
+        .to_string();
+    let url = value
+        .get("html_url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(UPDATE_RELEASE_URL)
+        .to_string();
+    let update_available = !tag.is_empty()
+        && version_parts(&tag).cmp(&version_parts(&current)) == std::cmp::Ordering::Greater;
+    Ok(UpdateCheck {
+        current,
+        latest: tag,
+        url,
+        update_available,
+    })
+}
+
+/// Advisory "check update" flow used where the updater plugin is unavailable
+/// (dev builds without updater artifacts) or on platforms that do not
+/// auto-install (macOS / Linux): notify and offer the release page.
+async fn show_github_update_flow(app: &tauri::AppHandle) {
+    let app = app.clone();
+    match check_for_updates(app.clone()).await {
+        Ok(check) if check.update_available => {
+            let release_url = check.url.clone();
+            app.dialog()
+                .message(format!(
+                    "发现新版本 {}（当前 {}）。前往 GitHub 查看发布说明并下载？",
+                    check.latest, check.current
+                ))
+                .title("发现更新")
+                .buttons(MessageDialogButtons::OkCancel)
+                .show(move |open| {
+                    if open {
+                        let _ = app.opener().open_url(release_url, None::<&str>);
+                    }
+                });
+        }
+        Ok(check) => {
+            app.dialog()
+                .message(format!("已是最新版本（{}）。", check.current))
+                .title("检查更新")
+                .show(|_| {});
+        }
+        Err(error) => {
+            app.dialog()
+                .message(format!("{error}\n你可以手动前往 GitHub 查看最新发布。"))
+                .title("检查更新")
+                .buttons(MessageDialogButtons::OkCancel)
+                .show(move |open| {
+                    if open {
+                        let _ = app.opener().open_url(UPDATE_RELEASE_URL, None::<&str>);
+                    }
+                });
+        }
+    }
 }
 
 #[tauri::command]
@@ -2470,6 +4469,13 @@ fn look_direction(app: tauri::AppHandle, window_label: String) -> Option<u8> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // Register state before the runtime creates configured WebViews. A
         // page can execute JavaScript before the setup hook is entered.
         .manage(AppState::new())
@@ -2483,7 +4489,16 @@ pub fn run() {
                 WindowEvent::CloseRequested { api, .. }
                     if label == "pet-manager"
                         || label == "ai-settings"
+                        || label == "environment-settings"
+                        || label == "social-log"
+                        || label == "social-settings"
                         || label.starts_with("pet-chat-") =>
+                {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+                WindowEvent::CloseRequested { api, .. }
+                    if label.starts_with("pet-speech-") =>
                 {
                     api.prevent_close();
                     let _ = window.hide();
@@ -2508,7 +4523,9 @@ pub fn run() {
             start_fullscreen_overlay_guard(&app.handle());
             build_tray(&app.handle())?;
             build_app_menu(&app.handle())?;
+            environment::start_monitor(&app.handle());
             ai::start_heartbeat_scheduler(&app.handle());
+            social::start_scheduler(&app.handle());
             #[cfg(target_os = "macos")]
             if let Err(error) = macos_dock_menu::install(&app.handle()) {
                 eprintln!("failed to install Dock menu: {error}");
@@ -2534,6 +4551,15 @@ pub fn run() {
                     }
                 });
             }
+            if let Some(environment) = app.get_webview_window("environment-settings") {
+                let environment_for_close = environment.clone();
+                environment.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = environment_for_close.hide();
+                    }
+                });
+            }
             if !has_visible_pet_config(&app.handle(), &config) {
                 show_pet_manager(&app.handle())?;
             }
@@ -2543,14 +4569,29 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             is_app_ready,
             look_direction,
+            check_for_updates,
             open_pet_manager,
             open_ai_settings,
+            open_environment_settings,
+            pet_speech_ready,
+            show_pet_speech,
+            hide_pet_speech,
+            sync_pet_speech_position,
+            social::open_social_log,
+            social::open_social_settings,
+            get_environment_settings,
+            update_environment_settings,
+            show_pet_context_menu,
             open_pet_chat,
+            toggle_pet_chat,
             hide_pet_chat,
             get_pet_catalog,
+            get_pet_preview,
             get_pet_settings,
             get_pet_instances,
             get_visible_pets,
+            get_pet_occupancies,
+            set_pet_position_safely,
             get_runtime_config,
             set_pet_instance_visible,
             add_pet_instance,
@@ -2560,16 +4601,23 @@ pub fn run() {
             toggle_pet_pause,
             set_pet_enabled,
             import_pet_package,
+            export_pet_package,
             remove_imported_pet,
             ai::get_ai_settings,
             ai::update_ai_settings,
             ai::set_ai_secret,
             ai::delete_ai_secret,
             ai::test_ai_provider,
+            ai::list_models,
             ai::capture_desktop,
             ai::get_pet_state,
             ai::record_pet_interaction,
             ai::settle_pet_activity,
+            ai::perform_pet_action,
+            ai::record_petting,
+            ai::wake_pet,
+            ai::sleep_pet,
+            ai::get_pet_relationship,
             ai::get_chat_history,
             ai::send_chat_message,
             ai::cancel_chat_response,
@@ -2581,7 +4629,15 @@ pub fn run() {
             ai::get_shared_memories,
             ai::delete_shared_memory,
             ai::update_shared_memory,
-            ai::clear_shared_memories
+            ai::clear_shared_memories,
+            social::get_social_settings,
+            social::update_social_settings,
+            social::start_social_interaction,
+            social::cancel_social_scene,
+            social::report_pet_runtime_state,
+            social::get_public_relationships,
+            social::get_social_log,
+            social::clear_social_log
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -2611,6 +4667,24 @@ mod tests {
             .expect("legacy card should parse");
         assert_eq!(card.dialogue.click, vec!["你好"]);
         assert!(!card.dialogue.idle.is_empty());
+    }
+
+    #[test]
+    fn speech_layout_compacts_short_lines_and_checks_overlap() {
+        let short = speech_window_size("去那边看看！");
+        let long = speech_window_size(&"这是一段需要换行的较长回复。".repeat(5));
+        assert!(short.0 < long.0);
+        assert_eq!(short.1, SPEECH_WINDOW_HEIGHT);
+        assert!(speech_rect_overlaps(
+            (0.0, 0.0, 100.0, 80.0),
+            (105.0, 0.0, 205.0, 80.0),
+            10.0,
+        ));
+        assert!(!speech_rect_overlaps(
+            (0.0, 0.0, 100.0, 80.0),
+            (115.0, 0.0, 215.0, 80.0),
+            10.0,
+        ));
     }
 
     #[test]
@@ -2666,5 +4740,74 @@ mod tests {
     fn character_file_limit_is_one_megabyte() {
         let bytes = vec![b' '; 1024 * 1024 + 1];
         assert!(decode_character(&bytes).is_err());
+    }
+
+    #[test]
+    fn parses_optional_frame_animation_pack() {
+        let manifest = parse_animation_pack(
+            br#"{
+              "format":"sakipet-frame-pack",
+              "version":1,
+              "cellWidth":192,
+              "cellHeight":208,
+              "clips":{
+                "yawn":{
+                  "path":"animations/yawn.webp",
+                  "frames":2,
+                  "durations":[140,320],
+                  "loop":false,
+                  "type":"gesture",
+                  "returnTo":"idle"
+                }
+              }
+            }"#,
+        )
+        .expect("valid frame animation pack should parse");
+        assert_eq!(manifest.clips["yawn"].frames, 2);
+        assert_eq!(manifest.clips["yawn"].return_to.as_deref(), Some("idle"));
+    }
+
+    #[test]
+    fn rejects_frame_animation_pack_with_unsafe_clip_path() {
+        let manifest = parse_animation_pack(
+            br#"{
+              "format":"sakipet-frame-pack",
+              "version":1,
+              "cellWidth":192,
+              "cellHeight":208,
+              "clips":{
+                "escape":{
+                  "path":"../outside.webp",
+                  "frames":1,
+                  "durations":[140],
+                  "loop":false,
+                  "type":"gesture"
+                }
+              }
+            }"#,
+        )
+        .expect("manifest parsing is independent from path validation");
+        let clip = &manifest.clips["escape"];
+        assert!(validate_animation_clip("escape", clip, &[0u8; 1]).is_err());
+    }
+
+    #[test]
+    fn pet_export_contains_identity_and_actions_but_not_app_state() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../public/pets/sakimiao");
+        let entries = collect_pet_export_entries(&root, "sakimiao")
+            .expect("the bundled starter pet should be exportable");
+        let names: HashSet<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert!(names.contains("pet.json"));
+        assert!(names.contains("spritesheet.webp"));
+        assert!(names.contains("character.json"));
+        assert!(names.contains("animations.json"));
+        assert!(names.contains("animations/sleep.webp"));
+        assert!(!names.iter().any(|name| {
+            name.contains("memory")
+                || name.contains("messages")
+                || name.contains("state")
+                || name.contains("config")
+        }));
     }
 }

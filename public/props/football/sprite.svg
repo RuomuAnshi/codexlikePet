@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 72" role="img" aria-label="足球">
+  <defs>
+    <radialGradient id="ball" cx="32%" cy="25%" r="72%">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#dce8ee"/>
+    </radialGradient>
+  </defs>
+  <ellipse cx="38" cy="59" rx="22" ry="5" fill="#243746" opacity=".18"/>
+  <circle cx="36" cy="34" r="24" fill="url(#ball)" stroke="#2c5368" stroke-width="3"/>
+  <path d="m36 18 8 6-3 10h-10l-3-10zM16 31l12 3m28-3L41 34M23 52l8-11m26 11-8-11M27 24l-7-7m25 7 8-7" fill="none" stroke="#2c5368" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="m36 20 6 5-2 7h-8l-2-7z" fill="#2c5368"/>
+  <circle cx="28" cy="25" r="5" fill="#fff" opacity=".65"/>
+</svg>

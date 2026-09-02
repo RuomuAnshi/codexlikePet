@@ -46,54 +46,83 @@ body {
   pointer-events: auto;
 }
 
-.speech {
+.effect-layer,
+.emotion-icon {
   position: absolute;
-  top: 4px;
-  left: 5px;
-  right: 5px;
-  z-index: 2;
-  padding: 7px 9px;
-  border: 2px solid #ff67ad;
-  border-radius: 10px;
-  background: rgba(255, 247, 252, 0.97);
-  box-shadow: 2px 2px 0 rgba(181, 19, 98, 0.8);
-  color: #351126;
-  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1.35;
+  inset: 0;
+  pointer-events: none;
+}
+
+.emotion-icon {
+  z-index: 3;
+  top: 18px;
+  left: auto;
+  right: 18px;
+  width: 24px;
+  height: 24px;
+  color: #f0649c;
+  font-size: 20px;
+  line-height: 24px;
   opacity: 0;
-  cursor: pointer;
-  pointer-events: auto;
-  text-align: center;
-  transform: translateY(-4px) scale(0.98);
+  transform: translateY(5px) scale(0.8);
   transition: opacity 180ms ease, transform 180ms ease;
 }
 
-.speech::after {
-  position: absolute;
-  right: 32px;
-  bottom: -8px;
-  width: 12px;
-  height: 12px;
-  border-right: 2px solid #ff67ad;
-  border-bottom: 2px solid #ff67ad;
-  background: rgba(255, 247, 252, 0.97);
-  content: "";
-  transform: rotate(45deg);
-}
-
-.speech-visible {
+.emotion-visible {
   opacity: 1;
   transform: translateY(0) scale(1);
 }
 
-.speech[hidden] {
-  display: none;
+.particle {
+  position: absolute;
+  z-index: 3;
+  color: #f0649c;
+  font-size: 19px;
+  line-height: 1;
+  pointer-events: none;
+  animation: pet-particle 1s ease-out forwards;
+}
+
+.particle-star { color: #66bfd2; }
+.particle-food { color: #f5b44c; }
+.particle-dust { color: #aacbd1; font-size: 25px; }
+
+.is-carried #stage {
+  transform: rotate(-4deg) translateY(-3px);
+  transform-origin: 50% 86%;
+}
+
+@keyframes pet-particle {
+  from { opacity: 0; transform: translateY(7px) scale(0.7); }
+  25% { opacity: 1; }
+  to { opacity: 0; transform: translateY(-38px) scale(1.15); }
+}
+
+.food-drop {
+  height: 34px;
+  left: 40%;
+  opacity: 0;
+  pointer-events: none;
+  position: absolute;
+  top: 8%;
+  width: 34px;
+  z-index: 3;
+  animation: food-fall 850ms ease-in forwards;
+}
+
+@keyframes food-fall {
+  0% { opacity: 0; transform: translate(0, 0) rotate(0deg) scale(0.8); }
+  15% { opacity: 1; }
+  85% { opacity: 1; }
+  100% { opacity: 0; transform: translate(-36px, 150px) rotate(200deg) scale(1); }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .speech {
+  .emotion-icon {
     transition: none;
   }
+
+  .particle { animation: none; opacity: 0; }
+  .is-carried #stage { transform: none; }
+  .food-drop { display: none; }
 }

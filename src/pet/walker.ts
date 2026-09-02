@@ -1,22 +1,36 @@
 import { LogicalPosition } from "@tauri-apps/api/dpi";
+import { invoke } from "@tauri-apps/api/core";
 import { currentMonitor, getCurrentWindow, primaryMonitor } from "@tauri-apps/api/window";
+import {
+  isCollisionFree,
+  planCollisionFreeRoute,
+  type CollisionBounds,
+  type CollisionPoint,
+  type CollisionRect,
+} from "./collision";
 import { dragState, type MoveDirection } from "./window";
 
 const WALK_DELAY_MIN = 30000;
 const WALK_DELAY_MAX = 60000;
 const WALK_MIN_DISTANCE = 160;
 const WALK_TICK_MS = 50;
-
-interface WalkBounds {
-  minX: number;
-  maxX: number;
-  minY: number;
-  maxY: number;
-}
+const OCCUPANCY_REFRESH_MS = 200;
+const COLLISION_GAP = 12;
+const STUCK_ABORT_MS = 1800;
 
 interface WalkTarget {
   x: number;
   y: number;
+}
+
+interface PetOccupancy {
+  instanceId: string;
+  petId: string;
+  monitorKey: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 /** Moves the pet occasionally while leaving long, quiet idle periods. */
@@ -29,10 +43,20 @@ export class PetWalker {
   private enabled = true;
   private quietMode = false;
   private forcedTarget: WalkTarget | null = null;
+  private occupancy: PetOccupancy[] = [];
+  private occupancyStaleAt = 0;
+  private width = 0;
+  private height = 0;
+  private monitorKey = "";
 
   constructor(
+    private readonly instanceId: string,
     private readonly onChange: (walking: boolean, direction: MoveDirection | null) => void,
   ) {}
+
+  get isWalking(): boolean {
+    return this.walking;
+  }
 
   setSettings(speed: number, enabled: boolean, quietMode: boolean): void {
     this.speed = speed;
@@ -121,7 +145,10 @@ export class PetWalker {
       const workAreaSize = monitor.workArea.size.toLogical(monitor.scaleFactor);
       const currentPosition = position.toLogical(scaleFactor);
       const currentSize = windowSize.toLogical(scaleFactor);
-      const bounds: WalkBounds = {
+      this.monitorKey = `${monitor.position.x}:${monitor.position.y}`;
+      this.width = currentSize.width;
+      this.height = currentSize.height;
+      const bounds: CollisionBounds = {
         minX: workAreaPosition.x,
         maxX: Math.max(workAreaPosition.x, workAreaPosition.x + workAreaSize.width - currentSize.width),
         minY: workAreaPosition.y,
@@ -157,7 +184,7 @@ export class PetWalker {
 
       this.walking = true;
       this.onChange(true, direction);
-      await this.move(token, currentX, currentY, targetX, targetY, duration);
+      await this.move(token, currentX, currentY, targetX, targetY, duration, bounds);
     } catch (error) {
       console.warn("autonomous pet walk stopped:", error);
       this.finish(token);
@@ -192,6 +219,19 @@ export class PetWalker {
     return horizontal < 0 ? "down-left" : "down-right";
   }
 
+  private async refreshOccupancy(): Promise<void> {
+    if (performance.now() < this.occupancyStaleAt) return;
+    this.occupancyStaleAt = performance.now() + OCCUPANCY_REFRESH_MS;
+    try {
+      this.occupancy = await invoke<PetOccupancy[]>("get_pet_occupancies", {
+        instanceId: this.instanceId,
+      });
+      this.occupancy = this.occupancy.filter((other) => other.monitorKey === this.monitorKey);
+    } catch {
+      this.occupancyStaleAt = 0;
+    }
+  }
+
   private async move(
     token: number,
     startX: number,
@@ -199,16 +239,89 @@ export class PetWalker {
     targetX: number,
     targetY: number,
     duration: number,
+    bounds: CollisionBounds,
   ): Promise<void> {
     const startedAt = performance.now();
+    let lastTick = startedAt;
+    let stuckSince: number | null = null;
+    let lastDirection: MoveDirection | null = null;
+    const maxDuration = Math.max(duration + 7_000, duration * 1.8);
+    const ownSize = { width: this.width, height: this.height };
+
     while (token === this.walkToken && !dragState.current) {
-      const progress = Math.min(1, (performance.now() - startedAt) / duration);
-      const x = startX + (targetX - startX) * progress;
-      const y = startY + (targetY - startY) * progress;
-      await this.window.setPosition(new LogicalPosition(x, y));
-      if (progress >= 1) break;
+      const elapsed = performance.now() - startedAt;
+      if (elapsed >= maxDuration) break;
+      await this.refreshOccupancy();
+      const current: CollisionPoint = {
+        x: startX,
+        y: startY,
+      };
+      // `startX/startY` become the last committed position below.  Keeping
+      // the current point explicit makes every re-plan use the real top-left
+      // of this window, not the centre or a stale target interpolation.
+      const obstacles: CollisionRect[] = this.occupancy;
+      const route = planCollisionFreeRoute(
+        current,
+        { x: targetX, y: targetY },
+        ownSize,
+        bounds,
+        obstacles,
+        COLLISION_GAP,
+      );
+      const waypoint = route[0];
+      if (!waypoint) {
+        if (stuckSince === null) stuckSince = elapsed;
+        if (elapsed - stuckSince >= STUCK_ABORT_MS) break;
+        await new Promise<void>((resolve) => window.setTimeout(resolve, WALK_TICK_MS));
+        continue;
+      }
+
+      const routeEnd = route[route.length - 1];
+      if (Math.hypot(current.x - routeEnd.x, current.y - routeEnd.y) <= 4) break;
+
+      const now = performance.now();
+      const seconds = Math.min(0.2, Math.max(0.01, (now - lastTick) / 1000));
+      lastTick = now;
+      const dx = waypoint.x - current.x;
+      const dy = waypoint.y - current.y;
+      const stepDistance = Math.min(Math.hypot(dx, dy), this.speed * seconds);
+      const length = Math.hypot(dx, dy) || 1;
+      const candidate = {
+        x: Math.min(bounds.maxX, Math.max(bounds.minX, current.x + (dx / length) * stepDistance)),
+        y: Math.min(bounds.maxY, Math.max(bounds.minY, current.y + (dy / length) * stepDistance)),
+      };
+
+      if (!isCollisionFree(candidate, ownSize, obstacles, COLLISION_GAP)) {
+        if (stuckSince === null) stuckSince = elapsed;
+        if (elapsed - stuckSince >= STUCK_ABORT_MS) break;
+      } else {
+        stuckSince = null;
+        const direction = this.directionFor(current.x, current.y, waypoint.x, waypoint.y);
+        if (direction !== lastDirection) {
+          lastDirection = direction;
+          this.onChange(true, direction);
+        }
+        try {
+          const committed = await invoke<CollisionPoint>("set_pet_position_safely", {
+            instanceId: this.instanceId,
+            x: candidate.x,
+            y: candidate.y,
+          });
+          startX = committed.x;
+          startY = committed.y;
+        } catch {
+          // Keep dev mode usable while the backend is restarting. The normal
+          // path is always arbitrated by Rust before the window is moved.
+          await this.window.setPosition(new LogicalPosition(candidate.x, candidate.y));
+          void invoke("sync_pet_speech_position", { instanceId: this.instanceId }).catch(() => undefined);
+          startX = candidate.x;
+          startY = candidate.y;
+        }
+      }
+
       await new Promise<void>((resolve) => window.setTimeout(resolve, WALK_TICK_MS));
     }
+    this.occupancy = [];
     this.finish(token);
   }
 

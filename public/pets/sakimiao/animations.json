@@ -1,0 +1,44 @@
+{
+  "format": "sakipet-frame-pack",
+  "version": 1,
+  "cellWidth": 192,
+  "cellHeight": 208,
+  "clips": {
+    "sleep": {
+      "path": "animations/sleep.webp",
+      "frames": 8,
+      "durations": [180, 160, 180, 220, 300, 260, 320, 420],
+      "loop": true,
+      "loopStart": 4,
+      "type": "mode",
+      "fallback": "waiting"
+    },
+    "wake": {
+      "path": "animations/wake.webp",
+      "frames": 6,
+      "durations": [160, 160, 180, 200, 220, 320],
+      "loop": false,
+      "type": "gesture",
+      "returnTo": "idle",
+      "fallback": "idle"
+    },
+    "yawn": {
+      "path": "animations/yawn.webp",
+      "frames": 6,
+      "durations": [180, 160, 220, 260, 180, 300],
+      "loop": false,
+      "type": "gesture",
+      "returnTo": "idle",
+      "fallback": "idle"
+    },
+    "stretch": {
+      "path": "animations/stretch.webp",
+      "frames": 6,
+      "durations": [160, 160, 220, 260, 180, 300],
+      "loop": false,
+      "type": "gesture",
+      "returnTo": "idle",
+      "fallback": "idle"
+    }
+  }
+}

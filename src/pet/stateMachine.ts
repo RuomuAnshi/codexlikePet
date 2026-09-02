@@ -1,7 +1,7 @@
 import type { AnimationState } from "./atlas";
 import type { DragDirection } from "./window";
 
-export type PetAction = "waving" | "jumping" | "failed" | "waiting" | "review";
+export type PetAction = "waving" | "jumping" | "failed" | "waiting" | "review" | "running";
 
 /**
  * Keeps interaction priorities in one place:
@@ -14,11 +14,20 @@ export class PetStateMachine {
   private walking = false;
   private walkingDirection: DragDirection | null = null;
   private dragDirection: DragDirection | null = null;
+  private carried = false;
   private action: PetAction | null = null;
+  private clip: string | null = null;
+  private baseState: AnimationState = "idle";
+  private socialState: AnimationState | null = null;
 
-  setDragging(dragging: boolean, direction: DragDirection | null = null): void {
+  setDragging(
+    dragging: boolean,
+    direction: DragDirection | null = null,
+    carried = false,
+  ): void {
     this.dragging = dragging;
     this.dragDirection = direction;
+    this.carried = carried;
   }
 
   setWalking(walking: boolean, direction: DragDirection | null = null): void {
@@ -27,13 +36,34 @@ export class PetStateMachine {
   }
 
   startAction(action: PetAction): boolean {
-    if (this.dragging || this.walking || this.action !== null) return false;
+    if (this.dragging || this.walking || this.socialState !== null || this.action !== null || this.clip !== null) return false;
     this.action = action;
     return true;
   }
 
   finishAction(): void {
     this.action = null;
+    this.clip = null;
+  }
+
+  startClip(clip: string): boolean {
+    if (this.dragging || this.walking || this.socialState !== null || this.action !== null || this.clip !== null) {
+      return false;
+    }
+    this.clip = clip;
+    return true;
+  }
+
+  finishClip(): void {
+    this.clip = null;
+  }
+
+  setBaseState(state: AnimationState): void {
+    this.baseState = state;
+  }
+
+  setSocialState(state: AnimationState | null): void {
+    this.socialState = state;
   }
 
   reset(): void {
@@ -41,14 +71,19 @@ export class PetStateMachine {
     this.walking = false;
     this.walkingDirection = null;
     this.dragDirection = null;
+    this.carried = false;
     this.action = null;
+    this.clip = null;
+    this.baseState = "idle";
+    this.socialState = null;
   }
 
   hasAction(): boolean {
-    return this.action !== null;
+    return this.action !== null || this.clip !== null;
   }
 
   animationState(): AnimationState {
+    if (this.carried) return "waiting";
     if (this.dragDirection === "left" || this.dragDirection === "up-left" || this.dragDirection === "down-left") {
       return "running-left";
     }
@@ -56,6 +91,7 @@ export class PetStateMachine {
       return "running-right";
     }
     if (this.dragging) return "running";
+    if (this.socialState !== null) return this.socialState;
     if (
       this.walkingDirection === "left" ||
       this.walkingDirection === "up-left" ||
@@ -71,6 +107,6 @@ export class PetStateMachine {
       return "running-right";
     }
     if (this.walking) return "running";
-    return this.action ?? "idle";
+    return this.action ?? this.baseState;
   }
 }

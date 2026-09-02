@@ -1,0 +1,20 @@
+:root { background: transparent; }
+html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+.prop {
+  position: absolute;
+  left: 4px;
+  top: 4px;
+  width: 64px;
+  height: 64px;
+  filter: drop-shadow(3px 4px 0 rgba(38, 59, 72, 0.16));
+  animation: prop-bob 620ms ease-in-out infinite alternate;
+}
+.prop img { display: block; width: 100%; height: 100%; object-fit: contain; user-select: none; pointer-events: none; }
+.prop[data-kind="football"] { animation-duration: 520ms; }
+.prop[data-kind="snack"] { animation-duration: 760ms; }
+.prop[data-kind="plush"] { animation-duration: 680ms; }
+@keyframes prop-bob {
+  from { transform: translateY(2px) rotate(-5deg); }
+  to { transform: translateY(-3px) rotate(5deg); }
+}
+@media (prefers-reduced-motion: reduce) { .prop { animation: none; } }

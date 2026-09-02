@@ -1,10 +1,12 @@
 import {
+  CELL_HEIGHT,
   CELL_WIDTH,
   STATE_TIMING,
   type AnimationState,
   type LookDirection,
 } from "./atlas";
 import { drawLookCell, drawStateFrame } from "./loader";
+import type { LoadedAnimationClip } from "./loader";
 
 /**
  * PetEngine drives a single-output canvas from a Codex v2 sprite atlas.
@@ -27,6 +29,12 @@ export class PetEngine {
   private lastTick = performance.now();
   private pausedLookFrames = false;
   private actionComplete: (() => void) | null = null;
+
+  private clips = new Map<string, LoadedAnimationClip>();
+  private activeClip: LoadedAnimationClip | null = null;
+  private clipFrame = 0;
+  private clipElapsed = 0;
+  private clipComplete: (() => void) | null = null;
 
   private look: LookDirection | null = null;
 
@@ -54,12 +62,46 @@ export class PetEngine {
     this.stateElapsed = 0;
     this.pausedLookFrames = false;
     this.actionComplete = null;
+    this.activeClip = null;
+    this.clipComplete = null;
+    this.clipFrame = 0;
+    this.clipElapsed = 0;
     this.target.clearRect(0, 0, this.target.canvas.width, this.target.canvas.height);
   }
 
   setScale(scale: number): void {
     this.scale = scale;
     this.target.clearRect(0, 0, this.target.canvas.width, this.target.canvas.height);
+  }
+
+  setAnimationClips(clips: Map<string, LoadedAnimationClip>): void {
+    this.clips = clips;
+    if (this.activeClip && ![...clips.values()].includes(this.activeClip)) this.cancelClip();
+  }
+
+  hasAnimationClip(id: string): boolean {
+    return this.clips.has(id);
+  }
+
+  playClip(id: string, onComplete?: () => void): boolean {
+    const clip = this.clips.get(id);
+    if (!clip || this.activeClip !== null || this.pausedLookFrames) return false;
+    this.activeClip = clip;
+    this.clipFrame = 0;
+    this.clipElapsed = 0;
+    this.clipComplete = onComplete ?? null;
+    return true;
+  }
+
+  cancelClip(): void {
+    this.activeClip = null;
+    this.clipComplete = null;
+    this.clipFrame = 0;
+    this.clipElapsed = 0;
+  }
+
+  isPlayingClip(): boolean {
+    return this.activeClip !== null;
   }
 
   getState(): AnimationState {
@@ -80,7 +122,7 @@ export class PetEngine {
    * user can see the whole gesture near the pet.
    */
   playOnce(state: AnimationState, onComplete?: () => void): void {
-    if (this.pausedLookFrames) return;
+    if (this.pausedLookFrames || this.activeClip) return;
     this.state = state;
     this.stateFrame = 0;
     this.stateElapsed = 0;
@@ -91,6 +133,7 @@ export class PetEngine {
   cancelAction(): void {
     this.pausedLookFrames = false;
     this.actionComplete = null;
+    this.cancelClip();
     this.state = "idle";
     this.stateFrame = 0;
     this.stateElapsed = 0;
@@ -114,6 +157,10 @@ export class PetEngine {
   }
 
   private drawStaticFrame(): void {
+    if (this.activeClip) {
+      this.drawClipFrame();
+      return;
+    }
     const x = (this.target.canvas.width - CELL_WIDTH * this.scale) / 2;
     if (this.look !== null && !this.pausedLookFrames) {
       drawLookCell(this.source, this.target, this.look, this.scale, x, 0);
@@ -122,11 +169,58 @@ export class PetEngine {
     }
   }
 
+  private drawClipFrame(): void {
+    if (!this.activeClip) return;
+    const x = (this.target.canvas.width - CELL_WIDTH * this.scale) / 2;
+    const sx = this.clipFrame * CELL_WIDTH;
+    this.target.clearRect(0, 0, this.target.canvas.width, this.target.canvas.height);
+    this.target.imageSmoothingEnabled = true;
+    this.target.drawImage(
+      this.activeClip.canvas,
+      sx,
+      0,
+      CELL_WIDTH,
+      CELL_HEIGHT,
+      x,
+      0,
+      CELL_WIDTH * this.scale,
+      CELL_HEIGHT * this.scale,
+    );
+  }
+
+  private advanceClip(dt: number): void {
+    const clip = this.activeClip;
+    if (!clip) return;
+    this.clipElapsed += dt;
+    while (this.activeClip === clip && this.clipElapsed >= clip.manifest.durations[this.clipFrame]) {
+      this.clipElapsed -= clip.manifest.durations[this.clipFrame];
+      const next = this.clipFrame + 1;
+      if (next < clip.manifest.frames) {
+        this.clipFrame = next;
+      } else if (clip.manifest.loop) {
+        this.clipFrame = clip.manifest.loopStart ?? 0;
+      } else {
+        this.activeClip = null;
+        this.clipFrame = 0;
+        this.clipElapsed = 0;
+        const onComplete = this.clipComplete;
+        this.clipComplete = null;
+        onComplete?.();
+      }
+    }
+  }
+
   private readonly tick = (now: number): void => {
-    const dt = now - this.lastTick;
+    // A stalled render loop (IPC burst, compositor pressure) can hand the next
+    // frame a huge delta. Capping it prevents the animation from fast-forwarding
+    // several frames at once, which reads as a stutter.
+    const dt = Math.min(now - this.lastTick, 120);
     this.lastTick = now;
 
-    if (this.look === null || this.pausedLookFrames) {
+    if (this.activeClip) {
+      this.advanceClip(dt);
+      this.drawStaticFrame();
+    } else if (this.look === null || this.pausedLookFrames) {
       // Advance the looping state animation using per-frame durations.
       const spec = STATE_TIMING[this.state];
       this.stateElapsed += dt;

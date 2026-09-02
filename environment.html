@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>环境与权限</title>
+    <link rel="stylesheet" href="/src/environment.css" />
+  </head>
+  <body>
+    <main class="environment-page">
+      <header class="page-header">
+        <p class="eyebrow">SAKIPET · LOCAL ONLY</p>
+        <h1>环境与权限</h1>
+        <p>只读取本地公开状态，帮助宠物理解你是否在工作、开会或暂时离开。</p>
+      </header>
+      <p id="status" class="status" role="status">正在读取设置…</p>
+      <section class="panel">
+        <div class="panel-title"><h2>陪伴感知</h2><span>默认安全关闭</span></div>
+        <label class="switch-row"><input id="foreground" type="checkbox" /><span><strong>感知前台应用</strong><small>只记录应用名、分类和连续使用时长，不读取窗口标题。</small></span></label>
+        <label class="switch-row"><input id="break-reminder" type="checkbox" /><span><strong>连续工作提醒</strong><small>达到设定时长后提醒休息，不记录具体窗口标题。</small></span></label>
+        <label class="switch-row"><input id="meeting-quiet" type="checkbox" /><span><strong>全屏会议自动安静</strong><small>检测到会议应用占满显示器时，暂停主动打扰。</small></span></label>
+        <label class="switch-row"><input id="low-battery" type="checkbox" /><span><strong>低电量提醒</strong><small>只读取系统电池百分比，不读取通知内容。</small></span></label>
+        <label class="switch-row"><input id="notifications" type="checkbox" /><span><strong>通知事件</strong><small id="notification-note">当前构建默认关闭，不读取通知正文。</small></span></label>
+      </section>
+      <section class="panel grid-panel">
+        <label><span>连续工作提醒（分钟）</span><input id="break-minutes" type="number" min="30" max="720" step="10" /></label>
+        <label><span>低电量阈值（%）</span><input id="battery-threshold" type="number" min="5" max="50" step="1" /></label>
+      </section>
+      <section class="panel">
+        <div class="panel-title"><h2>应用分类</h2><span>逗号分隔</span></div>
+        <label class="list-field"><span>编程应用</span><textarea id="coding-apps" rows="2" placeholder="Code, Xcode, Terminal"></textarea></label>
+        <label class="list-field"><span>会议应用</span><textarea id="meeting-apps" rows="2" placeholder="zoom.us, Microsoft Teams"></textarea></label>
+      </section>
+      <section class="panel snapshot-panel">
+        <div class="panel-title"><h2>当前状态</h2><span id="support-badge">平台检测中</span></div>
+        <p id="snapshot">未启用前台感知。宠物仍会使用作息和手动互动。</p>
+      </section>
+      <button id="save" class="save-button" type="button">保存设置</button>
+    </main>
+    <script type="module" src="/src/environment-settings.ts"></script>
+  </body>
+</html>

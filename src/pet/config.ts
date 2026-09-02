@@ -1,4 +1,5 @@
 import type { PetManifest } from "./atlas";
+import type { PetAnimationPack } from "./animations";
 
 export interface PetSettings {
   scale: number;
@@ -10,6 +11,10 @@ export interface PetSettings {
   quietMode: boolean;
   showInFullscreen: boolean;
   paused: boolean;
+  circadianEnabled: boolean;
+  sleepStartMinutes: number;
+  wakeMinutes: number;
+  socialEnabled: boolean;
 }
 
 export interface PetSettingsEvent {
@@ -25,6 +30,19 @@ export interface PetDialogue {
   walk: string[];
   drag: string[];
   idle: string[];
+  morning: string[];
+  evening: string[];
+  sleep: string[];
+  wake: string[];
+  petting: string[];
+  feed: string[];
+  play: string[];
+  pickup: string[];
+  putDown: string[];
+  lowBattery: string[];
+  breakReminder: string[];
+  reunion: string[];
+  milestone: string[];
 }
 
 export interface PetInstanceInfo {
@@ -58,6 +76,7 @@ export interface RuntimeConfig {
   settings: PetSettings;
   dialogue: PetDialogue;
   character?: CharacterCard;
+  animationPack?: PetAnimationPack | null;
 }
 
 export interface CharacterCard {
@@ -108,11 +127,51 @@ export interface PetLifeState {
   chatCount: number;
   petInteractionCount: number;
   nextActionAt: number;
+  moodValue: number;
+  relationshipLevel: number;
+  peakBond: number;
+  lastAdvancedAt: number;
+  energyProgressMs: number;
+  attentionProgressMs: number;
+  lastBondDecayAt: number;
+  sleepingSince: number;
+  sleepOverrideUntil: number;
+  lastGreetingDate: string;
+  lastFedAt: number;
+  lastPlayedAt: number;
+  lastPettedAt: number;
+  unlockedMilestones: string[];
+}
+
+export interface PetPairRelationship {
+  pairId: string;
+  affinity: number;
+  peakAffinity: number;
+  level: number;
+  knownSince: number;
+  interactionCount: number;
+  lastInteractionAt: number;
+  lastAdvancedAt: number;
+  unlockedMilestones: string[];
+}
+
+export interface EnvironmentSettings {
+  foregroundTrackingEnabled: boolean;
+  breakReminderEnabled: boolean;
+  breakReminderMinutes: number;
+  meetingQuietEnabled: boolean;
+  lowBatteryEnabled: boolean;
+  lowBatteryThreshold: number;
+  notificationEventsEnabled: boolean;
+  codingApps: string[];
+  meetingApps: string[];
 }
 
 export interface PetBehavior {
   say: string;
-  action: "idle" | "waving" | "jumping" | "waiting" | "review" | "walk" | "sleep";
+  action: "idle" | "waving" | "jumping" | "failed" | "waiting" | "running" | "review" | "walk" | "sleep";
+  mode?: "idle" | "working" | "waiting" | "sleeping" | null;
+  gesture?: string | null;
   mood: string;
   duration: number;
   nextActionAfter: number;

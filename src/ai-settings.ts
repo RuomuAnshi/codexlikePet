@@ -114,7 +114,7 @@ function endpointFromForm(
     baseUrl: (baseUrl.value.trim() || fallbackBaseUrl.trim()).replace(/\/$/, ""),
     model: modelName,
     credentialRef: credentialRef || null,
-    maxOutputTokens: 300,
+    maxOutputTokens: 1024,
   };
 }
 
@@ -370,6 +370,53 @@ saveAiButton.addEventListener("click", () => {
 });
 testChatButton.addEventListener("click", () => void testAiProvider(false));
 testVisionButton.addEventListener("click", () => void testAiProvider(true));
+const listChatModelsButton = document.querySelector<HTMLButtonElement>("#list-chat-models")!;
+const chatModelSuggestions = document.querySelector<HTMLDataListElement>("#chat-model-suggestions")!;
+listChatModelsButton.addEventListener("click", async () => {
+  const endpoint = endpointFromForm(
+    chatProvider,
+    chatBaseUrl,
+    chatModel,
+    "chat-api-key",
+  );
+  if (!chatModel.value.trim() && !endpoint) {
+    aiStatus.textContent = "请先填写模型名称或 Base URL";
+    return;
+  }
+  if (endpoint?.provider === "anthropic-messages") {
+    aiStatus.textContent = "Anthropic Messages 协议没有标准的模型列表接口。";
+    return;
+  }
+  setBusy(listChatModelsButton, true);
+  aiStatus.textContent = "正在拉取模型列表…";
+  try {
+    if (chatKey.value) {
+      await invoke("set_ai_secret", { reference: "chat-api-key", secret: chatKey.value });
+    }
+    const models = await invoke<string[]>("list_models", {
+      config: endpoint ?? {
+        provider: chatProvider.value as ProviderKind,
+        baseUrl: chatBaseUrl.value || "https://api.openai.com/v1",
+        model: chatModel.value || "",
+        credentialRef: "chat-api-key",
+        maxOutputTokens: 1024,
+      },
+    });
+    chatModelSuggestions.replaceChildren(
+      ...models.map((id) => {
+        const option = document.createElement("option");
+        option.value = id;
+        return option;
+      }),
+    );
+    if (!chatModel.value.trim() && models.length > 0) chatModel.value = models[0];
+    aiStatus.textContent = `已拉取 ${models.length} 个模型，可从下拉选择。`;
+  } catch (error) {
+    aiStatus.textContent = `拉取失败：${errorMessage(error)}`;
+  } finally {
+    setBusy(listChatModelsButton, false);
+  }
+});
 clearChatKey.addEventListener("click", async () => {
   if (!(await confirmDialog("删除已保存的聊天 API Key 吗？"))) return;
   try {

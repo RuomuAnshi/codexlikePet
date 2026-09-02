@@ -741,6 +741,42 @@ input[type="range"] {
   width: 18px;
 }
 
+.schedule-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.time-setting {
+  align-items: center;
+  background: #f7fcfd;
+  border: 1px solid #c5e8ed;
+  border-radius: 10px;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  min-height: 54px;
+  padding: 9px 10px;
+}
+
+.time-setting span {
+  display: grid;
+  gap: 2px;
+}
+
+.time-setting strong { color: var(--ink); font-size: 12px; }
+.time-setting small { color: var(--muted); font-size: 11px; }
+.time-setting input {
+  border: 1px solid #a9d9e3;
+  border-radius: 7px;
+  color: var(--ink);
+  font: inherit;
+  padding: 5px;
+}
+
+.milestone-list { display: block; margin-top: 3px; color: var(--yellow) !important; }
+
 .helper-text {
   color: var(--muted);
   font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
@@ -1048,6 +1084,10 @@ input[type="range"] {
 
   .setting-row input[type="range"] {
     grid-column: 1 / -1;
+  }
+
+  .schedule-grid {
+    grid-template-columns: 1fr;
   }
 
   .ai-form-grid {

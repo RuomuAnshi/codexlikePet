@@ -1,0 +1,41 @@
+:root {
+  color: #263b48;
+  color-scheme: light;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+  background: #f5fcfe;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 8% 8%, rgba(238,134,170,.2) 0 3px, transparent 4px),
+    radial-gradient(circle at 90% 24%, rgba(74,175,193,.2) 0 2px, transparent 3px),
+    linear-gradient(135deg, #f4fcff, #fff6fa 55%, #eefafd);
+  background-size: 68px 68px, 54px 54px, auto;
+}
+.settings-page { max-width: 520px; margin: auto; padding: 24px; }
+header, form {
+  border: 1px solid #b8e1ea;
+  border-radius: 18px;
+  background: rgba(255,255,255,.95);
+  box-shadow: 0 10px 24px rgba(74,141,157,.1);
+}
+header { padding: 20px; }
+.eyebrow { margin: 0 0 5px; color: #e66b9c; font-size: 11px; font-weight: 900; letter-spacing: .16em; }
+h1 { margin: 0; font-size: 28px; }
+header p:last-child { margin: 7px 0 0; color: #627a86; }
+form { display: grid; gap: 12px; margin-top: 14px; padding: 16px; }
+.toggle { display: flex; gap: 10px; padding: 12px; border: 1px solid #d1ebef; border-radius: 12px; background: #f7fdfe; }
+.toggle input { width: 18px; height: 18px; accent-color: #ea75a3; }
+.toggle span, label > span { display: grid; gap: 3px; }
+strong { font-size: 14px; }
+small { color: #627a86; font-size: 12px; }
+.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.grid label { display: grid; gap: 5px; color: #627a86; font-size: 12px; font-weight: 800; }
+input[type="number"] { width: 100%; border: 1px solid #a9dce6; border-radius: 9px; padding: 9px; color: #263b48; background: #fbfeff; }
+button { min-height: 42px; border: 2px solid #62bfd0; border-radius: 12px; color: #266f80; background: #ddf5f8; font: inherit; font-weight: 900; cursor: pointer; }
+button:disabled { opacity: .55; cursor: default; }
+.status { margin: 0; color: #627a86; font-size: 13px; }
+.status[data-kind="error"] { color: #c95d7e; }
+@media (max-width: 520px) { .settings-page { padding: 12px; } .grid { grid-template-columns: 1fr; } }

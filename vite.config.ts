@@ -14,9 +14,14 @@ export default defineConfig(async () => ({
     rollupOptions: {
       input: {
         main: "index.html",
+        speech: "speech.html",
         manager: "manager.html",
         "ai-settings": "ai-settings.html",
         chat: "chat.html",
+        "environment-settings": "environment.html",
+        "social-log": "social-log.html",
+        "social-prop": "social-prop.html",
+        "social-settings": "social-settings.html",
       },
     },
   },
