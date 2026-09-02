@@ -24,6 +24,19 @@ type DialogueTrigger = Exclude<keyof PetDialogue, "version">;
 const IDLE_SPEECH_DELAY_MS = 90_000;
 const PET_BUBBLE_MAX_CHARS = 100;
 
+const EMOTION_ICONS: Record<string, string> = {
+  sleeping: "💤",
+  sleepy: "💤",
+  sad: "😿",
+  lonely: "💔",
+  social: "💬",
+  curious: "👀",
+  happy: "😊",
+  content: "🙂",
+  calm: "🙂",
+  low: "!",
+};
+
 interface PetMeetupEvent {
   meetupId: string;
   petId: string;
@@ -150,7 +163,7 @@ async function boot(): Promise<void> {
 
   const sayLine = (trigger: DialogueTrigger): void => {
     if (settings.quietMode || autoQuiet) return;
-    const lines = dialogue[trigger];
+    const lines = dialogue[trigger] ?? [];
     if (!lines.length) return;
     const index = dialogueIndices[trigger] % lines.length;
     dialogueIndices[trigger] += 1;
@@ -170,8 +183,7 @@ async function boot(): Promise<void> {
   };
 
   const showEmotion = (value: string, duration = 2_000): void => {
-    const icon = value === "sleeping" ? "💤" : value === "sad" ? "😿" : value === "low" ? "!" : "❤";
-    emotion.textContent = icon;
+    emotion.textContent = EMOTION_ICONS[value] ?? "❤";
     emotion.hidden = false;
     emotion.classList.add("emotion-visible");
     globalThis.setTimeout(() => emotion.classList.remove("emotion-visible"), duration);
