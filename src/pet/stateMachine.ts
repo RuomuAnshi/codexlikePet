@@ -15,6 +15,7 @@ export class PetStateMachine {
   private walkingDirection: DragDirection | null = null;
   private dragDirection: DragDirection | null = null;
   private carried = false;
+  private thrown = false;
   private action: PetAction | null = null;
   private clip: string | null = null;
   private baseState: AnimationState = "idle";
@@ -35,8 +36,13 @@ export class PetStateMachine {
     this.walkingDirection = direction;
   }
 
+  /** True while the pet is airborne in the throw physics loop. */
+  setThrown(thrown: boolean): void {
+    this.thrown = thrown;
+  }
+
   startAction(action: PetAction): boolean {
-    if (this.dragging || this.walking || this.socialState !== null || this.action !== null || this.clip !== null) return false;
+    if (this.dragging || this.thrown || this.walking || this.socialState !== null || this.action !== null || this.clip !== null) return false;
     this.action = action;
     return true;
   }
@@ -72,6 +78,7 @@ export class PetStateMachine {
     this.walkingDirection = null;
     this.dragDirection = null;
     this.carried = false;
+    this.thrown = false;
     this.action = null;
     this.clip = null;
     this.baseState = "idle";
@@ -91,6 +98,9 @@ export class PetStateMachine {
       return "running-right";
     }
     if (this.dragging) return "running";
+    // Airborne pets flail; the fall/land extension clips overlay this via the
+    // engine's clip channel when the pet pack ships them.
+    if (this.thrown) return "running";
     if (this.socialState !== null) return this.socialState;
     if (
       this.walkingDirection === "left" ||

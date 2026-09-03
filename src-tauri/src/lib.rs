@@ -30,6 +30,7 @@ use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 mod ai;
 mod desktop_windows;
 mod environment;
+mod football;
 mod social;
 use ai::{AiRuntime, AiSettings};
 use social::SocialSettings;
@@ -726,7 +727,7 @@ impl Default for PetDialogue {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct PetPosition {
     x: f64,
     y: f64,

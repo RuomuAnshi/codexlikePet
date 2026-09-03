@@ -619,6 +619,7 @@ fn scene_options(participant_count: usize) -> &'static [&'static str] {
             "toy-scramble",
             "pass",
             "share-snack",
+            "football",
         ]
     } else {
         &[
@@ -641,6 +642,7 @@ fn scene_options(participant_count: usize) -> &'static [&'static str] {
             "kick-and-chase",
             "pass",
             "fetch",
+            "football",
         ]
     }
 }
@@ -692,6 +694,7 @@ fn prop_scene(scene: &str) -> bool {
             | "steal"
             | "prank"
             | "toy-scramble"
+            | "football"
     )
 }
 
@@ -721,6 +724,9 @@ fn generic_line(scene: &str, role: &str) -> String {
         ("share-snack", _) => &["一人一半，公平吧？"],
         ("kick-and-chase", "kicker") => &["接住！我踢过去了！", "快追上它！"],
         ("kick-and-chase", _) => &["等等我！球滚远了！", "这次换我来！"],
+        ("football", "striker") => &["看我的射门！", "接球！"],
+        ("football", "keeper") => &["我来守住这边！", "别想从我这里过去！"],
+        ("football", _) => &["传给我传给我！", "好球！再来一次！"],
         ("pass", "passer") => &["传给你！", "准备好了吗？"],
         ("pass", _) => &["接到了！再传回来！", "好球！"],
         ("fetch", "thrower") => &["去把它捡回来！", "看我扔得多远！"],
@@ -747,6 +753,11 @@ fn role_for(scene: &str, index: usize) -> String {
         "tug" => if index == 0 { "winner" } else { "challenger" }.to_string(),
         "steal" => if index == 0 { "thief" } else { "owner" }.to_string(),
         "kick-and-chase" => if index == 0 { "kicker" } else { "chaser" }.to_string(),
+        "football" => ["striker", "keeper", "winger", "defender"]
+            .get(index)
+            .copied()
+            .unwrap_or("reserve")
+            .to_string(),
         "pass" => if index == 0 { "passer" } else { "receiver" }.to_string(),
         "fetch" => if index == 0 { "thrower" } else { "fetcher" }.to_string(),
         "prank" => if index == 0 { "prankster" } else { "target" }.to_string(),
@@ -1147,7 +1158,7 @@ fn compile_decision(
 
 fn default_prop(scene: &str) -> Option<String> {
     match scene {
-        "kick-and-chase" | "pass" | "fetch" | "chase" => Some("football".to_string()),
+        "kick-and-chase" | "pass" | "fetch" | "chase" | "football" => Some("football".to_string()),
         "share-snack" => Some("snack".to_string()),
         "tug" | "steal" | "toy-scramble" | "prank" => Some("plush".to_string()),
         _ => None,
@@ -1176,7 +1187,7 @@ fn target_positions(scene: &str, candidates: &[Snapshot]) -> Vec<PetPosition> {
         let first_height = candidates[0].bounds.height();
         let second_height = candidates[1].bounds.height();
         return match scene {
-            "chase" | "tag" | "kick-and-chase" | "pass" | "fetch" => vec![
+            "chase" | "tag" | "kick-and-chase" | "pass" | "fetch" | "football" => vec![
                 PetPosition {
                     x: if direction > 0.0 {
                         center_x - (first_width + second_width + SOCIAL_COLLISION_GAP + 180.0) / 2.0
@@ -1423,7 +1434,7 @@ fn emit_phase(app: &tauri::AppHandle, scene_id: &str, phase: &str, actors: &[Sce
 
 /// Convert a screen-space vector into one of the named atlas directions.
 /// Screen Y grows downwards, so positive Y means "down" here.
-fn look_direction_toward(from: (f64, f64), to: (f64, f64)) -> String {
+pub(crate) fn look_direction_toward(from: (f64, f64), to: (f64, f64)) -> String {
     let dx = to.0 - from.0;
     let dy = to.1 - from.1;
     if dx.abs() < 1.0 && dy.abs() < 1.0 {
@@ -1519,7 +1530,8 @@ fn phase_actors_at(
                 "approach" => "walking",
                 "face" => "idle",
                 "interaction" => match plan.scene.as_str() {
-                    "sync-jump" | "group-cheer" | "kick-and-chase" | "pass" | "fetch" => "jumping",
+                    "sync-jump" | "group-cheer" | "kick-and-chase" | "pass" | "fetch"
+                    | "football" => "jumping",
                     "group-nap" => "waiting",
                     _ => "waving",
                 },
@@ -1535,7 +1547,7 @@ fn phase_actors_at(
                     match plan.scene.as_str() {
                         "nuzzle" | "comfort" | "reconcile" => "heart",
                         "sync-jump" | "group-cheer" => "star",
-                        "kick-and-chase" | "pass" | "fetch" => "star",
+                        "kick-and-chase" | "pass" | "fetch" | "football" => "star",
                         "chase" | "tag" | "toy-scramble" => "dust",
                         "share-snack" => "food",
                         _ => "sparkle",
@@ -2277,6 +2289,65 @@ async fn run_prop_play(
     true
 }
 
+/// A football match keeps the pets and ball busy for a fixed spell after the
+/// scripted approach; the scene end event reserves room for it.
+const FOOTBALL_MATCH_MS: u64 = 16_000;
+
+/// Bridge between the scene coordinator and the physics match. Gathers the
+/// per-pet collision sizes and lines, derives the pitch from the stage rect
+/// and hands control to `football::run_match` until the whistle blows.
+async fn run_football_match(
+    app: &tauri::AppHandle,
+    plan: &ScenePlan,
+    prop_label: &str,
+    cancel: &AtomicBool,
+) -> bool {
+    let players = plan
+        .actors
+        .iter()
+        .map(|actor| super::football::FootballPlayer {
+            instance_id: actor.snapshot.instance_id.clone(),
+            pet_id: actor.snapshot.pet_id.clone(),
+            say: actor.say.clone(),
+            width: actor.snapshot.bounds.width(),
+            height: actor.snapshot.bounds.height(),
+        })
+        .collect::<Vec<_>>();
+    let stage_center = prop_stage_center(plan);
+    let pitch = super::football::PitchBounds {
+        min_x: plan.stage.left + 60.0,
+        min_y: plan.stage.top + 60.0,
+        max_x: (plan.stage.right - 60.0).max(plan.stage.left + 60.0),
+        max_y: (plan.stage.bottom - 60.0).max(plan.stage.top + 60.0),
+    };
+    let player_area = super::football::PitchBounds {
+        min_x: plan.stage.left,
+        min_y: plan.stage.top,
+        max_x: plan.stage.right.max(plan.stage.left),
+        max_y: plan.stage.bottom.max(plan.stage.top),
+    };
+    let ball_center = (stage_center.x + 36.0, stage_center.y + 36.0);
+    match super::football::run_match(
+        app,
+        &plan.scene_id,
+        &players,
+        prop_label,
+        ball_center,
+        pitch,
+        player_area,
+        FOOTBALL_MATCH_MS,
+        cancel,
+    )
+    .await
+    {
+        Some(finals) => {
+            update_runtime_positions(app, plan, &finals);
+            !cancel.load(Ordering::Relaxed)
+        }
+        None => false,
+    }
+}
+
 async fn run_scene(app: tauri::AppHandle, plan: ScenePlan, cancel: Arc<AtomicBool>) {
     let participants = plan
         .actors
@@ -2292,6 +2363,9 @@ async fn run_scene(app: tauri::AppHandle, plan: ScenePlan, cancel: Arc<AtomicBoo
             },
         })
         .collect();
+    let football_match = plan.scene == "football"
+        && plan.prop.as_deref() == Some("football")
+        && plan.actors.len() >= 2;
     let _ = app.emit(
         "pet://social-scene-start",
         SceneStartEvent {
@@ -2300,7 +2374,12 @@ async fn run_scene(app: tauri::AppHandle, plan: ScenePlan, cancel: Arc<AtomicBoo
             trigger: plan.trigger.clone(),
             participants,
             prop: plan.prop.clone(),
-            duration_ms: plan.duration_ms + 3_000,
+            duration_ms: plan.duration_ms
+                + if football_match {
+                    FOOTBALL_MATCH_MS + 3_000
+                } else {
+                    3_000
+                },
         },
     );
     emit_phase(
@@ -2313,20 +2392,31 @@ async fn run_scene(app: tauri::AppHandle, plan: ScenePlan, cancel: Arc<AtomicBoo
         .prop
         .as_deref()
         .and_then(|kind| create_prop_window(&app, &plan.scene_id, kind, prop_stage_center(&plan)));
+    let football_match = football_match && prop_label.is_some();
     let chased = matches!(
         plan.scene.as_str(),
         "chase" | "tag" | "chain-chase" | "follow" | "kick-and-chase"
     );
-    let arrived = if chased {
+    let arrived = if football_match {
+        move_actors(&app, &plan, &cancel).await
+    } else if chased {
         run_chase_movement(&app, &plan, &cancel, prop_label.as_deref()).await
     } else {
         move_actors(&app, &plan, &cancel).await
     };
     if arrived {
-        if !chased {
+        if !chased && !football_match {
             update_scene_runtime_positions(&app, &plan);
         }
-        let prop_played = if !chased && prop_scene(&plan.scene) {
+        let prop_played = if football_match {
+            run_football_match(
+                &app,
+                &plan,
+                prop_label.as_deref().unwrap_or_default(),
+                &cancel,
+            )
+            .await
+        } else if !chased && prop_scene(&plan.scene) {
             if let Some(label) = prop_label.as_deref() {
                 run_prop_play(&app, &plan, label, &cancel).await
             } else {
@@ -3001,10 +3091,22 @@ mod tests {
     #[test]
     fn prop_scene_defaults_match_the_built_in_interactions() {
         assert_eq!(default_prop("kick-and-chase"), Some("football".to_string()));
+        assert_eq!(default_prop("football"), Some("football".to_string()));
         assert_eq!(default_prop("share-snack"), Some("snack".to_string()));
         assert_eq!(default_prop("tug"), Some("plush".to_string()));
         assert!(prop_scene("pass"));
+        assert!(prop_scene("football"));
         assert!(!prop_scene("whisper"));
+    }
+
+    #[test]
+    fn football_scene_is_available_to_pairs_and_groups() {
+        assert!(scene_options(2).contains(&"football"));
+        assert!(scene_options(4).contains(&"football"));
+        assert_eq!(role_for("football", 0), "striker");
+        assert_eq!(role_for("football", 1), "keeper");
+        assert_eq!(role_for("football", 3), "defender");
+        assert_eq!(role_for("football", 9), "reserve");
     }
 
     #[test]

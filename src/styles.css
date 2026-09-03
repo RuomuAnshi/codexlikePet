@@ -90,6 +90,12 @@ body {
 .is-carried #stage {
   transform: rotate(-4deg) translateY(-3px);
   transform-origin: 50% 86%;
+  animation: carried-sway 1.6s ease-in-out infinite;
+}
+
+@keyframes carried-sway {
+  0%, 100% { transform: rotate(-4deg) translateY(-3px); }
+  50% { transform: rotate(3.5deg) translateY(-2px); }
 }
 
 @keyframes pet-particle {
@@ -123,6 +129,6 @@ body {
   }
 
   .particle { animation: none; opacity: 0; }
-  .is-carried #stage { transform: none; }
+  .is-carried #stage { transform: none; animation: none; }
   .food-drop { display: none; }
 }

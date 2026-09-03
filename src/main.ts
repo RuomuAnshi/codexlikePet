@@ -6,8 +6,9 @@ import { loadAnimationPack, loadPet, loadPetFromData } from "./pet/loader";
 import { PetEngine } from "./pet/engine";
 import { watchCursorDirection } from "./pet/cursorWatcher";
 import { PetStateMachine, type PetAction } from "./pet/stateMachine";
-import { attachDrag, attachGestures, dragState, type DragDirection, type Gesture } from "./pet/window";
+import { attachDrag, attachGestures, dragState, isThrowVelocity, type DragDirection, type Gesture } from "./pet/window";
 import { PetWalker } from "./pet/walker";
+import { ThrowPhysics } from "./pet/throw";
 import { extractSayText } from "./pet/streaming";
 import { waitForAppReady } from "./appReady";
 import type {
@@ -129,6 +130,79 @@ async function boot(): Promise<void> {
   let socialSceneId: string | null = null;
   let windowSceneId: string | null = null;
   let lifeSleeping = false;
+  let thrownActive = false;
+  let squashTimer: number | undefined;
+  const reducedMotion = (): boolean =>
+    globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+
+  const applySquash = (): void => {
+    if (reducedMotion()) return;
+    // The window itself cannot deform, but the canvas inside can: a short
+    // squash-and-stretch sells the landing better than any animation frame.
+    stage.style.transform = "scaleY(0.82) scaleX(1.06)";
+    if (squashTimer !== undefined) globalThis.clearTimeout(squashTimer);
+    squashTimer = globalThis.setTimeout(() => {
+      squashTimer = undefined;
+      if (!thrownActive) stage.style.transform = "";
+    }, 120);
+  };
+
+  const throwPhysics = new ThrowPhysics(petEl);
+
+  const finishThrow = (rest: { x: number; y: number } | null): void => {
+    const landed = rest !== null;
+    thrownActive = false;
+    stateMachine.setThrown(false);
+    stage.style.transform = "";
+    if (!landed) {
+      // Caught mid-air: the drag handler owns everything from here.
+      stopFrameClip();
+      syncAnimation();
+      return;
+    }
+    showEffect("dust");
+    applySquash();
+    void invoke("set_pet_position_safely", {
+      instanceId: runtime.instanceId,
+      x: rest.x,
+      y: rest.y,
+    })
+      .catch(() => undefined)
+      .finally(() => {
+        void savePosition();
+        void reportRuntimeState(false);
+      });
+    settlePetActivity();
+    stopFrameClip();
+    if (!playFrameClip("land")) syncAnimation();
+    if (!paused && settings.wanderEnabled && !settings.quietMode && !autoQuiet) walker.start();
+  };
+
+  const startThrow = (velocity: { x: number; y: number }): void => {
+    thrownActive = true;
+    stateMachine.setThrown(true);
+    if (stateMachine.hasAction()) {
+      stateMachine.finishAction();
+      engine.cancelAction();
+    }
+    stopFrameClip();
+    // Optional per-pet clip; falls back to the running flail via the
+    // state machine while airborne.
+    if (!playFrameClip("fall")) syncAnimation();
+    engine.setLook(null);
+    void invoke("hide_pet_speech", { instanceId: runtime.instanceId }).catch(() => undefined);
+    recordPetInteraction("throw");
+    // Stay marked busy so the social coordinator never targets a flying pet.
+    void reportRuntimeState(true);
+    throwPhysics.launch(velocity, {
+      onFrame: (lean) => {
+        if (!reducedMotion()) stage.style.transform = `rotate(${lean.toFixed(1)}deg)`;
+      },
+      onBounce: () => showEffect("dust"),
+      onRest: (rest) => finishThrow(rest),
+      onCaught: () => finishThrow(null),
+    });
+  };
 
   const speechPreview = (text: string): string => {
     const chars = [...text.trim()];
@@ -208,7 +282,7 @@ async function boot(): Promise<void> {
     if (settings.quietMode || autoQuiet || !dialogue.idle.length) return;
     idleSpeechTimer = globalThis.setTimeout(() => {
       idleSpeechTimer = undefined;
-      if (!settings.quietMode && !autoQuiet && !dragging && !walking && !stateMachine.hasAction()) {
+      if (!settings.quietMode && !autoQuiet && !dragging && !walking && !thrownActive && !stateMachine.hasAction()) {
         sayLine("idle");
       }
       scheduleIdleSpeech();
@@ -480,7 +554,9 @@ async function boot(): Promise<void> {
   watchCursorDirection(
     (direction) => {
       lastDirection = direction === null ? null : (direction as LookDirection);
-      if (!dragging && !walking && !dragState.petting && !socialSceneId && !windowSceneId) engine.setLook(lastDirection);
+      if (!dragging && !walking && !dragState.petting && !socialSceneId && !windowSceneId && !thrownActive) {
+        engine.setLook(lastDirection);
+      }
     },
     100,
     () => !paused,
@@ -489,7 +565,9 @@ async function boot(): Promise<void> {
   attachDrag(
     petEl,
     runtime.instanceId,
-    (enabled, direction: DragDirection | null, carried) => {
+    (enabled, direction: DragDirection | null, carried, releaseVelocity) => {
+      const throwing =
+        !enabled && releaseVelocity !== null && isThrowVelocity(releaseVelocity);
       dragging = enabled;
       if (enabled) {
         if (windowSceneId) {
@@ -515,13 +593,21 @@ async function boot(): Promise<void> {
       }
       if (!enabled && petEl.classList.contains("is-carried")) {
         petEl.classList.remove("is-carried");
-        showEffect("dust");
-        sayLine("putDown");
+        // The throw sequence provides its own landing effects and dialogue
+        // timing, so the plain put-down feedback only fits a normal drop.
+        if (!throwing) {
+          showEffect("dust");
+          sayLine("putDown");
+        }
       }
       if (enabled) engine.setLook(null);
-      else engine.setLook(lastDirection);
+      else if (!throwing) engine.setLook(lastDirection);
       syncAnimation();
       if (enabled) void savePosition();
+      if (throwing && releaseVelocity) {
+        startThrow(releaseVelocity);
+        return;
+      }
       void reportRuntimeState(enabled);
       if (!enabled) {
         dragDialogueShown = false;
@@ -534,13 +620,21 @@ async function boot(): Promise<void> {
   );
 
   petEl.addEventListener("pointerenter", () => {
-    if (hovered || dragState.current) return;
+    if (hovered || dragState.current || thrownActive) return;
     hovered = true;
     playAction("jumping");
   });
   petEl.addEventListener("pointerleave", () => {
     hovered = false;
-    if (!dragging && !walking && !dragState.petting && !socialSceneId && !windowSceneId && !stateMachine.hasAction()) {
+    if (
+      !dragging &&
+      !walking &&
+      !dragState.petting &&
+      !socialSceneId &&
+      !windowSceneId &&
+      !thrownActive &&
+      !stateMachine.hasAction()
+    ) {
       engine.setLook(lastDirection);
     }
   });

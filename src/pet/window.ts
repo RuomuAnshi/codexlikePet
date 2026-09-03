@@ -16,7 +16,30 @@ export type MoveDirection =
   | "down-right";
 export type DragDirection = MoveDirection;
 
-type DragChange = (dragging: boolean, direction: DragDirection | null, carried: boolean) => void;
+/** Pointer release speed in logical px/ms, averaged over a short sample window. */
+export interface ReleaseVelocity {
+  x: number;
+  y: number;
+}
+
+const VELOCITY_SAMPLE_WINDOW_MS = 120;
+/**
+ * Releases slower than this settle in place (legacy drop path); faster ones
+ * hand the pet to the throw physics loop. Shared with main.ts so the drag
+ * settle invoke and the throw decision can never disagree.
+ */
+export const THROW_MIN_SPEED = 0.6;
+
+export function isThrowVelocity(velocity: ReleaseVelocity | null): boolean {
+  return velocity !== null && Math.hypot(velocity.x, velocity.y) >= THROW_MIN_SPEED;
+}
+
+type DragChange = (
+  dragging: boolean,
+  direction: DragDirection | null,
+  carried: boolean,
+  releaseVelocity: ReleaseVelocity | null,
+) => void;
 
 /** Starts a window drag only after the pointer has moved more than 8px. */
 export function attachDrag(
@@ -38,9 +61,30 @@ export function attachDrag(
   let pendingPosition: { x: number; y: number } | null = null;
   let latestPosition: { x: number; y: number } | null = null;
   let flushingPosition = false;
+  // Recent pointer samples for release-velocity estimation. A flick lives in
+  // the last ~120ms of motion, so a sliding window beats a single-frame
+  // delta, which one tremor in the opposite direction would ruin.
+  const velocitySamples: { x: number; y: number; t: number }[] = [];
   let speechSyncTimer: number | undefined;
   let speechSyncQueued = false;
   let speechSyncInFlight = false;
+
+  const pushVelocitySample = (x: number, y: number): void => {
+    const now = performance.now();
+    velocitySamples.push({ x, y, t: now });
+    while (velocitySamples.length > 2 && now - velocitySamples[0].t > VELOCITY_SAMPLE_WINDOW_MS) {
+      velocitySamples.shift();
+    }
+  };
+
+  const computeReleaseVelocity = (): ReleaseVelocity | null => {
+    if (velocitySamples.length < 2) return null;
+    const first = velocitySamples[0];
+    const last = velocitySamples[velocitySamples.length - 1];
+    const dt = last.t - first.t;
+    if (dt < 8) return null;
+    return { x: (last.x - first.x) / dt, y: (last.y - first.y) / dt };
+  };
 
   /**
    * Speech windows are separate native windows. Keep them following the pet,
@@ -111,8 +155,10 @@ export function attachDrag(
       dragState.current = true;
       dragDirection = directionFor(dx, dy);
       carried = dy < -24 && Math.abs(dy) > Math.abs(dx);
-      onDragChange?.(true, dragDirection, carried);
+      onDragChange?.(true, dragDirection, carried, null);
     }
+
+    pushVelocitySample(x, y);
 
     pendingPosition = { x: startWin.x + dx, y: startWin.y + dy };
     latestPosition = pendingPosition;
@@ -121,7 +167,7 @@ export function attachDrag(
     if (dragDirection !== nextDirection || carried !== nextCarried) {
       dragDirection = nextDirection;
       carried = nextCarried;
-      onDragChange?.(true, nextDirection, nextCarried);
+      onDragChange?.(true, nextDirection, nextCarried, null);
     }
     void flushPosition();
   };
@@ -131,6 +177,7 @@ export function attachDrag(
     const token = ++dragToken;
     active = true;
     dragging = false;
+    velocitySamples.length = 0;
     pointerId = event.pointerId;
     startWin = null;
     pendingPosition = null;
@@ -162,6 +209,8 @@ export function attachDrag(
     if (!active) return;
     const wasDragging = dragging;
     const releasedPosition = latestPosition;
+    const releaseVelocity = wasDragging ? computeReleaseVelocity() : null;
+    const throwing = isThrowVelocity(releaseVelocity);
     active = false;
     dragging = false;
     dragToken += 1;
@@ -170,9 +219,10 @@ export function attachDrag(
     startWin = null;
     dragDirection = null;
     carried = false;
+    velocitySamples.length = 0;
     if (wasDragging || dragState.current) {
       dragState.current = false;
-      onDragChange?.(false, null, false);
+      onDragChange?.(false, null, false, throwing ? releaseVelocity : null);
     }
     try {
       if (event && event.pointerId === pointerId && element.hasPointerCapture(event.pointerId)) {
@@ -182,9 +232,11 @@ export function attachDrag(
       /* ignore */
     }
 
-    if (wasDragging && releasedPosition) {
+    if (wasDragging && releasedPosition && !throwing) {
       // Keep collision protection, but do it after pointer feedback has
       // stopped. A slow layout query must never hold the drag loop hostage.
+      // A throw skips this: the physics loop repositions the window and
+      // arbitrates once when it settles.
       void invoke<{ x: number; y: number }>("set_pet_position_safely", {
         instanceId,
         x: releasedPosition.x,
