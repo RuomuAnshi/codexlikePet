@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { waitForAppReady } from "./appReady";
 import { extractSayText } from "./pet/streaming";
-import type { AiSettings, ChatMessage } from "./pet/config";
+import type { ChatMessage } from "./pet/config";
 
 const params = new URLSearchParams(location.search);
 // Chat windows are always opened with the target pet id by the backend. Keep
@@ -16,8 +16,8 @@ const composer = document.querySelector<HTMLFormElement>("#composer")!;
 const sendButton = document.querySelector<HTMLButtonElement>("#send")!;
 const stopButton = document.querySelector<HTMLButtonElement>("#stop")!;
 const closeButton = document.querySelector<HTMLButtonElement>("#close")!;
+const dragHandle = document.querySelector<HTMLElement>("#drag-handle")!;
 const status = document.querySelector<HTMLElement>("#status")!;
-const setup = document.querySelector<HTMLElement>("#setup")!;
 const chatWindow = getCurrentWindow();
 let activeRequest: string | null = null;
 let streamingMessage: HTMLElement | null = null;
@@ -27,7 +27,10 @@ let historyVisible = false;
 let historyMessages: ChatMessage[] = [];
 const sessionMessages: ChatMessage[] = [];
 
-function setStatus(text: string): void { status.textContent = text; }
+function setStatus(text: string, kind: "normal" | "error" = "normal"): void {
+  status.textContent = text;
+  status.dataset.kind = kind;
+}
 
 function createMessageElement(message: ChatMessage): HTMLElement {
   const element = document.createElement("div");
@@ -86,8 +89,6 @@ async function load(): Promise<void> {
   renderMessages([]);
   document.body.classList.remove("history-visible");
   await resizeChatWindow(false);
-  const ai = await invoke<AiSettings>("get_ai_settings");
-  setup.hidden = Boolean(ai.enabled && ai.chatModel?.model);
 }
 
 async function send(content: string): Promise<void> {
@@ -112,7 +113,7 @@ async function send(content: string): Promise<void> {
     pendingUserMessage?.remove();
     if (lastSessionMessage()?.id.startsWith("local-")) sessionMessages.pop();
     pendingUserMessage = null;
-    setStatus(String(error));
+    setStatus(String(error), "error");
     sendButton.disabled = false;
     stopButton.hidden = true;
   }
@@ -175,7 +176,7 @@ function applyError(payload: Extract<PendingEvent, { type: "error" }>["payload"]
   pendingUserMessage = null;
   sendButton.disabled = false;
   stopButton.hidden = true;
-  setStatus(payload.message);
+  setStatus(payload.message, "error");
 }
 
 function flushPending(): void {
@@ -238,22 +239,25 @@ async function bootChat(): Promise<void> {
   closeButton.addEventListener("click", () => {
     closeButton.disabled = true;
     void invoke("hide_pet_chat", { petId })
-      .catch((error) => setStatus(String(error)))
+      .catch((error) => setStatus(String(error), "error"))
       .finally(() => {
         closeButton.disabled = false;
       });
   });
-  const openSettings = (): void => { void invoke("open_ai_settings"); };
-  document.querySelector("#setup-button")?.addEventListener("click", openSettings);
+  dragHandle.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    void chatWindow.startDragging().catch((error) => setStatus(String(error), "error"));
+  });
   document.addEventListener("keydown", (event) => {
     if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "h") return;
     event.preventDefault();
     if (activeRequest) return;
-    void setHistoryVisible(!historyVisible).catch((error) => setStatus(String(error)));
+    void setHistoryVisible(!historyVisible).catch((error) => setStatus(String(error), "error"));
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && historyVisible && !activeRequest) {
-      void setHistoryVisible(false).catch((error) => setStatus(String(error)));
+      void setHistoryVisible(false).catch((error) => setStatus(String(error), "error"));
     }
   });
   document.title = "SakiPet";

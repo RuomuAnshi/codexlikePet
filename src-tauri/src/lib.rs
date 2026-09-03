@@ -39,6 +39,9 @@ const LOOK_MARGIN_LOGICAL: f64 = 72.0;
 const LOOK_DEADZONE_LOGICAL: f64 = 60.0;
 const PET_WIDTH: f64 = 192.0;
 const PET_HEIGHT: f64 = 208.0;
+const CHAT_WINDOW_WIDTH: f64 = 320.0;
+const CHAT_WINDOW_HEIGHT: f64 = 230.0;
+const CHAT_WINDOW_GAP: f64 = 12.0;
 const SPEECH_WINDOW_MIN_WIDTH: f64 = 150.0;
 const SPEECH_WINDOW_MAX_WIDTH: f64 = 260.0;
 const SPEECH_WINDOW_HEIGHT: f64 = 82.0;
@@ -800,6 +803,8 @@ struct AppConfig {
     #[serde(default)]
     chat_positions: HashMap<String, PetPosition>,
     #[serde(default)]
+    chat_offsets: HashMap<String, PetPosition>,
+    #[serde(default)]
     environment: EnvironmentSettings,
     #[serde(default)]
     social: SocialSettings,
@@ -820,6 +825,7 @@ impl Default for AppConfig {
             next_instance_id: 2,
             ai: AiSettings::default(),
             chat_positions: HashMap::new(),
+            chat_offsets: HashMap::new(),
             environment: EnvironmentSettings::default(),
             social: SocialSettings::default(),
         }
@@ -832,6 +838,7 @@ struct AppState {
     desktop_windows: desktop_windows::DesktopWindowRuntime,
     environment: environment::EnvironmentRuntime,
     social: social::SocialRuntime,
+    chat_offsets: Mutex<HashMap<String, PetPosition>>,
     speech_ready: Mutex<HashSet<String>>,
     speech_layout: Mutex<()>,
     ready: AtomicBool,
@@ -845,6 +852,7 @@ impl AppState {
             desktop_windows: desktop_windows::DesktopWindowRuntime::default(),
             environment: environment::EnvironmentRuntime::default(),
             social: social::SocialRuntime::default(),
+            chat_offsets: Mutex::new(HashMap::new()),
             speech_ready: Mutex::new(HashSet::new()),
             speech_layout: Mutex::new(()),
             ready: AtomicBool::new(false),
@@ -1358,6 +1366,9 @@ fn normalize_config(config: &mut AppConfig) {
     config.pet_settings.retain(|id, _| is_safe_id(id));
     config
         .chat_positions
+        .retain(|id, position| is_safe_id(id) && position.x.is_finite() && position.y.is_finite());
+    config
+        .chat_offsets
         .retain(|id, position| is_safe_id(id) && position.x.is_finite() && position.y.is_finite());
     for settings in config.pet_settings.values_mut() {
         *settings = clamp_settings(settings.clone());
@@ -2302,7 +2313,17 @@ fn reposition_pet_speech(app: &tauri::AppHandle, instance_id: &str) -> Result<()
 /// speech window at the pet's previous position.
 #[tauri::command]
 fn sync_pet_speech_position(app: tauri::AppHandle, instance_id: String) -> Result<(), String> {
-    reposition_pet_speech(&app, &instance_id)
+    let speech_result = reposition_pet_speech(&app, &instance_id);
+    let chat_result = config_snapshot(&app).and_then(|config| {
+        let pet_id = config
+            .instances
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .map(|instance| instance.pet_id.clone())
+            .ok_or_else(|| "pet instance is not configured".to_string())?;
+        reposition_pet_chat(&app, &pet_id)
+    });
+    speech_result.and(chat_result)
 }
 
 #[derive(Clone, Serialize)]
@@ -2462,6 +2483,170 @@ fn chat_window_label(pet_id: &str) -> Result<String, String> {
     Ok(format!("pet-chat-{pet_id}"))
 }
 
+/// Place a chat window relative to its pet while keeping the whole window on
+/// the pet's current monitor. The offset is deliberately expressed in logical
+/// pixels so the same position works across Windows display scale factors.
+fn pet_chat_position(
+    pet_window: &tauri::WebviewWindow,
+    chat_size: (f64, f64),
+    offset: Option<&PetPosition>,
+) -> Result<LogicalPosition<f64>, String> {
+    let pet_scale = pet_window
+        .scale_factor()
+        .map_err(|error| error.to_string())?
+        .max(1.0);
+    let pet_position: LogicalPosition<f64> = pet_window
+        .outer_position()
+        .map_err(|error| error.to_string())?
+        .to_logical(pet_scale);
+    let pet_size: LogicalSize<f64> = pet_window
+        .outer_size()
+        .map_err(|error| error.to_string())?
+        .to_logical(pet_scale);
+    let preferred = offset
+        .map(|saved| (pet_position.x + saved.x, pet_position.y + saved.y))
+        .unwrap_or_else(|| {
+            (
+                pet_position.x + (pet_size.width - chat_size.0) / 2.0,
+                pet_position.y + pet_size.height + CHAT_WINDOW_GAP,
+            )
+        });
+
+    let Some(monitor) = pet_window.current_monitor().ok().flatten() else {
+        return Ok(LogicalPosition::new(preferred.0, preferred.1));
+    };
+    let monitor_scale = monitor.scale_factor().max(1.0);
+    let work_area = monitor.work_area();
+    let work_position: LogicalPosition<f64> = work_area.position.to_logical(monitor_scale);
+    let work_size: LogicalSize<f64> = work_area.size.to_logical(monitor_scale);
+    let work_right = work_position.x + work_size.width;
+    let work_bottom = work_position.y + work_size.height;
+    let max_x = (work_right - chat_size.0).max(work_position.x);
+    let max_y = (work_bottom - chat_size.1).max(work_position.y);
+    let below_y = pet_position.y + pet_size.height + CHAT_WINDOW_GAP;
+    let above_y = pet_position.y - chat_size.1 - CHAT_WINDOW_GAP;
+    let preferred_y =
+        if offset.is_none() && below_y + chat_size.1 > work_bottom && above_y >= work_position.y {
+            above_y
+        } else {
+            preferred.1
+        };
+    Ok(LogicalPosition::new(
+        preferred.0.clamp(work_position.x, max_x),
+        preferred_y.clamp(work_position.y, max_y),
+    ))
+}
+
+fn visible_pet_window_for_pet(
+    app: &tauri::AppHandle,
+    config: &AppConfig,
+    pet_id: &str,
+) -> Option<tauri::WebviewWindow> {
+    config
+        .instances
+        .iter()
+        .find(|instance| instance.pet_id == pet_id && instance.visible)
+        .and_then(|instance| app.get_webview_window(&instance_label(&instance.id).ok()?))
+}
+
+fn runtime_chat_offset(app: &tauri::AppHandle, pet_id: &str) -> Option<PetPosition> {
+    app.state::<AppState>()
+        .chat_offsets
+        .lock()
+        .ok()
+        .and_then(|offsets| offsets.get(pet_id).cloned())
+}
+
+fn set_runtime_chat_offset(app: &tauri::AppHandle, pet_id: &str, offset: PetPosition) {
+    if offset.x.is_finite() && offset.y.is_finite() {
+        if let Ok(mut offsets) = app.state::<AppState>().chat_offsets.lock() {
+            offsets.insert(pet_id.to_string(), offset);
+        }
+    }
+}
+
+/// Remember a chat window's logical position relative to its pet. This is
+/// called by the global native window-event hook, so it catches Windows
+/// title-bar dragging and programmatic moves without adding a hot path to the
+/// chat WebView.
+fn remember_pet_chat_offset_at(
+    app: &tauri::AppHandle,
+    pet_id: &str,
+    chat_position: LogicalPosition<f64>,
+) {
+    let Ok(config) = config_snapshot(app) else {
+        return;
+    };
+    let Some(pet_window) = visible_pet_window_for_pet(app, &config, pet_id) else {
+        return;
+    };
+    let (Ok(pet_scale), Ok(pet_position)) =
+        (pet_window.scale_factor(), pet_window.outer_position())
+    else {
+        return;
+    };
+    let pet_position: LogicalPosition<f64> = pet_position.to_logical(pet_scale.max(1.0));
+    set_runtime_chat_offset(
+        app,
+        pet_id,
+        PetPosition {
+            x: chat_position.x - pet_position.x,
+            y: chat_position.y - pet_position.y,
+        },
+    );
+}
+
+fn remember_pet_chat_offset(
+    app: &tauri::AppHandle,
+    pet_id: &str,
+    chat_window: &tauri::WebviewWindow,
+) {
+    let (Ok(scale_factor), Ok(position)) =
+        (chat_window.scale_factor(), chat_window.outer_position())
+    else {
+        return;
+    };
+    remember_pet_chat_offset_at(app, pet_id, position.to_logical(scale_factor.max(1.0)));
+}
+
+/// Keep an open chat window attached to its pet. Manual dragging changes the
+/// saved relative offset, so the window remains draggable without becoming
+/// stranded when the pet walks away.
+fn reposition_pet_chat(app: &tauri::AppHandle, pet_id: &str) -> Result<(), String> {
+    let config = config_snapshot(app)?;
+    let Some(pet_window) = visible_pet_window_for_pet(app, &config, pet_id) else {
+        return Ok(());
+    };
+    let Some(chat_window) = app.get_webview_window(&chat_window_label(pet_id)?) else {
+        return Ok(());
+    };
+    if !chat_window.is_visible().unwrap_or(false) {
+        return Ok(());
+    }
+    let chat_scale = chat_window
+        .scale_factor()
+        .map_err(|error| error.to_string())?
+        .max(1.0);
+    let chat_size = chat_window
+        .outer_size()
+        .map_err(|error| error.to_string())?
+        .to_logical(chat_scale);
+    let saved_offset =
+        runtime_chat_offset(app, pet_id).or_else(|| config.chat_offsets.get(pet_id).cloned());
+    let position = pet_chat_position(
+        &pet_window,
+        (chat_size.width, chat_size.height),
+        saved_offset.as_ref(),
+    )?;
+    chat_window
+        .set_position(position)
+        .map_err(|error| error.to_string())?;
+    if saved_offset.is_none() {
+        remember_pet_chat_offset(app, pet_id, &chat_window);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn toggle_pet_chat(app: tauri::AppHandle, pet_id: String) -> Result<bool, String> {
     if !pet_exists(&app, &pet_id) {
@@ -2477,6 +2662,7 @@ async fn toggle_pet_chat(app: tauri::AppHandle, pet_id: String) -> Result<bool, 
             let _ = window.unminimize();
         }
         window.show().map_err(|error| error.to_string())?;
+        let _ = reposition_pet_chat(&app, &pet_id);
         window.set_focus().map_err(|error| error.to_string())?;
         return Ok(true);
     }
@@ -2496,21 +2682,16 @@ async fn open_pet_chat(app: tauri::AppHandle, pet_id: String) -> Result<(), Stri
             let _ = window.unminimize();
         }
         window.show().map_err(|error| error.to_string())?;
+        let _ = reposition_pet_chat(&app, &pet_id);
         window.set_focus().map_err(|error| error.to_string())?;
         return Ok(());
     }
     let config = config_snapshot(&app)?;
-    let position = config
-        .chat_positions
-        .get(&pet_id)
-        .map(|position| (position.x, position.y))
-        .or_else(|| {
-            config
-                .instances
-                .iter()
-                .find(|instance| instance.pet_id == pet_id)
-                .and_then(|instance| instance.position.clone())
-                .map(|position| (position.x - 114.0, position.y + PET_HEIGHT + 12.0))
+    let position = visible_pet_window_for_pet(&app, &config, &pet_id)
+        .and_then(|pet_window| {
+            pet_chat_position(&pet_window, (CHAT_WINDOW_WIDTH, CHAT_WINDOW_HEIGHT), None)
+                .ok()
+                .map(|position| (position.x, position.y))
         })
         .unwrap_or((240.0, 390.0));
     let window = WebviewWindowBuilder::new(
@@ -2519,7 +2700,7 @@ async fn open_pet_chat(app: tauri::AppHandle, pet_id: String) -> Result<(), Stri
         WebviewUrl::App(format!("chat.html?petId={pet_id}").into()),
     )
     .title("")
-    .inner_size(320.0, 230.0)
+    .inner_size(CHAT_WINDOW_WIDTH, CHAT_WINDOW_HEIGHT)
     .position(position.0, position.1)
     .decorations(false)
     .always_on_top(true)
@@ -2534,6 +2715,7 @@ async fn open_pet_chat(app: tauri::AppHandle, pet_id: String) -> Result<(), Stri
     // Close/hide and position persistence for this window are handled by the
     // global `on_window_event` hook; per-window listeners registered after
     // creation never fire.
+    let _ = reposition_pet_chat(&app, &pet_id);
     window.set_focus().map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -2546,14 +2728,19 @@ fn hide_pet_chat(app: tauri::AppHandle, pet_id: String) -> Result<(), String> {
     let window = app
         .get_webview_window(&chat_window_label(&pet_id)?)
         .ok_or_else(|| "chat window is not available".to_string())?;
-    // Persist the closing position so the next open restores it.
+    // Persist the closing position and relative offset for the next open.
     if let (Ok(position), Ok(scale_factor)) = (window.outer_position(), window.scale_factor()) {
         let logical = PetPosition {
             x: position.x as f64 / scale_factor,
             y: position.y as f64 / scale_factor,
         };
+        remember_pet_chat_offset(&app, &pet_id, &window);
+        let offset = runtime_chat_offset(&app, &pet_id);
         let _ = update_config(&app, |config| {
             config.chat_positions.insert(pet_id.clone(), logical);
+            if let Some(offset) = offset {
+                config.chat_offsets.insert(pet_id.clone(), offset);
+            }
             Ok(())
         });
     }
@@ -2864,6 +3051,15 @@ fn set_pet_position_safely(
         .set_position(LogicalPosition::new(safe.x, safe.y))
         .map_err(|error| error.to_string())?;
     let _ = reposition_pet_speech(&app, &instance_id);
+    if let Ok(config) = config_snapshot(&app) {
+        if let Some(instance) = config
+            .instances
+            .iter()
+            .find(|instance| instance.id == instance_id)
+        {
+            let _ = reposition_pet_chat(&app, &instance.pet_id);
+        }
+    }
     Ok(safe)
 }
 
@@ -3605,6 +3801,7 @@ fn remove_imported_pet(app: tauri::AppHandle, pet_id: String) -> Result<Vec<Inst
         config.disabled_pet_ids.retain(|id| id != &pet_id);
         config.pet_settings.remove(&pet_id);
         config.chat_positions.remove(&pet_id);
+        config.chat_offsets.remove(&pet_id);
         Ok(())
     })?;
 
@@ -4598,6 +4795,17 @@ pub fn run() {
         .on_window_event(|window, event| {
             let label = window.label();
             match event {
+                WindowEvent::Moved(position) if label.starts_with("pet-chat-") => {
+                    if let Some(pet_id) = label.strip_prefix("pet-chat-") {
+                        if let Ok(scale_factor) = window.scale_factor() {
+                            remember_pet_chat_offset_at(
+                                window.app_handle(),
+                                pet_id,
+                                position.to_logical(scale_factor.max(1.0)),
+                            );
+                        }
+                    }
+                }
                 // WebView2 teardown can silently fail and leave the HWND
                 // alive, so utility windows hide on close instead of being
                 // destroyed. This must be a global hook: per-window listeners
