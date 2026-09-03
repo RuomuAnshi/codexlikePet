@@ -3,9 +3,12 @@
 //! Unlike the scripted prop plays, the ball here is a real entity with
 //! velocity, rolling friction and wall bounces, and every pet owns a collision
 //! volume (its window rectangle). Pets steer with a light team AI — the
-//! nearest one charges the ball while the others flank — and kick it away on
-//! contact, so a two, three, or four pet match emerges from the simulation
-//! instead of a fixed choreography.
+//! nearest one charges the ball, the second cuts off the ball's future path
+//! and the rest flank — and touches are classified by context: gentle
+//! contacts dribble the ball ahead, a charged carrier shoots, and a contact
+//! by a pet without possession tackles the ball clear. A two, three, or four
+//! pet match therefore emerges from the simulation instead of a fixed
+//! choreography.
 //!
 //! All coordinates are logical pixels. The ball position is the centre of the
 //! 72x72 prop window; pet positions are window top-left corners, matching the
@@ -39,11 +42,28 @@ const KICK_ESCAPE: f64 = 8.0;
 const CHASER_SPEED: f64 = 150.0;
 const SUPPORT_SPEED: f64 = 118.0;
 const SUPPORT_SPREAD: f64 = 95.0;
+/// Second-nearest pet chases the ball's future position to attempt tackles.
+const INTERCEPT_SPEED: f64 = 168.0;
+const INTERCEPT_LOOKAHEAD_S: f64 = 0.35;
 const PLAYER_SEPARATION_GAP: f64 = 6.0;
 const ARRIVAL_EPSILON: f64 = 6.0;
 const MATCH_PHASE_INTERVAL_MS: u64 = 700;
 const MATCH_SAY_COOLDOWN_MS: u64 = 2_600;
 const SAY_CHANCE: f64 = 0.65;
+
+// Dribbling: slow contacts nudge the ball ahead instead of blasting it away,
+// so a pet can carry the ball until it charges a shot or gets tackled.
+/// Consecutive gentle touches before the carrier blasts a shot.
+const SHOOT_CHARGE_AFTER_TOUCHES: u32 = 3;
+/// Small chance any gentle touch turns into an early shot.
+const SHOOT_CHANCE: f64 = 0.15;
+const DRIBBLE_PUSH_FACTOR: f64 = 1.35;
+const DRIBBLE_MIN_PUSH: f64 = 90.0;
+const DRIBBLE_PUSH_BONUS: f64 = 110.0;
+const DRIBBLE_COOLDOWN_S: f64 = 0.12;
+const DRIBBLE_ESCAPE: f64 = 6.0;
+/// Below this travel speed a pet is considered stationary for push direction.
+const TRAVEL_SPEED_EPSILON: f64 = 40.0;
 
 pub(crate) struct FootballPlayer {
     pub instance_id: String,
@@ -164,6 +184,94 @@ fn kick_velocity(
     (dir_x * power, dir_y * power)
 }
 
+/// What happens when a pet's collision volume touches the ball.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TouchKind {
+    /// Gentle nudge ahead of the pet: the ball rolls a little, the pet
+    /// catches up, and the run continues.
+    Dribble,
+    /// Full-power strike down the pet's travel direction.
+    Shoot,
+    /// A pet without possession knocked the loose ball away at full power.
+    Tackle,
+}
+
+fn classify_touch(
+    toucher: usize,
+    possession: Option<usize>,
+    dribble_touches: u32,
+    roll: f64,
+) -> TouchKind {
+    if possession.is_some_and(|carrier| carrier != toucher) {
+        return TouchKind::Tackle;
+    }
+    if dribble_touches + 1 >= SHOOT_CHARGE_AFTER_TOUCHES || roll < SHOOT_CHANCE {
+        TouchKind::Shoot
+    } else {
+        TouchKind::Dribble
+    }
+}
+
+/// The direction a touch pushes the ball: the pet's actual movement while it
+/// runs, or straight at the ball when it is standing still.
+fn travel_direction(
+    velocity: (f64, f64),
+    center: (f64, f64),
+    ball_center: (f64, f64),
+) -> (f64, f64) {
+    let speed = velocity.0.hypot(velocity.1);
+    if speed > TRAVEL_SPEED_EPSILON {
+        return (velocity.0 / speed, velocity.1 / speed);
+    }
+    let dx = ball_center.0 - center.0;
+    let dy = ball_center.1 - center.1;
+    let distance = dx.hypot(dy);
+    if distance < 1.0 {
+        (1.0, 0.0)
+    } else {
+        (dx / distance, dy / distance)
+    }
+}
+
+/// A dribble touch: slightly faster than the pet so the ball rolls ahead and
+/// the pet catches up, which reads as controlled footwork instead of a kick.
+fn dribble_push(
+    velocity: (f64, f64),
+    center: (f64, f64),
+    ball_center: (f64, f64),
+) -> (f64, f64) {
+    let (direction, power) = {
+        let speed = velocity.0.hypot(velocity.1);
+        if speed > TRAVEL_SPEED_EPSILON {
+            let power = (speed * DRIBBLE_PUSH_FACTOR).clamp(
+                DRIBBLE_MIN_PUSH,
+                speed + DRIBBLE_PUSH_BONUS,
+            );
+            (velocity, power)
+        } else {
+            (
+                travel_direction(velocity, center, ball_center),
+                DRIBBLE_MIN_PUSH,
+            )
+        }
+    };
+    let length = direction.0.hypot(direction.1).max(0.0001);
+    (direction.0 / length * power, direction.1 / length * power)
+}
+
+/// A charged shot: the travel direction with a tighter jitter than a random
+/// clearance, so shots visibly go where the pet was heading.
+fn shoot_velocity(travel: (f64, f64)) -> (f64, f64) {
+    let length = travel.0.hypot(travel.1).max(0.0001);
+    let (dx, dy) = (travel.0 / length, travel.1 / length);
+    let jitter: f64 = (rand::rng().random_range(0.0..1.0) - 0.5) * 0.24;
+    let (sin, cos) = jitter.sin_cos();
+    let power = rand::rng().random_range(KICK_SPEED_MIN..KICK_SPEED_MAX);
+    let dir_x = dx * cos - dy * sin;
+    let dir_y = dx * sin + dy * cos;
+    (dir_x * power, dir_y * power)
+}
+
 /// Circle-vs-rectangle overlap: distance from the ball centre to the closest
 /// point on the pet rectangle must stay within the ball radius.
 fn touches_ball(
@@ -241,62 +349,78 @@ fn clamp_players(positions: &mut [PetPosition], players: &[FootballPlayer], area
     }
 }
 
-/// One steering tick: the pet closest to the ball charges it head-on while
-/// the rest aim beside and slightly behind the ball, so a group surrounds the
-/// play instead of forming a conga line.
-fn steer_players(players: &[FootballPlayer], positions: &mut [PetPosition], ball: &Ball) {
+/// One steering tick with three tiers: the nearest pet charges the ball
+/// head-on, the second cuts off the ball's future path (which is how tackles
+/// actually happen), and the rest aim beside and slightly behind the ball so
+/// a group surrounds the play instead of forming a conga line. The per-pet
+/// actual movement is written back so touch classification knows how fast
+/// each pet was running.
+fn steer_players(
+    players: &[FootballPlayer],
+    positions: &mut [PetPosition],
+    ball: &Ball,
+    velocities: &mut [(f64, f64)],
+) {
     if players.is_empty() {
         return;
     }
-    let mut chaser = 0;
-    let mut best = f64::INFINITY;
-    for (index, player) in players.iter().enumerate() {
+    let distance_of = |index: usize| -> f64 {
+        let player = &players[index];
         let center = (
             positions[index].x + player.width / 2.0,
             positions[index].y + player.height / 2.0,
         );
-        let distance = (ball.x - center.0).hypot(ball.y - center.1);
-        if distance < best {
-            best = distance;
-            chaser = index;
-        }
-    }
+        (ball.x - center.0).hypot(ball.y - center.1)
+    };
+    let mut order: Vec<usize> = (0..players.len()).collect();
+    order.sort_by(|&first, &second| distance_of(first).total_cmp(&distance_of(second)));
+
     let speed = ball.speed();
     let heading = if speed > 1.0 {
         (ball.vx / speed, ball.vy / speed)
     } else {
         (0.0, 0.0)
     };
-    for (index, player) in players.iter().enumerate() {
+    for (rank, &index) in order.iter().enumerate() {
+        let player = &players[index];
         let center = (
             positions[index].x + player.width / 2.0,
             positions[index].y + player.height / 2.0,
         );
-        let target = if index == chaser {
-            (ball.x, ball.y)
-        } else {
-            let perp = (-heading.1, heading.0);
-            let side = if index % 2 == 0 { 1.0 } else { -1.0 };
-            let spread = SUPPORT_SPREAD * (1.0 + index as f64 * 0.25);
-            (
-                ball.x - heading.0 * 60.0 + perp.0 * spread * side,
-                ball.y - heading.1 * 60.0 + perp.1 * spread * side,
-            )
+        let (target, pace) = match rank {
+            0 => ((ball.x, ball.y), CHASER_SPEED),
+            1 => (
+                (
+                    ball.x + ball.vx * INTERCEPT_LOOKAHEAD_S,
+                    ball.y + ball.vy * INTERCEPT_LOOKAHEAD_S,
+                ),
+                INTERCEPT_SPEED,
+            ),
+            _ => {
+                let perp = (-heading.1, heading.0);
+                let side = if index % 2 == 0 { 1.0 } else { -1.0 };
+                let spread = SUPPORT_SPREAD * (1.0 + index as f64 * 0.25);
+                (
+                    (
+                        ball.x - heading.0 * 60.0 + perp.0 * spread * side,
+                        ball.y - heading.1 * 60.0 + perp.1 * spread * side,
+                    ),
+                    SUPPORT_SPEED,
+                )
+            }
         };
         let dx = target.0 - center.0;
         let dy = target.1 - center.1;
         let distance = dx.hypot(dy);
-        if distance <= ARRIVAL_EPSILON {
+        let step = if distance <= ARRIVAL_EPSILON {
+            velocities[index] = (0.0, 0.0);
             continue;
-        }
-        let pace = if index == chaser {
-            CHASER_SPEED
         } else {
-            SUPPORT_SPEED
+            (pace * TICK_S).min(distance)
         };
-        let step = (pace * TICK_S).min(distance);
         positions[index].x += dx / distance * step;
         positions[index].y += dy / distance * step;
+        velocities[index] = (dx / distance * step / TICK_S, dy / distance * step / TICK_S);
     }
 }
 
@@ -440,6 +564,9 @@ async fn run_match_inner(
     let started = Instant::now();
     let mut last_phase_ms = 0u64;
     let mut last_say_ms = 0u64;
+    let mut possession: Option<usize> = None;
+    let mut dribble_touches = vec![0u32; players.len()];
+    let mut velocities = vec![(0.0f64, 0.0f64); players.len()];
 
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -455,7 +582,13 @@ async fn run_match_inner(
 
         ball.step(&pitch);
 
-        // Kick detection: one kick per tick keeps pinball volleys readable.
+        steer_players(players, &mut positions, &ball, &mut velocities);
+        separate_players(&mut positions, players);
+        clamp_players(&mut positions, players, &player_area);
+        separate_players(&mut positions, players);
+
+        // Contact resolution, one touch per tick: a pet without possession
+        // tackles, a charged carrier shoots, everything else dribbles.
         for (index, player) in players.iter().enumerate() {
             if cooldowns[index] > 0.0 {
                 continue;
@@ -472,18 +605,49 @@ async fn run_match_inner(
             ) {
                 continue;
             }
-            let velocity = kick_velocity(center, (ball.x, ball.y), (ball.vx, ball.vy));
-            ball.vx = velocity.0;
-            ball.vy = velocity.1;
+            let kind = classify_touch(
+                index,
+                possession,
+                dribble_touches[index],
+                rand::rng().random_range(0.0..1.0),
+            );
+            let notable = kind != TouchKind::Dribble;
+            let (vx, vy, escape, cooldown) = match kind {
+                TouchKind::Dribble => {
+                    dribble_touches[index] += 1;
+                    let (vx, vy) =
+                        dribble_push(velocities[index], center, (ball.x, ball.y));
+                    (vx, vy, DRIBBLE_ESCAPE, DRIBBLE_COOLDOWN_S)
+                }
+                TouchKind::Shoot => {
+                    dribble_touches[index] = 0;
+                    let travel =
+                        travel_direction(velocities[index], center, (ball.x, ball.y));
+                    let (vx, vy) = shoot_velocity(travel);
+                    (vx, vy, BALL_RADIUS + KICK_ESCAPE, KICK_COOLDOWN_S)
+                }
+                TouchKind::Tackle => {
+                    dribble_touches[index] = 0;
+                    let (vx, vy) =
+                        kick_velocity(center, (ball.x, ball.y), (ball.vx, ball.vy));
+                    (vx, vy, BALL_RADIUS + KICK_ESCAPE, KICK_COOLDOWN_S)
+                }
+            };
+            possession = Some(index);
+            if notable {
+                last_kicker = Some(index);
+            }
+            ball.vx = vx;
+            ball.vy = vy;
             let kick_distance = ball.vx.hypot(ball.vy).max(1.0);
-            ball.x += ball.vx / kick_distance * (BALL_RADIUS + KICK_ESCAPE);
-            ball.y += ball.vy / kick_distance * (BALL_RADIUS + KICK_ESCAPE);
+            ball.x += ball.vx / kick_distance * escape;
+            ball.y += ball.vy / kick_distance * escape;
             let (x, y) = pitch.clamp_point(ball.x, ball.y);
             ball.x = x;
             ball.y = y;
-            cooldowns[index] = KICK_COOLDOWN_S;
-            last_kicker = Some(index);
-            if elapsed - last_say_ms >= MATCH_SAY_COOLDOWN_MS
+            cooldowns[index] = cooldown;
+            if notable
+                && elapsed - last_say_ms >= MATCH_SAY_COOLDOWN_MS
                 && !player.say.is_empty()
                 && rand::rng().random_range(0.0..1.0) < SAY_CHANCE
             {
@@ -501,11 +665,6 @@ async fn run_match_inner(
             }
             break;
         }
-
-        steer_players(players, &mut positions, &ball);
-        separate_players(&mut positions, players);
-        clamp_players(&mut positions, players, &player_area);
-        separate_players(&mut positions, players);
 
         for (index, player) in players.iter().enumerate() {
             if let Ok(label) = super::instance_label(&player.instance_id) {
@@ -625,10 +784,7 @@ mod tests {
                 height: 100.0,
             },
         ];
-        let mut positions = vec![
-            PetPosition { x: 0.0, y: 0.0 },
-            PetPosition { x: 50.0, y: 0.0 },
-        ];
+        let mut positions = vec![PetPosition { x: 0.0, y: 0.0 }, PetPosition { x: 50.0, y: 0.0 }];
         separate_players(&mut positions, &players);
         let first_right = positions[0].x + 100.0;
         let second_left = positions[1].x;
@@ -636,5 +792,82 @@ mod tests {
             second_left >= first_right - 0.01,
             "windows must not overlap after separation: {positions:?}"
         );
+    }
+
+    #[test]
+    fn dribble_push_is_gentle_and_forward() {
+        let (vx, vy) = dribble_push((150.0, 0.0), (0.0, 0.0), (30.0, 0.0));
+        assert!(vx > 100.0, "ball must roll ahead, got {vx}");
+        assert!(
+            vx <= 150.0 + DRIBBLE_PUSH_BONUS,
+            "dribble must stay gentle, got {vx}"
+        );
+        assert!(vy.abs() < 1.0, "push must follow travel direction, got {vy}");
+    }
+
+    #[test]
+    fn dribble_push_falls_back_to_ball_direction_when_stationary() {
+        let (vx, vy) = dribble_push((0.0, 0.0), (0.0, 0.0), (30.0, 0.0));
+        assert!((vx - DRIBBLE_MIN_PUSH).abs() < 0.01);
+        assert!(vy.abs() < 0.01);
+        // Ball exactly on the pet's centre: never stall, never reverse.
+        let (vx, _) = dribble_push((0.0, 0.0), (0.0, 0.0), (0.0, 0.0));
+        assert!(vx > 0.0);
+    }
+
+    #[test]
+    fn possession_changes_make_touches_tackles() {
+        assert_eq!(classify_touch(1, Some(0), 0, 1.0), TouchKind::Tackle);
+        assert_eq!(classify_touch(0, Some(0), 0, 1.0), TouchKind::Dribble);
+        assert_eq!(classify_touch(0, None, 0, 1.0), TouchKind::Dribble);
+    }
+
+    #[test]
+    fn charged_carriers_shoot_after_enough_touches() {
+        assert_eq!(
+            classify_touch(0, Some(0), SHOOT_CHARGE_AFTER_TOUCHES - 1, 1.0),
+            TouchKind::Shoot
+        );
+        assert_eq!(classify_touch(0, Some(0), 0, 0.0), TouchKind::Shoot);
+    }
+
+    #[test]
+    fn shots_follow_the_travel_direction_with_tight_jitter() {
+        for _ in 0..20 {
+            let (vx, vy) = shoot_velocity((1.0, 0.0));
+            assert!(vx >= KICK_SPEED_MIN * 0.99, "shot must fly forward: {vx}");
+            assert!(
+                vy.abs() <= KICK_SPEED_MAX * 0.13,
+                "jitter must stay tight: {vy}"
+            );
+        }
+    }
+
+    #[test]
+    fn steering_writes_each_pets_actual_velocity() {
+        let players = vec![FootballPlayer {
+            instance_id: "a".into(),
+            pet_id: "a".into(),
+            say: String::new(),
+            width: 100.0,
+            height: 100.0,
+        }];
+        let ball = Ball {
+            x: 500.0,
+            y: 0.0,
+            vx: 0.0,
+            vy: 0.0,
+        };
+        let mut positions = vec![PetPosition { x: 0.0, y: 0.0 }];
+        let mut velocities = vec![(0.0, 0.0)];
+        steer_players(&players, &mut positions, &ball, &mut velocities);
+        let (vx, vy) = velocities[0];
+        let speed = vx.hypot(vy);
+        assert!(
+            (speed - CHASER_SPEED).abs() < 0.5,
+            "a charging pet must report its real speed, got ({vx}, {vy})"
+        );
+        assert!(vx > 0.0, "the pet must move toward the ball");
+        assert!(positions[0].x > 0.0, "the pet must actually move");
     }
 }
