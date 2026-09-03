@@ -18,6 +18,22 @@ const snapshot = document.querySelector<HTMLElement>("#snapshot")!;
 const supportBadge = document.querySelector<HTMLElement>("#support-badge")!;
 const notificationNote = document.querySelector<HTMLElement>("#notification-note")!;
 const windowSupport = document.querySelector<HTMLElement>("#window-support")!;
+const permissionActions = document.querySelector<HTMLElement>(".permission-actions")!;
+const openScreenRecording = document.querySelector<HTMLButtonElement>("#open-screen-recording")!;
+const openAccessibility = document.querySelector<HTMLButtonElement>("#open-accessibility")!;
+const refreshPermissions = document.querySelector<HTMLButtonElement>("#refresh-permissions")!;
+
+type DesktopWindowSupport = {
+  platform: string;
+  enumerationSupported: boolean;
+  throwSupported: boolean;
+  accessibilityRequired: boolean;
+  accessibilityGranted: boolean;
+  screenRecordingRequired: boolean;
+  screenRecordingGranted: boolean;
+  windowCount: number;
+  enumerationError?: string | null;
+};
 
 function setStatus(message: string, error = false): void {
   status.textContent = message;
@@ -43,25 +59,60 @@ function listValue(value: string): string[] {
 async function load(): Promise<void> {
   try {
     setForm(await invoke<EnvironmentSettings>("get_environment_settings"));
-    const support = await invoke<{
-      platform: string;
-      enumerationSupported: boolean;
-      throwSupported: boolean;
-      accessibilityRequired: boolean;
-      accessibilityGranted: boolean;
-    }>("get_desktop_window_support");
-    if (!support.enumerationSupported) {
-      windowSupport.textContent = "窗口枚举：当前平台不支持（Linux 首版安全关闭）";
-    } else if (support.accessibilityRequired && !support.accessibilityGranted) {
-      windowSupport.textContent = "窗口枚举可用；扔窗口需要在系统设置 → 隐私与安全性 → 辅助功能中授权 SakiPet。";
-    } else {
-      windowSupport.textContent = `窗口互动可用：支持爬窗、坐窗沿${support.throwSupported ? "和受保护的窗口移动" : ""}。`;
-    }
+    await loadWindowSupport();
     setStatus("环境设置已加载");
   } catch (error) {
     setStatus(String(error), true);
   }
 }
+
+async function loadWindowSupport(): Promise<void> {
+  const support = await invoke<DesktopWindowSupport>("get_desktop_window_support");
+  permissionActions.hidden = support.platform !== "macos";
+  if (support.platform !== "macos") {
+    openScreenRecording.disabled = true;
+    openAccessibility.disabled = true;
+  }
+    if (!support.enumerationSupported) {
+      windowSupport.textContent = "窗口枚举：当前平台不支持（Linux 首版安全关闭）";
+    } else if (support.screenRecordingRequired && !support.screenRecordingGranted) {
+      windowSupport.textContent = "未获得屏幕录制授权，无法发现其他应用窗口；请配置后完全退出并重启 SakiPet。";
+    } else if (support.enumerationError) {
+      windowSupport.textContent = `窗口枚举失败：${support.enumerationError}`;
+    } else if (support.windowCount === 0) {
+      windowSupport.textContent = "权限已就绪，但暂时没有发现可互动的普通窗口；请打开一个非全屏、非最小化窗口。";
+    } else if (support.accessibilityRequired && !support.accessibilityGranted) {
+      windowSupport.textContent = `已发现 ${support.windowCount} 个窗口；扔窗口还需要在系统设置 → 隐私与安全性 → 辅助功能中授权 SakiPet。`;
+    } else {
+      windowSupport.textContent = `窗口互动可用：已发现 ${support.windowCount} 个窗口，支持爬窗、坐窗沿${support.throwSupported ? "和受保护的窗口移动" : ""}。`;
+    }
+}
+
+async function openPermission(kind: "screen-recording" | "accessibility", button: HTMLButtonElement): Promise<void> {
+  button.disabled = true;
+  try {
+    await invoke("open_desktop_permission_settings", { kind });
+    setStatus("已打开系统权限设置；授权后点击“重新检测”并重启 SakiPet");
+  } catch (error) {
+    setStatus(String(error), true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+openScreenRecording.addEventListener("click", () => void openPermission("screen-recording", openScreenRecording));
+openAccessibility.addEventListener("click", () => void openPermission("accessibility", openAccessibility));
+refreshPermissions.addEventListener("click", async () => {
+  refreshPermissions.disabled = true;
+  try {
+    await loadWindowSupport();
+    setStatus("权限状态已重新检测");
+  } catch (error) {
+    setStatus(String(error), true);
+  } finally {
+    refreshPermissions.disabled = false;
+  }
+});
 
 save.addEventListener("click", async () => {
   save.disabled = true;

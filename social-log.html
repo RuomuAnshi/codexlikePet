@@ -33,6 +33,16 @@
         <button id="refresh" class="secondary" type="button">刷新</button>
       </section>
       <p id="status" class="status">正在读取……</p>
+      <section class="conversation-section" aria-labelledby="conversation-title">
+        <div class="conversation-heading">
+          <div>
+            <p class="eyebrow">RECENT CHAT</p>
+            <h2 id="conversation-title">最近与宠物的对话</h2>
+          </div>
+          <span id="conversation-status" class="relationship-meta">最近 30 条</span>
+        </div>
+        <div id="conversation-list" class="conversation-list" aria-live="polite"></div>
+      </section>
       <section id="relationship-list" class="relationship-list" aria-label="关系"></section>
       <section id="log-list" class="log-list" aria-live="polite"></section>
     </main>

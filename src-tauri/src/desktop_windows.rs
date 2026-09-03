@@ -60,11 +60,16 @@ pub(crate) struct DesktopWindowSupport {
     pub throw_supported: bool,
     pub accessibility_required: bool,
     pub accessibility_granted: bool,
+    pub screen_recording_required: bool,
+    pub screen_recording_granted: bool,
+    pub window_count: usize,
+    pub enumeration_error: Option<String>,
 }
 
 #[derive(Default)]
 pub(crate) struct DesktopWindowRuntime {
     pub(crate) windows: Mutex<Vec<DesktopWindowRect>>,
+    last_error: Mutex<Option<String>>,
     started: AtomicBool,
     active_scenes: Mutex<HashMap<String, ActiveWindowScene>>,
 }
@@ -213,8 +218,23 @@ fn changed_significantly(previous: &[DesktopWindowRect], next: &[DesktopWindowRe
 }
 
 pub(crate) fn refresh(app: &tauri::AppHandle) -> Result<Vec<DesktopWindowRect>, String> {
-    let next = enumerate_platform_windows(std::process::id())?;
+    let next = match enumerate_platform_windows(std::process::id()) {
+        Ok(next) => next,
+        Err(error) => {
+            let runtime = &app.state::<AppState>().desktop_windows;
+            if let Ok(mut windows) = runtime.windows.lock() {
+                windows.clear();
+            }
+            if let Ok(mut last_error) = runtime.last_error.lock() {
+                *last_error = Some(error.clone());
+            }
+            return Err(error);
+        }
+    };
     let runtime = &app.state::<AppState>().desktop_windows;
+    if let Ok(mut last_error) = runtime.last_error.lock() {
+        *last_error = None;
+    }
     let changed = runtime
         .windows
         .lock()
@@ -265,13 +285,63 @@ pub(crate) fn list_desktop_windows(
 }
 
 #[tauri::command]
-pub(crate) fn get_desktop_window_support() -> DesktopWindowSupport {
+pub(crate) fn get_desktop_window_support(app: tauri::AppHandle) -> DesktopWindowSupport {
+    support_snapshot(&app)
+}
+
+pub(crate) fn support_snapshot(app: &tauri::AppHandle) -> DesktopWindowSupport {
+    let refresh_error = refresh(app).err();
+    let runtime = &app.state::<AppState>().desktop_windows;
+    let enumeration_error = refresh_error.or_else(|| {
+        runtime
+            .last_error
+            .lock()
+            .ok()
+            .and_then(|error| error.clone())
+    });
+    let screen_recording_required = cfg!(target_os = "macos");
     DesktopWindowSupport {
         platform: std::env::consts::OS.to_string(),
         enumeration_supported: cfg!(any(target_os = "macos", target_os = "windows")),
         throw_supported: cfg!(any(target_os = "macos", target_os = "windows")),
         accessibility_required: cfg!(target_os = "macos"),
         accessibility_granted: accessibility_granted(),
+        screen_recording_required,
+        screen_recording_granted: screen_recording_granted() || !screen_recording_required,
+        window_count: cached_windows(app).len(),
+        enumeration_error,
+    }
+}
+
+#[tauri::command]
+pub(crate) fn open_desktop_permission_settings(kind: String) -> Result<(), String> {
+    if !matches!(kind.as_str(), "screen-recording" | "accessibility") {
+        return Err("无效的权限类型".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if kind == "screen-recording" && !screen_recording_granted() {
+            // This asks macOS to register the current, installed app as a
+            // screen-capture client before opening the matching pane.
+            let _ = macos_accessibility::request_screen_recording();
+        }
+        let url = if kind == "screen-recording" {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+        } else {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        };
+        std::process::Command::new("/usr/bin/open")
+            .arg(url)
+            .spawn()
+            .map_err(|error| format!("无法打开系统权限设置: {error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = kind;
+        Err("当前平台不需要这组 macOS 权限".to_string())
     }
 }
 
@@ -282,6 +352,16 @@ fn accessibility_granted() -> bool {
 
 #[cfg(not(target_os = "macos"))]
 fn accessibility_granted() -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn screen_recording_granted() -> bool {
+    macos_accessibility::screen_recording_granted()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn screen_recording_granted() -> bool {
     true
 }
 
@@ -744,6 +824,7 @@ fn platform_throw_window(_target: &DesktopWindowRect) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 mod macos_accessibility {
     use super::DesktopWindowRect;
+    use objc2_core_graphics::{CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess};
     use std::ffi::{c_char, c_void, CString};
     use std::ptr;
 
@@ -795,6 +876,14 @@ mod macos_accessibility {
 
     pub(super) fn is_trusted() -> bool {
         unsafe { AXIsProcessTrusted() != 0 }
+    }
+
+    pub(super) fn screen_recording_granted() -> bool {
+        CGPreflightScreenCaptureAccess()
+    }
+
+    pub(super) fn request_screen_recording() -> bool {
+        CGRequestScreenCaptureAccess()
     }
 
     fn attribute(name: &str) -> Option<CFStringRef> {

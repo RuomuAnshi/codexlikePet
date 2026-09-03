@@ -1,5 +1,5 @@
 use base64::Engine;
-use chrono::{Local, Timelike};
+use chrono::{Local, NaiveDate, TimeZone, Timelike};
 use futures_util::StreamExt;
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, RgbaImage};
@@ -27,6 +27,13 @@ const LEGACY_KEYRING_SERVICE: &str = "com.ifan.sakipet";
 const AI_DIRECTORY: &str = "ai";
 const MAX_MESSAGE_CHARS: usize = 4_000;
 const MAX_HISTORY_MESSAGES: usize = 200;
+const HOUR_MS: u64 = 3_600_000;
+const MAX_LIFE_ADVANCE_MS: u64 = 30 * 24 * HOUR_MS;
+const SLEEP_REASON_NONE: &str = "none";
+const SLEEP_REASON_SCHEDULE: &str = "schedule";
+const SLEEP_REASON_SYSTEM: &str = "system";
+const SLEEP_REASON_MANUAL: &str = "manual";
+const SLEEP_REASON_REST: &str = "rest";
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 static LAST_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_VISION_MS: AtomicU64 = AtomicU64::new(0);
@@ -122,9 +129,14 @@ pub(crate) struct PetLifeState {
     pub relationship_level: u8,
     pub peak_bond: u8,
     pub activity: String,
+    pub sleep_reason: String,
     pub last_interaction_at: u64,
     pub last_advanced_at: u64,
+    /// Deprecated remainder from the original activity-based accounting.
+    /// It is migrated once into one of the two rate-specific cursors below.
     pub energy_progress_ms: u64,
+    pub awake_energy_progress_ms: u64,
+    pub sleep_energy_progress_ms: u64,
     pub attention_progress_ms: u64,
     pub last_bond_decay_at: u64,
     pub last_spoke_at: u64,
@@ -157,9 +169,12 @@ impl Default for PetLifeState {
             relationship_level: 1,
             peak_bond: 0,
             activity: "idle".to_string(),
+            sleep_reason: SLEEP_REASON_NONE.to_string(),
             last_interaction_at: 0,
             last_advanced_at: now,
             energy_progress_ms: 0,
+            awake_energy_progress_ms: 0,
+            sleep_energy_progress_ms: 0,
             attention_progress_ms: 0,
             last_bond_decay_at: now,
             last_spoke_at: 0,
@@ -280,6 +295,15 @@ impl Default for MemoryFact {
 pub(crate) struct ChatHistoryResponse {
     pub pet_id: String,
     pub messages: Vec<ChatMessage>,
+}
+
+#[derive(Clone, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RecentPetConversation {
+    pub pet_id: String,
+    pub role: String,
+    pub content: String,
+    pub timestamp: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -597,6 +621,30 @@ fn normalize_life_state(state: &mut PetLifeState) {
             _ => 62,
         };
     }
+    if state.sleep_reason.is_empty() {
+        // Older versions only persisted `activity`. Treat an old sleeping
+        // snapshot as schedule-driven so a daytime advance can immediately
+        // reconcile it instead of keeping the pet asleep forever.
+        state.sleep_reason = if state.activity == "sleeping" {
+            SLEEP_REASON_SCHEDULE.to_string()
+        } else {
+            SLEEP_REASON_NONE.to_string()
+        };
+    }
+    if state.awake_energy_progress_ms == 0
+        && state.sleep_energy_progress_ms == 0
+        && state.energy_progress_ms > 0
+    {
+        // Migrate the old single cursor without charging the same fraction of
+        // an hour twice. The old cursor measured time at the previous
+        // activity's rate, so preserve it on the matching side.
+        if state.activity == "sleeping" {
+            state.sleep_energy_progress_ms = state.energy_progress_ms.min(HOUR_MS - 1);
+        } else {
+            state.awake_energy_progress_ms = state.energy_progress_ms.min(HOUR_MS - 1);
+        }
+    }
+    state.energy_progress_ms = 0;
     state.relationship_level = relationship_level(state.bond);
     state.peak_bond = state.peak_bond.max(state.bond);
 }
@@ -642,6 +690,14 @@ fn current_local_minutes() -> u16 {
     (now.hour() * 60 + now.minute()) as u16
 }
 
+fn local_minutes_at(timestamp_ms: u64) -> u16 {
+    let local = Local
+        .timestamp_millis_opt(timestamp_ms as i64)
+        .single()
+        .unwrap_or_else(Local::now);
+    (local.hour() * 60 + local.minute()) as u16
+}
+
 fn is_sleep_window(settings: &PetSettings, minutes: u16) -> bool {
     if !settings.circadian_enabled {
         return false;
@@ -654,6 +710,172 @@ fn is_sleep_window(settings: &PetSettings, minutes: u16) -> bool {
     } else {
         minutes >= settings.sleep_start_minutes && minutes < settings.wake_minutes
     }
+}
+
+fn local_boundary_ms(date: NaiveDate, minutes: u16) -> Option<u64> {
+    let naive = date.and_hms_opt((minutes / 60) as u32, (minutes % 60) as u32, 0)?;
+    let local = Local
+        .from_local_datetime(&naive)
+        .single()
+        .or_else(|| Local.from_local_datetime(&naive).earliest())?;
+    u64::try_from(local.timestamp_millis()).ok()
+}
+
+fn next_sleep_boundary_ms(timestamp_ms: u64, settings: &PetSettings) -> Option<u64> {
+    if !settings.circadian_enabled || settings.sleep_start_minutes == settings.wake_minutes {
+        return None;
+    }
+    let local = Local
+        .timestamp_millis_opt(timestamp_ms as i64)
+        .single()
+        .unwrap_or_else(Local::now);
+    let today = local.date_naive();
+    let tomorrow = today.succ_opt()?;
+    [today, tomorrow]
+        .into_iter()
+        .flat_map(|date| {
+            [settings.sleep_start_minutes, settings.wake_minutes]
+                .into_iter()
+                .filter_map(move |minutes| local_boundary_ms(date, minutes))
+        })
+        .filter(|candidate| *candidate > timestamp_ms)
+        .min()
+}
+
+fn is_sleep_window_at(settings: &PetSettings, timestamp_ms: u64) -> bool {
+    is_sleep_window(settings, local_minutes_at(timestamp_ms))
+}
+
+fn apply_energy_segment(state: &mut PetLifeState, sleeping: bool, duration_ms: u64) -> u64 {
+    let progress = if sleeping {
+        &mut state.sleep_energy_progress_ms
+    } else {
+        &mut state.awake_energy_progress_ms
+    };
+    let elapsed = progress.saturating_add(duration_ms);
+    let hours = elapsed / HOUR_MS;
+    *progress = elapsed % HOUR_MS;
+    if hours == 0 {
+        return 0;
+    }
+    if sleeping {
+        let recovery = hours.saturating_mul(8).min(100) as u8;
+        state.energy = state.energy.saturating_add(recovery).min(100);
+        state.mood_value = state
+            .mood_value
+            .saturating_add(hours.saturating_mul(2).min(100) as u8)
+            .min(100);
+    } else {
+        state.energy = state.energy.saturating_sub(hours.min(100) as u8);
+        state.mood_value = state.mood_value.saturating_sub(hours.min(100) as u8);
+    }
+    hours
+}
+
+fn advance_energy_by_calendar(
+    state: &mut PetLifeState,
+    from_ms: u64,
+    to_ms: u64,
+    settings: &PetSettings,
+) {
+    if to_ms <= from_ms {
+        return;
+    }
+    let elapsed = to_ms.saturating_sub(from_ms).min(MAX_LIFE_ADVANCE_MS);
+    let mut cursor = to_ms.saturating_sub(elapsed);
+    let manual_sleep = state.activity == "sleeping"
+        && matches!(
+            state.sleep_reason.as_str(),
+            SLEEP_REASON_MANUAL | SLEEP_REASON_SYSTEM
+        );
+    let mut awake_duration_ms = 0u64;
+
+    while cursor < to_ms {
+        let sleeping = manual_sleep || is_sleep_window_at(settings, cursor);
+        let next_boundary = if manual_sleep {
+            to_ms
+        } else {
+            next_sleep_boundary_ms(cursor, settings)
+                .unwrap_or(to_ms)
+                .min(to_ms)
+        };
+        let end = next_boundary.max(cursor.saturating_add(1)).min(to_ms);
+        let duration = end.saturating_sub(cursor);
+        if sleeping {
+            apply_energy_segment(state, true, duration);
+        } else {
+            awake_duration_ms = awake_duration_ms.saturating_add(duration);
+            apply_energy_segment(state, false, duration);
+        }
+        cursor = end;
+    }
+
+    // Attention only fades while the pet is awake. Keeping its own cursor
+    // prevents a short daytime segment before and after sleep from losing a
+    // full two-hour period twice.
+    let attention_elapsed = state
+        .attention_progress_ms
+        .saturating_add(awake_duration_ms);
+    let attention_periods = attention_elapsed / (2 * HOUR_MS);
+    state.attention_progress_ms = attention_elapsed % (2 * HOUR_MS);
+    if attention_periods > 0 {
+        state.attention = state
+            .attention
+            .saturating_sub(attention_periods.min(100) as u8);
+    }
+}
+
+fn reconcile_sleep_activity_at(
+    state: &mut PetLifeState,
+    now: u64,
+    current_minutes: u16,
+    settings: &PetSettings,
+) {
+    let in_schedule = is_sleep_window(settings, current_minutes);
+    let sleeping = state.activity == "sleeping";
+
+    if state.sleep_override_until > now {
+        if sleeping {
+            state.activity = "idle".to_string();
+            state.sleeping_since = 0;
+        }
+        state.sleep_reason = SLEEP_REASON_NONE.to_string();
+    } else if state.sleep_reason == SLEEP_REASON_SYSTEM && sleeping {
+        // The session monitor clears this reason on wake. This guard keeps a
+        // pet asleep if a platform event arrives before the next scheduler
+        // tick while the desktop is still locked or suspended.
+    } else if state.sleep_reason == SLEEP_REASON_MANUAL && sleeping {
+        // Manual sleep is intentionally sticky until the user chooses wake.
+    } else if in_schedule {
+        if !sleeping || state.sleep_reason != SLEEP_REASON_SCHEDULE {
+            state.activity = "sleeping".to_string();
+            state.sleeping_since = now;
+        }
+        state.sleep_reason = SLEEP_REASON_SCHEDULE.to_string();
+    } else if sleeping {
+        // A persisted schedule sleep must end in the daytime, including old
+        // state files that had no sleep reason at all.
+        state.activity = "idle".to_string();
+        state.sleeping_since = 0;
+        state.sleep_reason = SLEEP_REASON_NONE.to_string();
+    }
+
+    if state.activity == "resting" && state.energy > 20 {
+        state.activity = "idle".to_string();
+        state.sleep_reason = SLEEP_REASON_NONE.to_string();
+    } else if state.energy <= 20
+        && matches!(
+            state.activity.as_str(),
+            "idle" | "walking" | "working" | "waiting"
+        )
+    {
+        state.activity = "resting".to_string();
+        state.sleep_reason = SLEEP_REASON_REST.to_string();
+    }
+}
+
+fn reconcile_sleep_activity(state: &mut PetLifeState, now: u64, settings: &PetSettings) {
+    reconcile_sleep_activity_at(state, now, current_local_minutes(), settings);
 }
 
 fn refresh_mood_label(state: &mut PetLifeState) {
@@ -699,38 +921,11 @@ fn advance_pet_life_state_with_settings(
     }
     let elapsed = now
         .saturating_sub(state.last_advanced_at)
-        .min(30 * 24 * 3_600_000);
+        .min(MAX_LIFE_ADVANCE_MS);
+    let previous_advanced_at = now.saturating_sub(elapsed);
     state.last_advanced_at = now;
 
-    let sleeping = state.activity == "sleeping";
-    let energy_elapsed = state.energy_progress_ms.saturating_add(elapsed);
-    let energy_hours = energy_elapsed / 3_600_000;
-    state.energy_progress_ms = energy_elapsed % 3_600_000;
-    if energy_hours > 0 {
-        if sleeping {
-            let recovery = energy_hours.saturating_mul(8).min(100) as u8;
-            state.energy = state.energy.saturating_add(recovery).min(100);
-        } else {
-            state.energy = state.energy.saturating_sub(energy_hours.min(100) as u8);
-        }
-        state.mood_value = if sleeping {
-            state
-                .mood_value
-                .saturating_add(energy_hours.saturating_mul(2).min(100) as u8)
-                .min(100)
-        } else {
-            state.mood_value.saturating_sub(energy_hours.min(100) as u8)
-        };
-    }
-
-    let attention_elapsed = state.attention_progress_ms.saturating_add(elapsed);
-    let attention_periods = attention_elapsed / (2 * 3_600_000);
-    state.attention_progress_ms = attention_elapsed % (2 * 3_600_000);
-    if attention_periods > 0 && !sleeping {
-        state.attention = state
-            .attention
-            .saturating_sub(attention_periods.min(100) as u8);
-    }
+    advance_energy_by_calendar(state, previous_advanced_at, now, settings);
 
     // Snacks regenerate passively (one every 8h, capped at 5) so feeding is a
     // consumable rather than an endless button.
@@ -753,18 +948,7 @@ fn advance_pet_life_state_with_settings(
         }
     }
 
-    let in_schedule = is_sleep_window(settings, current_local_minutes());
-    if state.sleep_override_until > now {
-        state.activity = "idle".to_string();
-    } else if in_schedule || state.energy <= 20 {
-        state.activity = "sleeping".to_string();
-        if state.sleeping_since == 0 {
-            state.sleeping_since = now;
-        }
-    } else if sleeping {
-        state.activity = "idle".to_string();
-        state.sleeping_since = 0;
-    }
+    reconcile_sleep_activity(state, now, settings);
 
     state.relationship_level = relationship_level(state.bond);
     state.peak_bond = state.peak_bond.max(state.bond);
@@ -888,6 +1072,7 @@ fn record_pet_interaction_internal(
         if was_sleeping {
             state.sleep_override_until = now.saturating_add(10 * 60_000);
             state.sleeping_since = 0;
+            state.sleep_reason = SLEEP_REASON_NONE.to_string();
         }
         state.interaction_count = state.interaction_count.saturating_add(1);
         match normalized.as_str() {
@@ -936,6 +1121,13 @@ fn record_pet_interaction_internal(
             }
         }
         state.peak_bond = state.peak_bond.max(state.bond);
+        if state.activity != "sleeping"
+            && state.activity != "resting"
+            && state.sleep_reason != SLEEP_REASON_SYSTEM
+        {
+            state.sleep_reason = SLEEP_REASON_NONE.to_string();
+            state.sleeping_since = 0;
+        }
         refresh_mood_label(state);
     })
 }
@@ -994,6 +1186,7 @@ pub(crate) fn perform_pet_action_internal(
         if matches!(action.as_str(), "feed" | "play") && state.activity == "sleeping" {
             state.sleep_override_until = now.saturating_add(10 * 60_000);
             state.sleeping_since = 0;
+            state.sleep_reason = SLEEP_REASON_NONE.to_string();
         }
         state.last_interaction_at = now;
         state.last_bond_decay_at = now;
@@ -1007,6 +1200,8 @@ pub(crate) fn perform_pet_action_internal(
                 increase_mood(state, 8);
                 state.last_fed_at = now;
                 state.activity = "eating".to_string();
+                state.sleep_reason = SLEEP_REASON_NONE.to_string();
+                state.sleeping_since = 0;
             }
             "play" => {
                 state.energy = state.energy.saturating_sub(8);
@@ -1015,16 +1210,20 @@ pub(crate) fn perform_pet_action_internal(
                 increase_mood(state, 10);
                 state.last_played_at = now;
                 state.activity = "playing".to_string();
+                state.sleep_reason = SLEEP_REASON_NONE.to_string();
+                state.sleeping_since = 0;
             }
             "sleep" => {
                 state.activity = "sleeping".to_string();
                 state.sleeping_since = now;
                 state.sleep_override_until = 0;
+                state.sleep_reason = SLEEP_REASON_MANUAL.to_string();
             }
             "wake" => {
                 state.activity = "idle".to_string();
                 state.sleeping_since = 0;
                 state.sleep_override_until = now.saturating_add(10 * 60_000);
+                state.sleep_reason = SLEEP_REASON_NONE.to_string();
                 state.mood_value = state.mood_value.max(58);
             }
             _ => unreachable!(),
@@ -1047,6 +1246,7 @@ pub(crate) fn record_petting_internal(
         if state.activity == "sleeping" {
             state.sleep_override_until = now.saturating_add(10 * 60_000);
             state.sleeping_since = 0;
+            state.sleep_reason = SLEEP_REASON_NONE.to_string();
         }
         if effective {
             state.last_interaction_at = now;
@@ -1057,6 +1257,8 @@ pub(crate) fn record_petting_internal(
             increase_mood(state, 5);
         }
         state.activity = "being-petted".to_string();
+        state.sleep_reason = SLEEP_REASON_NONE.to_string();
+        state.sleeping_since = 0;
         refresh_mood_label(state);
     })?;
     emit_interaction_feedback(app, pet_id, "petting", &state);
@@ -1068,31 +1270,59 @@ fn record_pet_behavior_internal(
     pet_id: &str,
     behavior: &PetBehavior,
 ) -> Result<PetLifeState, String> {
+    let config = config_snapshot(app)?;
+    let settings = super::settings_for_pet(&config, pet_id);
+    let scheduled_sleep = is_sleep_window(&settings, current_local_minutes());
     update_pet_life_state(app, pet_id, |state| {
         let now = now_ms();
+        let requested_sleep =
+            behavior.mode.as_deref() == Some("sleeping") || behavior.action == "sleep";
         if !behavior.mood.trim().is_empty() {
             state.mood = behavior.mood.clone();
         }
-        state.activity = match behavior.mode.as_deref() {
-            Some("sleeping") => "sleeping",
-            Some("working") => "working",
-            Some("waiting") => "waiting",
-            Some("idle") => "idle",
-            _ => match behavior.action.as_str() {
-                "walk" => "walking",
-                "sleep" => "sleeping",
-                "waving" | "jumping" | "failed" => "playing",
-                "running" => "working",
-                _ if !behavior.say.trim().is_empty() => "speaking",
-                _ => "idle",
-            },
-        }
-        .to_string();
-        if !behavior.say.trim().is_empty() {
-            state.last_spoke_at = now;
-        }
-        if behavior.next_action_after > 0 {
-            state.next_action_at = now.saturating_add(behavior.next_action_after * 1_000);
+        let prevented_daytime_sleep =
+            requested_sleep && !scheduled_sleep && state.sleep_reason != SLEEP_REASON_SYSTEM;
+        if prevented_daytime_sleep {
+            // AI may describe a nap during the day, but it must not turn a
+            // conversational behavior into the persistent sleep animation.
+            state.activity = "resting".to_string();
+            state.sleep_reason = SLEEP_REASON_REST.to_string();
+            state.sleeping_since = 0;
+        } else {
+            state.activity = match behavior.mode.as_deref() {
+                Some("sleeping") => "sleeping",
+                Some("working") => "working",
+                Some("waiting") => "waiting",
+                Some("idle") => "idle",
+                _ => match behavior.action.as_str() {
+                    "walk" => "walking",
+                    "sleep" => "sleeping",
+                    "waving" | "jumping" | "failed" => "playing",
+                    "running" => "working",
+                    _ if !behavior.say.trim().is_empty() => "speaking",
+                    _ => "idle",
+                },
+            }
+            .to_string();
+            if state.activity == "sleeping" {
+                state.sleep_reason = if scheduled_sleep {
+                    SLEEP_REASON_SCHEDULE.to_string()
+                } else {
+                    SLEEP_REASON_MANUAL.to_string()
+                };
+                if state.sleeping_since == 0 {
+                    state.sleeping_since = now;
+                }
+            } else if state.sleep_reason != SLEEP_REASON_SYSTEM {
+                state.sleep_reason = SLEEP_REASON_NONE.to_string();
+                state.sleeping_since = 0;
+            }
+            if !behavior.say.trim().is_empty() {
+                state.last_spoke_at = now;
+            }
+            if behavior.next_action_after > 0 {
+                state.next_action_at = now.saturating_add(behavior.next_action_after * 1_000);
+            }
         }
     })
 }
@@ -1102,7 +1332,11 @@ fn settle_pet_activity_internal(
     pet_id: &str,
 ) -> Result<PetLifeState, String> {
     update_pet_life_state(app, pet_id, |state| {
-        state.activity = "idle".to_string();
+        if state.activity != "sleeping" {
+            state.activity = "idle".to_string();
+            state.sleep_reason = SLEEP_REASON_NONE.to_string();
+            state.sleeping_since = 0;
+        }
     })
 }
 
@@ -2708,6 +2942,41 @@ pub(crate) fn get_chat_history(
 }
 
 #[tauri::command]
+pub(crate) fn get_recent_pet_conversations(
+    app: tauri::AppHandle,
+    limit: Option<usize>,
+) -> Result<Vec<RecentPetConversation>, String> {
+    let config = config_snapshot(&app)?;
+    let max_records = limit.unwrap_or(30).clamp(1, 30);
+    let mut records = Vec::new();
+    for pet in super::installed_pets(&app, &config) {
+        for message in load_messages(&app, &pet.id)? {
+            if message.source != "chat"
+                || !matches!(message.role.as_str(), "user" | "assistant")
+                || message.content.trim().is_empty()
+            {
+                continue;
+            }
+            records.push(RecentPetConversation {
+                pet_id: pet.id.clone(),
+                role: message.role,
+                content: message.content,
+                timestamp: message.timestamp,
+            });
+        }
+    }
+    records.sort_by_key(|record| record.timestamp);
+    Ok(records
+        .into_iter()
+        .rev()
+        .take(max_records)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect())
+}
+
+#[tauri::command]
 pub(crate) fn send_chat_message(
     app: tauri::AppHandle,
     pet_id: String,
@@ -3787,18 +4056,35 @@ pub(crate) fn set_all_pets_sleeping(app: &tauri::AppHandle, sleeping: bool) {
     pet_ids.dedup();
     for pet_id in pet_ids {
         let settings = super::settings_for_pet(&config, &pet_id);
-        let _ = update_pet_life_state(app, &pet_id, |state| {
+        let Ok(state) = update_pet_life_state(app, &pet_id, |state| {
             if sleeping {
                 state.activity = "sleeping".to_string();
                 state.sleeping_since = now_ms();
+                state.sleep_reason = SLEEP_REASON_SYSTEM.to_string();
+                state.sleep_override_until = 0;
             } else {
-                state.activity = "idle".to_string();
+                // update_pet_life_state has already advanced the interval
+                // while the reason was `system`, so the offline/locked time
+                // receives sleep recovery before we decide the next activity.
                 state.sleeping_since = 0;
                 state.sleep_override_until = 0;
-                advance_pet_life_state_with_settings(state, now_ms(), &settings);
+                if is_sleep_window(&settings, current_local_minutes()) {
+                    state.activity = "sleeping".to_string();
+                    state.sleep_reason = SLEEP_REASON_SCHEDULE.to_string();
+                    state.sleeping_since = now_ms();
+                } else {
+                    state.activity = "idle".to_string();
+                    state.sleep_reason = SLEEP_REASON_NONE.to_string();
+                }
             }
             refresh_mood_label(state);
-        });
+        }) else {
+            continue;
+        };
+        let _ = app.emit(
+            "pet://life-state",
+            serde_json::json!({"petId": pet_id, "state": state}),
+        );
     }
 }
 
@@ -4141,6 +4427,66 @@ mod tests {
         assert!(is_sleep_window(&settings, 23 * 60 + 45));
         assert!(is_sleep_window(&settings, 6 * 60));
         assert!(!is_sleep_window(&settings, 12 * 60));
+    }
+
+    #[test]
+    fn offline_energy_uses_nighttime_calendar_not_previous_activity() {
+        let settings = PetSettings {
+            sleep_start_minutes: 1_410,
+            wake_minutes: 450,
+            ..PetSettings::default()
+        };
+        let from = Local
+            .with_ymd_and_hms(2026, 9, 2, 22, 0, 0)
+            .single()
+            .expect("valid local start")
+            .timestamp_millis() as u64;
+        let to = Local
+            .with_ymd_and_hms(2026, 9, 3, 8, 0, 0)
+            .single()
+            .expect("valid local end")
+            .timestamp_millis() as u64;
+        let mut state = PetLifeState::default();
+        state.energy = 10;
+        state.activity = "idle".to_string();
+        state.sleep_reason = SLEEP_REASON_NONE.to_string();
+
+        advance_energy_by_calendar(&mut state, from, to, &settings);
+
+        // 8h of scheduled sleep restores 64 energy; the two awake portions
+        // add up to two hours and drain two points.
+        assert_eq!(state.energy, 72);
+        assert!(state.sleep_energy_progress_ms < HOUR_MS);
+    }
+
+    #[test]
+    fn low_energy_becomes_daytime_rest_not_sleep() {
+        let settings = PetSettings::default();
+        let mut state = PetLifeState::default();
+        state.energy = 0;
+        state.activity = "idle".to_string();
+        state.sleep_reason = SLEEP_REASON_NONE.to_string();
+
+        reconcile_sleep_activity_at(&mut state, 1, 12 * 60, &settings);
+
+        assert_eq!(state.activity, "resting");
+        assert_eq!(state.sleep_reason, SLEEP_REASON_REST);
+    }
+
+    #[test]
+    fn daytime_reconciles_legacy_sleeping_state() {
+        let settings = PetSettings::default();
+        let mut state = PetLifeState::default();
+        state.energy = 80;
+        state.activity = "sleeping".to_string();
+        state.sleep_reason = SLEEP_REASON_SCHEDULE.to_string();
+        state.sleeping_since = 1;
+
+        reconcile_sleep_activity_at(&mut state, 1, 12 * 60, &settings);
+
+        assert_eq!(state.activity, "idle");
+        assert_eq!(state.sleep_reason, SLEEP_REASON_NONE);
+        assert_eq!(state.sleeping_since, 0);
     }
 
     #[test]

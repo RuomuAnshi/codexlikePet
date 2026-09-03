@@ -121,6 +121,7 @@ export interface PetLifeState {
   attention: number;
   bond: number;
   activity: string;
+  sleepReason: string;
   lastInteractionAt: number;
   lastSpokeAt: number;
   knownSince: number;

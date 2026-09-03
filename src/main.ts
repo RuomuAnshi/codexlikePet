@@ -130,6 +130,7 @@ async function boot(): Promise<void> {
   let socialSceneId: string | null = null;
   let windowSceneId: string | null = null;
   let lifeSleeping = false;
+  let lifeResting = false;
   let thrownActive = false;
   let squashTimer: number | undefined;
   const reducedMotion = (): boolean =>
@@ -373,8 +374,11 @@ async function boot(): Promise<void> {
     engine.setScale(next.scale);
     walker.setSettings(next.speed, next.wanderEnabled, next.quietMode);
     engine.play(!next.paused);
-    if (next.paused || !next.wanderEnabled || next.quietMode || autoQuiet) walker.stop();
-    else if (!dragging) walker.start();
+    if (next.paused || !next.wanderEnabled || next.quietMode || autoQuiet || lifeSleeping || lifeResting) {
+      walker.stop();
+    } else if (!dragging) {
+      walker.start();
+    }
     if (!dragging && !walking) engine.setLook(lastDirection);
     syncAnimation();
     scheduleIdleSpeech();
@@ -463,7 +467,9 @@ async function boot(): Promise<void> {
       !dragState.petting &&
       !settings.quietMode &&
       !autoQuiet &&
-      settings.wanderEnabled
+      settings.wanderEnabled &&
+      !lifeSleeping &&
+      !lifeResting
     ) {
       // Wake-up should lead back into the pet's normal life instead of
       // leaving it parked forever after the sleep clip finishes.
@@ -811,7 +817,15 @@ async function boot(): Promise<void> {
       if (payload.sceneId !== windowSceneId || payload.instanceId !== runtime.instanceId) return;
       windowSceneId = null;
       stateMachine.setSocialState(null);
-      if (!dragging && !paused && !settings.quietMode && !autoQuiet && settings.wanderEnabled) {
+      if (
+        !dragging &&
+        !paused &&
+        !settings.quietMode &&
+        !autoQuiet &&
+        settings.wanderEnabled &&
+        !lifeSleeping &&
+        !lifeResting
+      ) {
         walker.start();
       }
       if (!dragging) engine.setLook(lastDirection);
@@ -826,8 +840,10 @@ async function boot(): Promise<void> {
     ({ payload }) => {
       if (payload.petId !== runtime.petId) return;
       const wasSleeping = lifeSleeping;
+      const wasResting = lifeResting;
       lifeSleeping = payload.state.activity === "sleeping";
-      if (payload.state.activity === "sleeping") {
+      lifeResting = payload.state.activity === "resting";
+      if (lifeSleeping) {
         walker.stop();
         stateMachine.setBaseState("waiting");
         if (!engine.isPlayingClip()) {
@@ -838,6 +854,12 @@ async function boot(): Promise<void> {
           }
         }
         if (!engine.isPlayingClip()) syncAnimation();
+      } else if (lifeResting) {
+        // Low energy is a daytime rest state, not the real sleep animation.
+        walker.stop();
+        stopFrameClip();
+        stateMachine.setBaseState("waiting");
+        syncAnimation();
       } else if (!dragging && !dragState.petting) {
         stopFrameClip();
         stateMachine.setBaseState("idle");
@@ -846,6 +868,11 @@ async function boot(): Promise<void> {
             syncAnimation();
             startWalkingAfterWake();
           }
+        } else if (wasResting) {
+          if (!paused && settings.wanderEnabled && !settings.quietMode && !autoQuiet) {
+            walker.start();
+          }
+          syncAnimation();
         } else {
           syncAnimation();
         }
@@ -853,14 +880,15 @@ async function boot(): Promise<void> {
       showEmotion(
         payload.state.activity === "sleeping"
           ? "sleeping"
-          : payload.state.energy < 20
-            ? "low"
+          : payload.state.activity === "resting" || payload.state.energy < 20
+            ? "sleepy"
             : payload.state.mood,
         2_400,
       );
       if (
         payload.state.food === 0 &&
         payload.state.activity !== "sleeping" &&
+        payload.state.activity !== "resting" &&
         payload.state.energy >= 20
       ) {
         showEmotion("hungry", 2_400);
@@ -918,7 +946,7 @@ async function boot(): Promise<void> {
       autoQuiet = payload.autoQuiet;
       if (payload.breakReminder) sayLine("breakReminder");
       if (payload.lowBattery) sayLine("lowBattery");
-      if (payload.autoQuiet || payload.snapshot.session !== "active") {
+      if (payload.autoQuiet || payload.snapshot.session !== "active" || lifeSleeping || lifeResting) {
         walker.stop();
         stopFrameClip();
         stateMachine.setBaseState("waiting");
@@ -982,11 +1010,34 @@ async function boot(): Promise<void> {
   });
 
   document.title = initialPet.manifest.displayName;
+  try {
+    const initialLifeState = await invoke<{ activity: string }>("get_pet_state", {
+      petId: runtime.petId,
+    });
+    lifeSleeping = initialLifeState.activity === "sleeping";
+    lifeResting = initialLifeState.activity === "resting";
+  } catch (error) {
+    console.warn("failed to load initial pet life state:", error);
+  }
   engine.play(!paused);
   walker.setSettings(settings.speed, settings.wanderEnabled, settings.quietMode);
   scheduleIdleSpeech();
   void reportRuntimeState(false);
-  if (!paused && settings.wanderEnabled && !settings.quietMode) walker.start();
+  if (lifeSleeping) {
+    walker.stop();
+    stateMachine.setBaseState("waiting");
+    if (!paused) {
+      if (!startSleepSequence()) syncAnimation();
+    } else {
+      syncAnimation();
+    }
+  } else if (lifeResting) {
+    walker.stop();
+    stateMachine.setBaseState("waiting");
+    syncAnimation();
+  } else if (!paused && settings.wanderEnabled && !settings.quietMode) {
+    walker.start();
+  }
 }
 
 boot().catch((err) => {

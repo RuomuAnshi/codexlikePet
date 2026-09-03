@@ -31,6 +31,10 @@ input[type="number"], textarea { width: 100%; padding: 9px 10px; border: 1px sol
 textarea { resize: vertical; line-height: 1.5; }
 .list-field + .list-field { margin-top: 12px; }
 .snapshot-panel p { color: #66838d; font-size: 13px; }
+.permission-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.secondary-button { padding: 9px 12px; border: 1px solid #a9d9e3; border-radius: 9px; background: #effbfd; color: #287684; font: inherit; font-weight: 700; cursor: pointer; }
+.secondary-button:disabled { opacity: .55; cursor: wait; }
+.permission-note { margin-top: 10px; color: #8aa1a8 !important; font-size: 11px !important; line-height: 1.5; }
 .save-button { width: 100%; padding: 12px; border: 0; border-radius: 11px; background: #65c3d2; box-shadow: 0 3px 0 #3199aa; color: #fff; font: inherit; font-weight: 800; cursor: pointer; }
 .save-button:disabled { opacity: .6; cursor: wait; }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }

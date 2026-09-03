@@ -3893,15 +3893,24 @@ fn show_pet_context_menu(app: tauri::AppHandle, window_label: String) -> Result<
         .iter()
         .map(|item| item as &dyn tauri::menu::IsMenuItem<Wry>)
         .collect();
+    let window_support = desktop_windows::support_snapshot(&app);
+    let window_submenu_title = if !window_interaction_enabled {
+        "窗口互动（请在独立设置中开启）"
+    } else if window_support.screen_recording_required && !window_support.screen_recording_granted {
+        "窗口互动（请配置屏幕录制）"
+    } else if window_refs.is_empty() {
+        "窗口互动（未发现普通窗口）"
+    } else {
+        "窗口互动"
+    };
     let window_submenu = Submenu::with_id_and_items(
         &app,
         format!("pet-windows-menu-{instance_id}"),
-        if window_interaction_enabled {
-            "窗口互动"
-        } else {
-            "窗口互动（请在独立设置中开启）"
-        },
-        window_interaction_enabled && !window_refs.is_empty(),
+        window_submenu_title,
+        window_interaction_enabled
+            && window_support.enumeration_supported
+            && window_support.screen_recording_granted
+            && !window_refs.is_empty(),
         &window_refs,
     )
     .map_err(|error| error.to_string())?;
@@ -4689,6 +4698,7 @@ pub fn run() {
             update_environment_settings,
             desktop_windows::list_desktop_windows,
             desktop_windows::get_desktop_window_support,
+            desktop_windows::open_desktop_permission_settings,
             desktop_windows::start_window_scene,
             desktop_windows::cancel_window_scene,
             desktop_windows::throw_desktop_window,
@@ -4730,6 +4740,7 @@ pub fn run() {
             ai::sleep_pet,
             ai::get_pet_relationship,
             ai::get_chat_history,
+            ai::get_recent_pet_conversations,
             ai::send_chat_message,
             ai::cancel_chat_response,
             ai::clear_chat_history,

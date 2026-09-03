@@ -4550,6 +4550,7 @@ dependencies = [
  "keyring",
  "objc2",
  "objc2-app-kit",
+ "objc2-core-graphics",
  "objc2-foundation",
  "rand 0.9.5",
  "reqwest 0.12.28",

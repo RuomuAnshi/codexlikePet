@@ -51,6 +51,19 @@ select { min-width: 124px; border: 1px solid #a9dce6; border-radius: 9px; paddin
 .filters button { margin-left: auto; }
 .status { color: #627a86; font-size: 13px; }
 .status[data-kind="error"] { color: #c95d7e; }
+.conversation-section { margin-top: 14px; padding: 16px; border: 1px solid #b8e1ea; border-radius: 18px; background: rgba(255,255,255,.94); box-shadow: 0 10px 24px rgba(74,141,157,.1); }
+.conversation-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.conversation-heading h2 { font-size: 20px; }
+.conversation-list { display: grid; gap: 8px; margin-top: 12px; }
+.conversation-card { padding: 10px 12px; border: 1px solid #d0edf2; border-radius: 12px; background: #eefafd; }
+.conversation-card.from-user { border-color: #f2c4d8; background: #fff0f6; }
+.conversation-card header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.conversation-speaker { color: #277487; font-size: 13px; font-weight: 900; }
+.conversation-card.from-user .conversation-speaker { color: #d45f8b; }
+.conversation-card .pet-link { min-height: 24px; padding: 1px 3px; }
+.conversation-time { color: #8aa0a8; font-size: 11px; }
+.conversation-text { max-height: 9rem; margin: 5px 0 0; overflow: auto; color: #355664; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.conversation-empty { margin: 12px 0 0; color: #8aa0a8; font-size: 13px; }
 .relationship-list, .log-list { display: grid; gap: 10px; margin-top: 14px; }
 .relationship-card { padding: 14px 16px; }
 .relationship-title { display: flex; justify-content: space-between; font-weight: 900; }

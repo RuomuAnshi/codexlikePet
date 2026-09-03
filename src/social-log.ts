@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 interface SocialLogDialogue { petId: string; text: string; }
 interface SocialLogEntry {
@@ -9,6 +10,12 @@ interface SocialLogEntry {
   prop?: string | null;
   dialogue: SocialLogDialogue[];
   milestones: string[];
+}
+interface RecentPetConversation {
+  petId: string;
+  role: string;
+  content: string;
+  timestamp: number;
 }
 interface PublicRelationship {
   firstPetId: string;
@@ -29,6 +36,8 @@ interface PetPreview {
 const petFilter = document.querySelector<HTMLSelectElement>("#pet-filter")!;
 const typeFilter = document.querySelector<HTMLSelectElement>("#type-filter")!;
 const status = document.querySelector<HTMLElement>("#status")!;
+const conversationStatus = document.querySelector<HTMLElement>("#conversation-status")!;
+const conversationList = document.querySelector<HTMLElement>("#conversation-list")!;
 const logList = document.querySelector<HTMLElement>("#log-list")!;
 const relationshipList = document.querySelector<HTMLElement>("#relationship-list")!;
 const previewCanvas = document.querySelector<HTMLCanvasElement>("#preview-canvas")!;
@@ -40,10 +49,12 @@ const names: Record<string, string> = {};
 const previews = new Map<string, PetPreview>();
 const previewImages = new Map<string, HTMLImageElement>();
 let logs: SocialLogEntry[] = [];
+let conversations: RecentPetConversation[] = [];
 let relationships: PublicRelationship[] = [];
 let selectedPetId = "";
 let previewTimer: number | undefined;
 let previewRequest = 0;
+let reloadTimer: number | undefined;
 
 const displayName = (id: string): string => names[id] ?? id;
 const relationshipName = (level: number): string =>
@@ -214,9 +225,51 @@ function renderLogs(): void {
   setStatus(filtered.length ? "共 " + filtered.length + " 条记录" : "还没有宠物社交记录。");
 }
 
+function renderConversations(): void {
+  const pet = petFilter.value;
+  const filtered = conversations.filter((record) => !pet || record.petId === pet);
+  conversationList.replaceChildren();
+  conversationStatus.textContent = filtered.length
+    ? `显示最近 ${filtered.length} 条`
+    : "暂无对话记录";
+
+  if (!filtered.length) {
+    const empty = document.createElement("p");
+    empty.className = "conversation-empty";
+    empty.textContent = pet
+      ? `${displayName(pet)} 还没有和你保存过对话。`
+      : "和宠物聊天后，最近 30 条对话会显示在这里。";
+    conversationList.append(empty);
+    return;
+  }
+
+  for (const record of filtered) {
+    const card = document.createElement("article");
+    card.className = `conversation-card ${record.role === "user" ? "from-user" : "from-pet"}`;
+    const header = document.createElement("header");
+    const speaker = document.createElement("span");
+    speaker.className = "conversation-speaker";
+    if (record.role === "user") {
+      speaker.textContent = "你";
+    } else {
+      speaker.append(petButton(record.petId));
+    }
+    const time = document.createElement("time");
+    time.className = "conversation-time";
+    time.dateTime = new Date(record.timestamp).toISOString();
+    time.textContent = new Date(record.timestamp).toLocaleString();
+    header.append(speaker, time);
+    const text = document.createElement("p");
+    text.className = "conversation-text";
+    text.textContent = record.content;
+    card.append(header, text);
+    conversationList.append(card);
+  }
+}
+
 async function reload(): Promise<void> {
   try {
-    const [catalog, nextLogs, nextRelationships] = await Promise.all([
+    const [catalog, nextLogs, nextRelationships, nextConversations] = await Promise.all([
       invoke<Array<{ id: string; displayName: string }>>("get_pet_catalog"),
       invoke<SocialLogEntry[]>("get_social_log", {
         petId: null,
@@ -226,11 +279,17 @@ async function reload(): Promise<void> {
         toMs: null,
       }),
       invoke<PublicRelationship[]>("get_public_relationships"),
+      invoke<RecentPetConversation[]>("get_recent_pet_conversations", { limit: 30 }),
     ]);
     for (const pet of catalog) names[pet.id] = pet.displayName;
     logs = nextLogs;
+    conversations = nextConversations;
     relationships = nextRelationships;
-    const petValues = [...new Set(logs.flatMap((entry) => entry.participants))].sort();
+    const petValues = [...new Set([
+      ...catalog.map((pet) => pet.id),
+      ...logs.flatMap((entry) => entry.participants),
+      ...conversations.map((record) => record.petId),
+    ])].sort();
     petFilter.replaceChildren(
       new Option("全部", ""),
       ...petValues.map((id) => new Option(displayName(id), id)),
@@ -252,13 +311,23 @@ async function reload(): Promise<void> {
       previewMeta.textContent = "";
       stopPreviewAnimation();
     }
+    renderConversations();
     renderLogs();
   } catch (error) {
     setStatus(String(error), "error");
   }
 }
 
+function scheduleReload(): void {
+  if (reloadTimer !== undefined) window.clearTimeout(reloadTimer);
+  reloadTimer = window.setTimeout(() => {
+    reloadTimer = undefined;
+    void reload();
+  }, 180);
+}
+
 petFilter.addEventListener("change", () => {
+  renderConversations();
   renderLogs();
   if (petFilter.value) void selectPetPreview(petFilter.value);
 });
@@ -269,4 +338,6 @@ document.querySelector("#clear-log")?.addEventListener("click", async () => {
   await invoke("clear_social_log");
   await reload();
 });
+void listen<{ petId: string }>("chat://complete", scheduleReload);
+void listen<{ petId: string }>("chat://error", scheduleReload);
 void reload();
