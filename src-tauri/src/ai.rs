@@ -1885,9 +1885,8 @@ fn extract_json(text: &str) -> Option<Value> {
 
 fn normalize_behavior(mut behavior: PetBehavior) -> PetBehavior {
     behavior.action = match behavior.action.trim().to_ascii_lowercase().as_str() {
-        "idle" | "waving" | "jumping" | "failed" | "waiting" | "running" | "review" | "walk" | "sleep" => {
-            behavior.action.trim().to_ascii_lowercase()
-        }
+        "idle" | "waving" | "jumping" | "failed" | "waiting" | "running" | "review" | "walk"
+        | "sleep" => behavior.action.trim().to_ascii_lowercase(),
         _ => "idle".to_string(),
     };
     behavior.mood = behavior.mood.trim().chars().take(32).collect::<String>();
@@ -3604,8 +3603,16 @@ async fn run_pet_conversation(
         .map_err(|error| error.to_string())?;
     let mut conversation_endpoint = endpoint.clone();
     conversation_endpoint.max_output_tokens = 720;
-    let raw = call_stream(&client, &conversation_endpoint, &prompt, &history, None, false, |_| {})
-        .await?;
+    let raw = call_stream(
+        &client,
+        &conversation_endpoint,
+        &prompt,
+        &history,
+        None,
+        false,
+        |_| {},
+    )
+    .await?;
     let Some((first_behavior, second_behavior)) = parse_pet_conversation_response(raw) else {
         return Ok(());
     };

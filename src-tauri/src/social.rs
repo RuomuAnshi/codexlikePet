@@ -1966,15 +1966,20 @@ pub(super) fn play_single_toy(
     let pet_for_task = pet_id.to_string();
     let toy_for_task = toy.to_string();
     tauri::async_runtime::spawn(async move {
-        run_single_toy_tween(&app_for_task, &instance_for_task, &pet_for_task, &toy_for_task)
-            .await;
+        run_single_toy_tween(
+            &app_for_task,
+            &instance_for_task,
+            &pet_for_task,
+            &toy_for_task,
+        )
+        .await;
     });
     Ok(())
 }
 
 async fn run_single_toy_tween(app: &tauri::AppHandle, instance_id: &str, pet_id: &str, toy: &str) {
-    let Some(window) = app
-        .get_webview_window(&super::instance_label(instance_id).unwrap_or_default())
+    let Some(window) =
+        app.get_webview_window(&super::instance_label(instance_id).unwrap_or_default())
     else {
         return;
     };
@@ -2023,8 +2028,7 @@ async fn tween_toy_window(
     };
     let started = tokio::time::Instant::now();
     loop {
-        let progress =
-            (started.elapsed().as_secs_f64() / (duration_ms as f64 / 1000.0)).min(1.0);
+        let progress = (started.elapsed().as_secs_f64() / (duration_ms as f64 / 1000.0)).min(1.0);
         let eased = progress * progress * (3.0 - 2.0 * progress);
         set_prop_window_position(
             app,
@@ -2777,6 +2781,7 @@ pub(crate) fn report_pet_runtime_state(
     }
     if dragging {
         cancel_scenes_for_pet(&app, &pet_id);
+        super::desktop_windows::cancel_for_instance(&app, &instance_id);
     }
     let safe_position = position.map(|position| PetPosition {
         x: position.x,

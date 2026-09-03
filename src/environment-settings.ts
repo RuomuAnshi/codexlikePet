@@ -17,6 +17,7 @@ const save = document.querySelector<HTMLButtonElement>("#save")!;
 const snapshot = document.querySelector<HTMLElement>("#snapshot")!;
 const supportBadge = document.querySelector<HTMLElement>("#support-badge")!;
 const notificationNote = document.querySelector<HTMLElement>("#notification-note")!;
+const windowSupport = document.querySelector<HTMLElement>("#window-support")!;
 
 function setStatus(message: string, error = false): void {
   status.textContent = message;
@@ -42,6 +43,20 @@ function listValue(value: string): string[] {
 async function load(): Promise<void> {
   try {
     setForm(await invoke<EnvironmentSettings>("get_environment_settings"));
+    const support = await invoke<{
+      platform: string;
+      enumerationSupported: boolean;
+      throwSupported: boolean;
+      accessibilityRequired: boolean;
+      accessibilityGranted: boolean;
+    }>("get_desktop_window_support");
+    if (!support.enumerationSupported) {
+      windowSupport.textContent = "窗口枚举：当前平台不支持（Linux 首版安全关闭）";
+    } else if (support.accessibilityRequired && !support.accessibilityGranted) {
+      windowSupport.textContent = "窗口枚举可用；扔窗口需要在系统设置 → 隐私与安全性 → 辅助功能中授权 SakiPet。";
+    } else {
+      windowSupport.textContent = `窗口互动可用：支持爬窗、坐窗沿${support.throwSupported ? "和受保护的窗口移动" : ""}。`;
+    }
     setStatus("环境设置已加载");
   } catch (error) {
     setStatus(String(error), true);

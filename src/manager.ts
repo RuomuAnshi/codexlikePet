@@ -224,6 +224,7 @@ interface PetSettingsControls {
   showInFullscreen: HTMLInputElement;
   circadianEnabled: HTMLInputElement;
   socialEnabled: HTMLInputElement;
+  windowInteractionEnabled: HTMLInputElement;
   sleepStart: HTMLInputElement;
   wake: HTMLInputElement;
   pause: HTMLButtonElement;
@@ -289,6 +290,7 @@ function syncSettingsControls(controls: PetSettingsControls, next: PetSettings):
   controls.showInFullscreen.checked = next.showInFullscreen;
   controls.circadianEnabled.checked = next.circadianEnabled;
   controls.socialEnabled.checked = next.socialEnabled;
+  controls.windowInteractionEnabled.checked = next.windowInteractionEnabled;
   controls.sleepStart.value = minutesToTime(next.sleepStartMinutes);
   controls.wake.value = minutesToTime(next.wakeMinutes);
   controls.pause.textContent = next.paused ? "继续动画" : "暂停动画";
@@ -336,6 +338,7 @@ async function savePetSettings(
     sleepStartMinutes: timeToMinutes(controls.sleepStart.value, pet.info.settings.sleepStartMinutes),
     wakeMinutes: timeToMinutes(controls.wake.value, pet.info.settings.wakeMinutes),
     socialEnabled: controls.socialEnabled.checked,
+    windowInteractionEnabled: controls.windowInteractionEnabled.checked,
   };
   setSettingsBusy(controls, true);
   try {
@@ -412,6 +415,11 @@ function createSettingsForm(pet: LoadedPet, displayName: string): HTMLFormElemen
     "允许这只宠物加入靠近、玩耍和群体活动",
     pet.info.settings.socialEnabled,
   );
+  const windowInteraction = createToggleRow(
+    "窗口互动",
+    "允许爬窗、坐窗沿，以及在明确操作时移动其他窗口",
+    pet.info.settings.windowInteractionEnabled,
+  );
   const sleepStart = document.createElement("label");
   sleepStart.className = "time-setting";
   sleepStart.innerHTML = "<span><strong>入睡时间</strong><small>进入睡眠区间</small></span>";
@@ -426,7 +434,16 @@ function createSettingsForm(pet: LoadedPet, displayName: string): HTMLFormElemen
   wakeInput.type = "time";
   wakeInput.value = minutesToTime(pet.info.settings.wakeMinutes);
   wake.append(wakeInput);
-  toggleGrid.append(wander, quiet, lock, clickThrough, showInFullscreen, circadian, social);
+  toggleGrid.append(
+    wander,
+    quiet,
+    lock,
+    clickThrough,
+    showInFullscreen,
+    circadian,
+    social,
+    windowInteraction,
+  );
   const scheduleGrid = document.createElement("div");
   scheduleGrid.className = "schedule-grid";
   scheduleGrid.append(sleepStart, wake);
@@ -451,6 +468,7 @@ function createSettingsForm(pet: LoadedPet, displayName: string): HTMLFormElemen
     showInFullscreen: showInFullscreen.querySelector<HTMLInputElement>("input")!,
     circadianEnabled: circadian.querySelector<HTMLInputElement>("input")!,
     socialEnabled: social.querySelector<HTMLInputElement>("input")!,
+    windowInteractionEnabled: windowInteraction.querySelector<HTMLInputElement>("input")!,
     sleepStart: sleepStartInput,
     wake: wakeInput,
     pause,

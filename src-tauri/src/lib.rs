@@ -28,6 +28,7 @@ use tauri_plugin_updater::UpdaterExt;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 mod ai;
+mod desktop_windows;
 mod environment;
 mod social;
 use ai::{AiRuntime, AiSettings};
@@ -519,6 +520,7 @@ struct PetSettings {
     sleep_start_minutes: u16,
     wake_minutes: u16,
     social_enabled: bool,
+    window_interaction_enabled: bool,
 }
 
 impl Default for PetSettings {
@@ -537,6 +539,7 @@ impl Default for PetSettings {
             sleep_start_minutes: 1_410,
             wake_minutes: 450,
             social_enabled: true,
+            window_interaction_enabled: false,
         }
     }
 }
@@ -825,6 +828,7 @@ impl Default for AppConfig {
 struct AppState {
     config: Mutex<AppConfig>,
     ai: AiRuntime,
+    desktop_windows: desktop_windows::DesktopWindowRuntime,
     environment: environment::EnvironmentRuntime,
     social: social::SocialRuntime,
     speech_ready: Mutex<HashSet<String>>,
@@ -837,6 +841,7 @@ impl AppState {
         Self {
             config: Mutex::new(AppConfig::default()),
             ai: AiRuntime::default(),
+            desktop_windows: desktop_windows::DesktopWindowRuntime::default(),
             environment: environment::EnvironmentRuntime::default(),
             social: social::SocialRuntime::default(),
             speech_ready: Mutex::new(HashSet::new()),
@@ -971,10 +976,15 @@ fn validate_animation_clip(
         return Err(format!("动画 clip 路径不安全: {}", clip.path));
     }
     if clip.frames == 0 || clip.frames > ANIMATION_CLIP_MAX_FRAMES {
-        return Err(format!("动画 clip {id} 的帧数必须在 1 到 {ANIMATION_CLIP_MAX_FRAMES} 之间"));
+        return Err(format!(
+            "动画 clip {id} 的帧数必须在 1 到 {ANIMATION_CLIP_MAX_FRAMES} 之间"
+        ));
     }
     if clip.durations.len() != usize::from(clip.frames)
-        || clip.durations.iter().any(|duration| !(30..=5_000).contains(duration))
+        || clip
+            .durations
+            .iter()
+            .any(|duration| !(30..=5_000).contains(duration))
     {
         return Err(format!("动画 clip {id} 的 duration 数量或范围无效"));
     }
@@ -2021,10 +2031,8 @@ fn speech_window_size(text: &str) -> (f64, f64) {
         .chars()
         .map(|character| if character.is_ascii() { 0.58 } else { 1.0 })
         .sum::<f64>();
-    let width = (visual_units * 13.0 + 38.0).clamp(
-        SPEECH_WINDOW_MIN_WIDTH,
-        SPEECH_WINDOW_MAX_WIDTH,
-    );
+    let width =
+        (visual_units * 13.0 + 38.0).clamp(SPEECH_WINDOW_MIN_WIDTH, SPEECH_WINDOW_MAX_WIDTH);
     let units_per_line = ((width - 30.0) / 13.0).max(1.0);
     let lines = (visual_units / units_per_line).ceil().clamp(1.0, 7.0);
     let height = (30.0 + lines * 18.0).clamp(SPEECH_WINDOW_HEIGHT, 170.0);
@@ -2060,9 +2068,7 @@ fn pet_speech_position(
     let pet_position = pet_window
         .outer_position()
         .map_err(|error| error.to_string())?;
-    let pet_size = pet_window
-        .outer_size()
-        .map_err(|error| error.to_string())?;
+    let pet_size = pet_window.outer_size().map_err(|error| error.to_string())?;
     let pet_x = f64::from(pet_position.x);
     let pet_y = f64::from(pet_position.y);
     let pet_width = f64::from(pet_size.width);
@@ -2105,22 +2111,22 @@ fn pet_speech_position(
                     {
                         return None;
                     }
-                    let other_monitor_key = window
-                        .current_monitor()
-                        .ok()
-                        .flatten()
-                        .map(|other_monitor| {
-                            format!(
-                                "{}:{}",
-                                other_monitor.position().x,
-                                other_monitor.position().y
-                            )
-                        });
+                    let other_monitor_key =
+                        window
+                            .current_monitor()
+                            .ok()
+                            .flatten()
+                            .map(|other_monitor| {
+                                format!(
+                                    "{}:{}",
+                                    other_monitor.position().x,
+                                    other_monitor.position().y
+                                )
+                            });
                     if other_monitor_key.as_deref() != Some(monitor_key.as_str()) {
                         return None;
                     }
-                    let (Ok(position), Ok(size)) =
-                        (window.outer_position(), window.outer_size())
+                    let (Ok(position), Ok(size)) = (window.outer_position(), window.outer_size())
                     else {
                         return None;
                     };
@@ -2182,7 +2188,10 @@ fn pet_speech_position(
         pet_x + pet_width + gap,
         pet_y + (pet_height - bubble_height) / 2.0,
     );
-    add_candidate(pet_x + (pet_width - bubble_width) / 2.0, pet_y + pet_height + gap);
+    add_candidate(
+        pet_x + (pet_width - bubble_width) / 2.0,
+        pet_y + pet_height + gap,
+    );
     let pet_center = (pet_x + pet_width / 2.0, pet_y + pet_height / 2.0);
     for radius in [18.0, 42.0, 76.0, 120.0, 180.0, 260.0] {
         for index in 0..8 {
@@ -2207,10 +2216,7 @@ fn pet_speech_position(
     Ok(LogicalPosition::new(x / scale_factor, y / scale_factor))
 }
 
-fn reposition_pet_speech_unlocked(
-    app: &tauri::AppHandle,
-    instance_id: &str,
-) -> Result<(), String> {
+fn reposition_pet_speech_unlocked(app: &tauri::AppHandle, instance_id: &str) -> Result<(), String> {
     let Some(speech_window) = app.get_webview_window(&speech_window_label(instance_id)?) else {
         return Ok(());
     };
@@ -2258,18 +2264,11 @@ fn reflow_pet_speech_windows(app: &tauri::AppHandle) -> Result<(), String> {
             .filter(|(key, _)| key == &monitor_key)
             .map(|(_, rect)| *rect)
             .collect::<Vec<_>>();
-        let position = pet_speech_position(
-            app,
-            instance_id,
-            &pet_window,
-            None,
-            Some(&blocked),
-        )?;
+        let position = pet_speech_position(app, instance_id, &pet_window, None, Some(&blocked))?;
         window
             .set_position(position)
             .map_err(|error| error.to_string())?;
-        let (Ok(actual_position), Ok(size)) = (window.outer_position(), window.outer_size())
-        else {
+        let (Ok(actual_position), Ok(size)) = (window.outer_position(), window.outer_size()) else {
             continue;
         };
         let left = f64::from(actual_position.x);
@@ -2342,9 +2341,11 @@ async fn show_pet_speech(
         return Err("宠物资源不存在或校验失败".to_string());
     }
     let config = config_snapshot(&app)?;
-    if !config.instances.iter().any(|instance| {
-        instance.id == instance_id && instance.pet_id == pet_id && instance.visible
-    }) {
+    if !config
+        .instances
+        .iter()
+        .any(|instance| instance.id == instance_id && instance.pet_id == pet_id && instance.visible)
+    {
         return Err("宠物实例不可见或不存在".to_string());
     }
     let Some(pet_window) = app.get_webview_window(&instance_label) else {
@@ -2368,13 +2369,8 @@ async fn show_pet_speech(
             if let Ok(mut ready) = app.state::<AppState>().speech_ready.lock() {
                 ready.remove(&instance_id);
             }
-            let position = pet_speech_position(
-                &app,
-                &instance_id,
-                &pet_window,
-                Some(speech_size),
-                None,
-            )?;
+            let position =
+                pet_speech_position(&app, &instance_id, &pet_window, Some(speech_size), None)?;
             WebviewWindowBuilder::new(
                 &app,
                 &speech_label,
@@ -2400,13 +2396,8 @@ async fn show_pet_speech(
         speech_window
             .set_size(LogicalSize::new(speech_size.0, speech_size.1))
             .map_err(|error| error.to_string())?;
-        let position = pet_speech_position(
-            &app,
-            &instance_id,
-            &pet_window,
-            Some(speech_size),
-            None,
-        )?;
+        let position =
+            pet_speech_position(&app, &instance_id, &pet_window, Some(speech_size), None)?;
         speech_window
             .set_position(position)
             .map_err(|error| error.to_string())?;
@@ -2621,15 +2612,18 @@ fn get_pet_preview(app: tauri::AppHandle, pet_id: String) -> Result<PetPreview, 
         });
     }
 
-    let bundled = pet_is_bundled(&app, &pet_id)
-        .ok_or_else(|| "pet resource is not installed".to_string())?;
+    let bundled =
+        pet_is_bundled(&app, &pet_id).ok_or_else(|| "pet resource is not installed".to_string())?;
     let sprite_path = bundled_pet_roots(&app)
         .into_iter()
-        .map(|root| root.join(&bundled.path).join(&bundled.manifest.spritesheet_path))
+        .map(|root| {
+            root.join(&bundled.path)
+                .join(&bundled.manifest.spritesheet_path)
+        })
         .find(|path| path.is_file())
         .ok_or_else(|| "pet spritesheet is not installed".to_string())?;
-    let sprite = fs::read(&sprite_path)
-        .map_err(|error| format!("failed to read pet preview: {error}"))?;
+    let sprite =
+        fs::read(&sprite_path).map_err(|error| format!("failed to read pet preview: {error}"))?;
 
     Ok(PetPreview {
         id: bundled.manifest.id,
@@ -2712,9 +2706,11 @@ fn get_pet_occupancies(
         if !window.is_visible().unwrap_or(false) {
             continue;
         }
-        let (Ok(position), Ok(size), Ok(scale_factor)) =
-            (window.outer_position(), window.outer_size(), window.scale_factor())
-        else {
+        let (Ok(position), Ok(size), Ok(scale_factor)) = (
+            window.outer_position(),
+            window.outer_size(),
+            window.scale_factor(),
+        ) else {
             continue;
         };
         let Some(monitor_key) = window
@@ -2745,13 +2741,7 @@ fn get_pet_occupancies(
 
 const PET_COLLISION_GAP: f64 = 12.0;
 
-fn pet_rect_overlaps(
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    other: &PetOccupancy,
-) -> bool {
+fn pet_rect_overlaps(x: f64, y: f64, width: f64, height: f64, other: &PetOccupancy) -> bool {
     x < other.x + other.width + PET_COLLISION_GAP
         && x + width + PET_COLLISION_GAP > other.x
         && y < other.y + other.height + PET_COLLISION_GAP
@@ -2782,6 +2772,7 @@ fn set_pet_position_safely(
     if !is_safe_id(&instance_id) {
         return Err("invalid pet instance id".to_string());
     }
+    desktop_windows::cancel_for_instance(&app, &instance_id);
     let label = instance_label(&instance_id)?;
     let window = app
         .get_webview_window(&label)
@@ -2864,7 +2855,8 @@ fn set_pet_position_safely(
                 x: current_position.x,
                 y: current_position.y,
             };
-            pet_position_is_clear(&current, size.width, size.height, &occupancies).then_some(current)
+            pet_position_is_clear(&current, size.width, size.height, &occupancies)
+                .then_some(current)
         })
         .unwrap_or(requested);
     window
@@ -2941,6 +2933,7 @@ fn set_instance_visible_internal(
         .ok_or_else(|| "pet instance is not configured".to_string())?;
     if !visible {
         social::cancel_scenes_for_pet(app, &instance.pet_id);
+        desktop_windows::cancel_for_instance(app, instance_id);
         let _ = hide_pet_speech(app.clone(), instance_id.to_string());
     }
     let window = app
@@ -3057,6 +3050,7 @@ fn remove_pet_instance(
     }
     if let Some(pet_id) = removed_pet_id {
         social::cancel_scenes_for_pet(&app, &pet_id);
+        desktop_windows::cancel_for_instance(&app, &instance_id);
         let pet_still_has_instance = config
             .instances
             .iter()
@@ -3114,9 +3108,11 @@ fn broadcast_settings(
             }
         }
         if let Some(speech_instance_id) = label.strip_prefix("pet-speech-") {
-            if config.instances.iter().any(|instance| {
-                instance.id == speech_instance_id && instance.pet_id == pet_id
-            }) {
+            if config
+                .instances
+                .iter()
+                .any(|instance| instance.id == speech_instance_id && instance.pet_id == pet_id)
+            {
                 let _ = reposition_pet_speech(app, speech_instance_id);
                 apply_fullscreen_visibility(&window, settings.show_in_fullscreen)?;
             }
@@ -3151,6 +3147,15 @@ fn update_pet_settings(
     if !saved.social_enabled || saved.paused || saved.quiet_mode {
         social::cancel_scenes_for_pet(&app, &pet_id);
     }
+    if !saved.window_interaction_enabled || saved.paused || saved.quiet_mode {
+        for instance in config
+            .instances
+            .iter()
+            .filter(|instance| instance.pet_id == pet_id)
+        {
+            desktop_windows::cancel_for_instance(&app, &instance.id);
+        }
+    }
     broadcast_settings(&app, &pet_id, &saved)?;
     Ok(saved)
 }
@@ -3168,6 +3173,14 @@ fn toggle_pet_pause_internal(app: &tauri::AppHandle, pet_id: &str) -> Result<Pet
     let settings = settings_for_pet(&config, pet_id);
     if settings.paused {
         social::cancel_scenes_for_pet(app, pet_id);
+        let config = config_snapshot(app)?;
+        for instance in config
+            .instances
+            .iter()
+            .filter(|instance| instance.pet_id == pet_id)
+        {
+            desktop_windows::cancel_for_instance(app, &instance.id);
+        }
     }
     broadcast_settings(app, pet_id, &settings)?;
     Ok(settings)
@@ -3216,6 +3229,14 @@ fn set_pet_enabled(
     }
     if !enabled {
         social::cancel_scenes_for_pet(&app, &pet_id);
+        let config = config_snapshot(&app)?;
+        for instance in config
+            .instances
+            .iter()
+            .filter(|instance| instance.pet_id == pet_id)
+        {
+            desktop_windows::cancel_for_instance(&app, &instance.id);
+        }
     }
     let config = update_config(&app, |config| {
         config.disabled_pet_ids.retain(|id| id != &pet_id);
@@ -3302,8 +3323,7 @@ fn pet_root_for_export(app: &tauri::AppHandle, pet_id: &str) -> Result<PathBuf, 
         return Ok(imported_root);
     }
 
-    let bundled = pet_is_bundled(app, pet_id)
-        .ok_or_else(|| format!("找不到宠物资源: {pet_id}"))?;
+    let bundled = pet_is_bundled(app, pet_id).ok_or_else(|| format!("找不到宠物资源: {pet_id}"))?;
     bundled_pet_roots(app)
         .into_iter()
         .map(|root| root.join(&bundled.path))
@@ -3311,12 +3331,9 @@ fn pet_root_for_export(app: &tauri::AppHandle, pet_id: &str) -> Result<PathBuf, 
         .ok_or_else(|| format!("找不到宠物资源目录: {pet_id}"))
 }
 
-fn collect_pet_export_entries(
-    root: &Path,
-    pet_id: &str,
-) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let manifest_bytes = fs::read(root.join("pet.json"))
-        .map_err(|error| format!("无法读取 pet.json: {error}"))?;
+fn collect_pet_export_entries(root: &Path, pet_id: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let manifest_bytes =
+        fs::read(root.join("pet.json")).map_err(|error| format!("无法读取 pet.json: {error}"))?;
     let manifest = serde_json::from_slice::<PetManifest>(&manifest_bytes)
         .map_err(|error| format!("pet.json 格式错误: {error}"))?;
     let sprite_path = manifest.spritesheet_path.clone();
@@ -3377,12 +3394,16 @@ fn write_pet_archive(
     pet_id: &str,
     entries: Vec<(String, Vec<u8>)>,
 ) -> Result<String, String> {
-    if output_path.extension().and_then(|extension| extension.to_str()) != Some("zip") {
+    if output_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("zip")
+    {
         output_path.set_extension("zip");
     }
 
-    let output = fs::File::create(&output_path)
-        .map_err(|error| format!("无法创建导出文件: {error}"))?;
+    let output =
+        fs::File::create(&output_path).map_err(|error| format!("无法创建导出文件: {error}"))?;
     let mut archive = ZipWriter::new(output);
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
@@ -3531,8 +3552,7 @@ fn import_pet_package(
         for (clip_path, bytes) in clip_files {
             let target = pet_root.join(&clip_path);
             if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| format!("无法创建动画目录: {error}"))?;
+                fs::create_dir_all(parent).map_err(|error| format!("无法创建动画目录: {error}"))?;
             }
             fs::write(&target, bytes)
                 .map_err(|error| format!("无法保存动画 clip {}: {error}", clip_path))?;
@@ -3650,14 +3670,21 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         true,
         None::<&str>,
     )?;
-    let social_settings = MenuItem::with_id(app, "app-social-settings", "社交设置", true, None::<&str>)?;
+    let social_settings =
+        MenuItem::with_id(app, "app-social-settings", "社交设置", true, None::<&str>)?;
     let social_log = MenuItem::with_id(app, "app-social-log", "宠物日志", true, None::<&str>)?;
     let app_submenu = Submenu::with_id_and_items(
         app,
         "sakipet-app-menu",
         "SakiPet",
         true,
-        &[&manage_pets, &ai_settings, &environment_settings, &social_settings, &social_log],
+        &[
+            &manage_pets,
+            &ai_settings,
+            &environment_settings,
+            &social_settings,
+            &social_log,
+        ],
     )?;
     let menu = Menu::with_items(app, &[&app_submenu])?;
     app.set_menu(menu)?;
@@ -3769,18 +3796,17 @@ fn show_pet_context_menu(app: tauri::AppHandle, window_label: String) -> Result<
     let settings = item("settings", "独立设置".to_string())?;
     let hide = item("hide", "隐藏".to_string())?;
     let friends = item("find-friends", "找朋友".to_string())?;
-    let source_monitor = window
-        .current_monitor()
-        .ok()
-        .flatten()
-        .map(|monitor| {
-            (
-                monitor.position().x,
-                monitor.position().y,
-                monitor.size().width,
-                monitor.size().height,
-            )
-        });
+    // Refresh lazily as well as in the background monitor so a context menu
+    // never keeps a closed window target around for long.
+    let _ = desktop_windows::refresh(&app);
+    let source_monitor = window.current_monitor().ok().flatten().map(|monitor| {
+        (
+            monitor.position().x,
+            monitor.position().y,
+            monitor.size().width,
+            monitor.size().height,
+        )
+    });
     let mut friend_items = Vec::new();
     for candidate in &config.instances {
         if candidate.id == instance_id
@@ -3793,8 +3819,7 @@ fn show_pet_context_menu(app: tauri::AppHandle, window_label: String) -> Result<
         {
             continue;
         }
-        let Some(candidate_window) = app.get_webview_window(&instance_label(&candidate.id)?)
-        else {
+        let Some(candidate_window) = app.get_webview_window(&instance_label(&candidate.id)?) else {
             continue;
         };
         let candidate_monitor = candidate_window
@@ -3813,16 +3838,19 @@ fn show_pet_context_menu(app: tauri::AppHandle, window_label: String) -> Result<
             continue;
         }
         let name = pet_display_name(&app, &candidate.pet_id);
-        friend_items.push(MenuItem::with_id(
-            &app,
-            format!(
-                "pet-context:find-friend-{}:{}:{}",
-                candidate.pet_id, instance_id, pet_id
-            ),
-            format!("和 {name} 互动"),
-            true,
-            None::<&str>,
-        ).map_err(|error| error.to_string())?);
+        friend_items.push(
+            MenuItem::with_id(
+                &app,
+                format!(
+                    "pet-context:find-friend-{}:{}:{}",
+                    candidate.pet_id, instance_id, pet_id
+                ),
+                format!("和 {name} 互动"),
+                true,
+                None::<&str>,
+            )
+            .map_err(|error| error.to_string())?,
+        );
     }
     let friend_refs: Vec<&dyn tauri::menu::IsMenuItem<Wry>> = friend_items
         .iter()
@@ -3836,6 +3864,46 @@ fn show_pet_context_menu(app: tauri::AppHandle, window_label: String) -> Result<
         &friend_refs,
     )
     .map_err(|error| error.to_string())?;
+    let window_interaction_enabled = settings_for_pet(&config, pet_id).window_interaction_enabled;
+    let mut window_items = Vec::new();
+    if window_interaction_enabled {
+        for target in desktop_windows::cached_windows(&app).into_iter().take(8) {
+            let target_name = if target.title.is_empty() {
+                target.app_name.clone()
+            } else {
+                target.title.clone()
+            };
+            let target_name: String = target_name.chars().take(24).collect();
+            window_items.push(item(
+                &format!("window-crawl-{}", target.id),
+                format!("爬到 {target_name}"),
+            )?);
+            window_items.push(item(
+                &format!("window-sit-{}", target.id),
+                format!("坐在 {target_name} 窗沿"),
+            )?);
+            window_items.push(item(
+                &format!("window-throw-{}", target.id),
+                format!("把 {target_name} 扔一下"),
+            )?);
+        }
+    }
+    let window_refs: Vec<&dyn tauri::menu::IsMenuItem<Wry>> = window_items
+        .iter()
+        .map(|item| item as &dyn tauri::menu::IsMenuItem<Wry>)
+        .collect();
+    let window_submenu = Submenu::with_id_and_items(
+        &app,
+        format!("pet-windows-menu-{instance_id}"),
+        if window_interaction_enabled {
+            "窗口互动"
+        } else {
+            "窗口互动（请在独立设置中开启）"
+        },
+        window_interaction_enabled && !window_refs.is_empty(),
+        &window_refs,
+    )
+    .map_err(|error| error.to_string())?;
     let menu = Menu::with_items(
         &app,
         &[
@@ -3846,12 +3914,13 @@ fn show_pet_context_menu(app: tauri::AppHandle, window_label: String) -> Result<
             &sleep,
             &friends,
             &friend_submenu,
+            &window_submenu,
             &chat,
             &settings,
             &hide,
         ],
     )
-        .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string())?;
     window
         .popup_menu_at(&menu, pet_context_menu_position(&window))
         .map_err(|error| format!("无法显示宠物菜单: {error}"))
@@ -3874,10 +3943,8 @@ fn pet_context_menu_position(window: &tauri::WebviewWindow) -> LogicalPosition<f
     let can_open_right = match (window_position, monitor) {
         (Some(position), Some(monitor)) => {
             let pet_right = f64::from(position.x) + window_width * scale_factor;
-            let monitor_right = f64::from(monitor.position().x)
-                + f64::from(monitor.size().width);
-            let required_space =
-                (CONTEXT_MENU_ESTIMATED_WIDTH + CONTEXT_MENU_GAP) * scale_factor;
+            let monitor_right = f64::from(monitor.position().x) + f64::from(monitor.size().width);
+            let required_space = (CONTEXT_MENU_ESTIMATED_WIDTH + CONTEXT_MENU_GAP) * scale_factor;
             monitor_right - pet_right >= required_space
         }
         // If monitor geometry is temporarily unavailable while the window is
@@ -3975,6 +4042,41 @@ fn handle_pet_context_action(app: &tauri::AppHandle, id: &str) -> Result<(), Str
                 Some(vec![target_pet_id.to_string()]),
             ))?;
         }
+        action if action.starts_with("window-crawl-") || action.starts_with("window-sit-") => {
+            let (prefix, mode) = if let Some(id) = action.strip_prefix("window-crawl-") {
+                (id, "crawl")
+            } else {
+                (
+                    action.strip_prefix("window-sit-").unwrap_or_default(),
+                    "sit",
+                )
+            };
+            let window_id = prefix
+                .parse::<u64>()
+                .map_err(|_| "无效的目标窗口".to_string())?;
+            desktop_windows::start_window_scene(
+                app.clone(),
+                instance_id.to_string(),
+                window_id,
+                mode.to_string(),
+            )?;
+        }
+        action if action.starts_with("window-throw-") => {
+            let window_id = action
+                .strip_prefix("window-throw-")
+                .and_then(|id| id.parse::<u64>().ok())
+                .ok_or_else(|| "无效的目标窗口".to_string())?;
+            if let Err(error) = desktop_windows::throw_desktop_window(
+                app.clone(),
+                instance_id.to_string(),
+                window_id,
+            ) {
+                let _ = app.emit(
+                    "pet://context-error",
+                    serde_json::json!({"petId": pet_id, "message": error}),
+                );
+            }
+        }
         "settings" => {
             show_pet_manager(app)?;
             let _ = app.emit(
@@ -4012,7 +4114,8 @@ fn build_tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<Wry>> {
         true,
         None::<&str>,
     )?;
-    let social_settings = MenuItem::with_id(app, "social-settings", "社交设置", true, None::<&str>)?;
+    let social_settings =
+        MenuItem::with_id(app, "social-settings", "社交设置", true, None::<&str>)?;
     let social_log = MenuItem::with_id(app, "social-log", "宠物日志", true, None::<&str>)?;
     let toggle_pause = MenuItem::with_id(
         app,
@@ -4357,7 +4460,10 @@ async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateCheck, String>
         .map_err(|error| format!("检查更新失败（网络错误）: {error}"))?;
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("检查更新失败（GitHub 返回 HTTP {}）", status.as_u16()));
+        return Err(format!(
+            "检查更新失败（GitHub 返回 HTTP {}）",
+            status.as_u16()
+        ));
     }
     let value: serde_json::Value = response
         .json()
@@ -4497,9 +4603,7 @@ pub fn run() {
                     api.prevent_close();
                     let _ = window.hide();
                 }
-                WindowEvent::CloseRequested { api, .. }
-                    if label.starts_with("pet-speech-") =>
-                {
+                WindowEvent::CloseRequested { api, .. } if label.starts_with("pet-speech-") => {
                     api.prevent_close();
                     let _ = window.hide();
                 }
@@ -4523,6 +4627,7 @@ pub fn run() {
             start_fullscreen_overlay_guard(&app.handle());
             build_tray(&app.handle())?;
             build_app_menu(&app.handle())?;
+            desktop_windows::start_monitor(&app.handle());
             environment::start_monitor(&app.handle());
             ai::start_heartbeat_scheduler(&app.handle());
             social::start_scheduler(&app.handle());
@@ -4581,6 +4686,11 @@ pub fn run() {
             social::open_social_settings,
             get_environment_settings,
             update_environment_settings,
+            desktop_windows::list_desktop_windows,
+            desktop_windows::get_desktop_window_support,
+            desktop_windows::start_window_scene,
+            desktop_windows::cancel_window_scene,
+            desktop_windows::throw_desktop_window,
             show_pet_context_menu,
             open_pet_chat,
             toggle_pet_chat,

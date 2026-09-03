@@ -127,6 +127,7 @@ async function boot(): Promise<void> {
   let pettingTimer: number | undefined;
   let autoQuiet = false;
   let socialSceneId: string | null = null;
+  let windowSceneId: string | null = null;
   let lifeSleeping = false;
 
   const speechPreview = (text: string): string => {
@@ -288,6 +289,9 @@ async function boot(): Promise<void> {
   }
 
   const applySettings = (next: PetSettings): void => {
+    if (!next.windowInteractionEnabled && windowSceneId) {
+      void invoke("cancel_window_scene", { sceneId: windowSceneId }).catch(() => undefined);
+    }
     settings = next;
     paused = next.paused;
     setStageSize(next.scale);
@@ -314,6 +318,9 @@ async function boot(): Promise<void> {
     try {
       if (socialSceneId) {
         await invoke("cancel_social_scene", { sceneId: socialSceneId });
+      }
+      if (windowSceneId) {
+        await invoke("cancel_window_scene", { sceneId: windowSceneId });
       }
       const opened = await invoke<boolean>("toggle_pet_chat", { petId: runtime.petId });
       if (opened) sayLine("doubleClick");
@@ -473,7 +480,7 @@ async function boot(): Promise<void> {
   watchCursorDirection(
     (direction) => {
       lastDirection = direction === null ? null : (direction as LookDirection);
-      if (!dragging && !walking && !dragState.petting && !socialSceneId) engine.setLook(lastDirection);
+      if (!dragging && !walking && !dragState.petting && !socialSceneId && !windowSceneId) engine.setLook(lastDirection);
     },
     100,
     () => !paused,
@@ -485,6 +492,9 @@ async function boot(): Promise<void> {
     (enabled, direction: DragDirection | null, carried) => {
       dragging = enabled;
       if (enabled) {
+        if (windowSceneId) {
+          void invoke("cancel_window_scene", { sceneId: windowSceneId }).catch(() => undefined);
+        }
         void invoke("hide_pet_speech", { instanceId: runtime.instanceId }).catch(() => undefined);
       }
       if (enabled) walker.stop();
@@ -530,7 +540,7 @@ async function boot(): Promise<void> {
   });
   petEl.addEventListener("pointerleave", () => {
     hovered = false;
-    if (!dragging && !walking && !dragState.petting && !socialSceneId && !stateMachine.hasAction()) {
+    if (!dragging && !walking && !dragState.petting && !socialSceneId && !windowSceneId && !stateMachine.hasAction()) {
       engine.setLook(lastDirection);
     }
   });
@@ -656,6 +666,65 @@ async function boot(): Promise<void> {
     syncAnimation();
     void savePosition();
   });
+  await listen<{
+    sceneId: string;
+    instanceId: string;
+    petId: string;
+    windowId: number;
+    mode: "crawl" | "sit";
+  }>("desktop://window-scene-start", ({ payload }) => {
+    if (payload.instanceId !== runtime.instanceId || payload.petId !== runtime.petId) return;
+    windowSceneId = payload.sceneId;
+    walker.stop();
+    stateMachine.setSocialState("waiting");
+    syncAnimation();
+  });
+  await listen<{
+    sceneId: string;
+    instanceId: string;
+    petId: string;
+    phase: string;
+    animation: string;
+    look: string;
+    onWindow: boolean;
+  }>("desktop://window-scene-phase", ({ payload }) => {
+    if (payload.sceneId !== windowSceneId || payload.instanceId !== runtime.instanceId) return;
+    const animationMap: Record<string, AnimationState> = {
+      idle: "idle",
+      waiting: "waiting",
+      running: "running",
+      jumping: "jumping",
+    };
+    stateMachine.setSocialState(animationMap[payload.animation] ?? "idle");
+    const directionNames: Record<string, LookDirection> = {
+      up: 0,
+      "up-right": 2,
+      right: 4,
+      "down-right": 6,
+      down: 8,
+      "down-left": 10,
+      left: 12,
+      "up-left": 14,
+    };
+    const direction = directionNames[payload.look];
+    if (direction !== undefined) engine.setLook(direction);
+    if (payload.phase === "jump-off") showEffect("dust");
+    syncAnimation();
+  });
+  await listen<{ sceneId: string; instanceId: string; cancelled: boolean }>(
+    "desktop://window-scene-end",
+    ({ payload }) => {
+      if (payload.sceneId !== windowSceneId || payload.instanceId !== runtime.instanceId) return;
+      windowSceneId = null;
+      stateMachine.setSocialState(null);
+      if (!dragging && !paused && !settings.quietMode && !autoQuiet && settings.wanderEnabled) {
+        walker.start();
+      }
+      if (!dragging) engine.setLook(lastDirection);
+      syncAnimation();
+      void savePosition();
+    },
+  );
   await listen<{
     petId: string;
     state: { activity: string; mood: string; energy: number; food?: number };

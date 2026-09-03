@@ -15,6 +15,7 @@ export interface PetSettings {
   sleepStartMinutes: number;
   wakeMinutes: number;
   socialEnabled: boolean;
+  windowInteractionEnabled: boolean;
 }
 
 export interface PetSettingsEvent {
